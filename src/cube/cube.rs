@@ -5,43 +5,58 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dimension::dimension::Dimension;
 use crate::storage::sparse_store::SparseStore;
-
-
+use crate::cube::node::CellValue;
 
 pub struct SliceQuery {
-    pub axes: Vec<String>,                 // Dimensions to group by (e.g., ["Product"])
-    pub filters: HashMap<String, String>,  // Dimensions to lock (e.g., {"Geography": "Europe"})
+    pub output_columns: Vec<String>,      // The exact order requested in SELECT
+    pub axes: Vec<String>,                // The dimensions to group by
+    pub requested_measures: Vec<String>,  // The specific measures to pivot (if any)
+    pub filters: HashMap<String, String>, // The WHERE clause
 }
 
 pub struct ResultSet {
     pub headers: Vec<String>,
-    pub rows: Vec<(Vec<String>, f64)>,
+    pub rows: Vec<Vec<String>>, // All cells converted to string for easy printing
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+
 pub struct Cube {
     pub name: String,
     
     // For saving to disk (Foreign Keys)
     pub dimension_names: Vec<String>,
+
+	pub measure_dimension: Option<String>,
+	// Determines if this acts like an attribute table or a data cube
+    pub is_aggregating: bool, 
     
     // For runtime speed (Shared Pointers). We skip saving this!
     #[serde(skip)]
     pub dimensions: Vec<Arc<RwLock<Dimension>>>,
     
     pub store: SparseStore,
+	
     
     // The Cache. We skip saving this!
     #[serde(skip)]
-    pub query_cache: HashMap<Vec<u32>, f64>,
+    pub query_cache: HashMap<Vec<u32>, f64>,// keep cache f64
 }
 
 impl Cube {
-    pub fn new(name: &str, dimension_names: Vec<String>, dimensions: Vec<Arc<RwLock<Dimension>>>) -> Self {
+    pub fn new( name: &str, 
+				dimension_names: Vec<String>, 
+				dimensions: Vec<Arc<RwLock<Dimension>>>,
+				measure_dimension: Option<String>,
+				is_aggregating: bool				
+				)
+				-> Self {
         let dim_count = dimension_names.len();
         Cube {
             name: name.to_string(),
             dimension_names,
+			measure_dimension,
+			is_aggregating,
             dimensions,
             store: SparseStore::new(dim_count),
             query_cache: HashMap::new(),
@@ -54,12 +69,15 @@ impl Cube {
     }
 
     /// Point 1: Row-by-row data import. Auto-creates leaves if they don't exist.
-    pub fn write(&mut self, members: &[&str], value: f64) {
+    pub fn write(&mut self, members: &[&str], value: CellValue) {
         let mut coords = Vec::new();
 
         for (i, m) in members.iter().enumerate() {
             // We lock the dimension for writing. If it's a new element, it gets added!
+			// Note: If it's a non-aggregating cube, we might be writing to a parent node!
+            // add_consolidated is safe to use here because it handles both new and existing members
             let mut dim = self.dimensions[i].write().unwrap();
+			
             let id = dim.add_leaf(m);
             coords.push(id);
         }
@@ -106,7 +124,7 @@ impl Cube {
     }
 
     // Helper: Recursively combine leaves. (e.g., [France, Germany] x [Laptop] x [Q1])
-    fn calculate_jit(
+fn calculate_jit(
         &self, 
         resolutions: &[HashMap<u32, f64>], 
         current_coords: &mut Vec<u32>, 
@@ -114,9 +132,11 @@ impl Cube {
         current_weight: f64
     ) -> f64 {
         if depth == resolutions.len() {
-            // We have a base-level coordinate. Fetch from the Patria Trie!
-            let val = self.store.query_exact(current_coords);
-            return val * current_weight;
+            // Fetch from the Patria Trie!
+            if let Some(CellValue::Numeric(val)) = self.store.query_exact(current_coords) {
+                return val * current_weight;
+            }
+            return 0.0; // If it's a String or None, it doesn't contribute to the math sum
         }
 
         let mut sum = 0.0;
@@ -161,7 +181,10 @@ impl Cube {
 
             // 2. Extract and parse the numeric value from the last column
             let val_str = record.get(dim_count).unwrap_or("0");
-            let value: f64 = val_str.parse().unwrap_or(0.0);
+            let value = match val_str.parse::<f64>() {
+                Ok(n) => CellValue::Numeric(n),
+                Err(_) => CellValue::String(val_str.to_string()),
+            };
 
             // 3. Write it to the engine! 
             // (This automatically updates the Dictionaries and the Trie)
@@ -175,88 +198,126 @@ impl Cube {
 
 pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         let dim_count = self.dimensions.len();
-        
-        // 1. Prepare the push-down filters for the Trie
         let mut scanner_filters: Vec<Option<HashSet<u32>>> = vec![None; dim_count];
-        
-        // 2. Track the weights for JIT calculation (e.g., France = 1.0, Germany = 1.0)
         let mut weight_maps: Vec<HashMap<u32, f64>> = vec![HashMap::new(); dim_count];
-        
-        // 3. Track which indices represent our "Axes" (Columns in the output table)
         let mut axis_indices = Vec::new();
 
+        // 1. Setup the Trie Scanner filters
         for (i, dim_name) in self.dimension_names.iter().enumerate() {
             let dim = self.dimensions[i].read().unwrap();
 
-            // 1. Is it requested in the SELECT clause?
-            let is_axis = query.axes.contains(dim_name);
-            if is_axis {
+            if query.axes.contains(dim_name) {
                 axis_indices.push(i);
             }
 
-            // 2. Is it filtered in the WHERE clause?
             if let Some(filter_val) = query.filters.get(dim_name) {
-                let leaves = dim.get_leaf_descendants(filter_val);
-                if leaves.is_empty() {
-                    return Err(format!("Member '{}' not found in '{}'", filter_val, dim_name));
+                if self.is_aggregating {
+                    // Standard Cube: Resolve to Leaves!
+                    let leaves = dim.get_leaf_descendants(filter_val);
+                    if leaves.is_empty() { return Err(format!("Member '{}' not found", filter_val)); }
+                    scanner_filters[i] = Some(leaves.keys().cloned().collect());
+                    weight_maps[i] = leaves;
+                } else {
+                    // Attribute Cube: Do NOT resolve to leaves. Just fetch the exact ID!
+                    if let Some(id) = dim.get_id(filter_val) {
+                        let mut exact_id = HashSet::new();
+                        exact_id.insert(id);
+                        scanner_filters[i] = Some(exact_id);
+                        weight_maps[i].insert(id, 1.0); // Weight is irrelevant here, just set to 1.0
+                    } else {
+                        return Err(format!("Member '{}' not found", filter_val));
+                    }
                 }
-                
-                let leaf_ids: HashSet<u32> = leaves.keys().cloned().collect();
-                scanner_filters[i] = Some(leaf_ids);
-                weight_maps[i] = leaves; 
-
-            } else if !is_axis {
-                // It is NEITHER selected NOR filtered.
-                return Err(format!("Dimension '{}' is neither filtered nor an axis.", dim_name));
+            } else if Some(dim_name) == self.measure_dimension.as_ref() && !query.requested_measures.is_empty() {
+                // PIVOT MODE (Unchanged)
+                if !axis_indices.contains(&i) { axis_indices.push(i); }
+                let mut valid_measures = HashSet::new();
+                for m_name in &query.requested_measures {
+                    if let Some(id) = dim.get_id(m_name) {
+                        valid_measures.insert(id);
+                    }
+                }
+                scanner_filters[i] = Some(valid_measures);
             }
         }
 
-        // 4. SCAN THE TRIE! (This fetches the raw base data instantly)
         let raw_data = self.store.scan_subcube(&scanner_filters);
 
-        // 5. Aggregate and group the results
-        // We use a HashMap to sum values that roll up into the same Axis combination
-        let mut grouped_results: HashMap<Vec<u32>, f64> = HashMap::new();
+        // 3. Aggregate Results (Now using CellValue!)
+        let mut grouped_results: HashMap<Vec<u32>, HashMap<String, CellValue>> = HashMap::new();
+        let measure_dim_idx = self.measure_dimension.as_ref()
+            .and_then(|m| self.dimension_names.iter().position(|d| d == m));
 
         for (coords, base_val) in raw_data {
-            let mut final_val = base_val;
+            let mut final_val = base_val.clone(); // Can be String or Numeric
             let mut row_key = Vec::new();
+            let mut current_measure_name = "value".to_string();
 
             for i in 0..dim_count {
-                // Apply the consolidation weight if it was a filtered parent
-                if let Some(weight) = weight_maps[i].get(&coords[i]) {
-                    final_val *= weight;
+                // Only apply math if the cell is Numeric AND the cube is aggregating
+                if self.is_aggregating {
+                    if let Some(weight) = weight_maps[i].get(&coords[i]) {
+                        if let CellValue::Numeric(n) = &mut final_val {
+                            *n *= weight; 
+                        }
+                    }
                 }
                 
-                // If this dimension is an Axis, add its ID to the grouping key
                 if axis_indices.contains(&i) {
-                    row_key.push(coords[i]);
+                    if Some(i) == measure_dim_idx && !query.requested_measures.is_empty() {
+                        let dim = self.dimensions[i].read().unwrap();
+                        current_measure_name = dim.get_name(coords[i]);
+                    } else {
+                        row_key.push(coords[i]);
+                    }
                 }
             }
 
-            // Add the calculated value to the specific group
-            *grouped_results.entry(row_key).or_insert(0.0) += final_val;
+            // Accumulate (Add numbers, or just overwrite strings)
+            let measure_map = grouped_results.entry(row_key).or_insert_with(HashMap::new);
+            let existing_val = measure_map.entry(current_measure_name).or_insert(CellValue::Numeric(0.0));
+            
+            match (existing_val, final_val) {
+                (CellValue::Numeric(existing), CellValue::Numeric(new)) => *existing += new,
+                (val, new) => *val = new, // If it's a string, just overwrite it (no math)
+            }
         }
 
-        // 6. Format into a Tabular ResultSet (Translating IDs back to Strings)
+        // 4. Format Output (Unchanged from before, because .to_string() handles the Display trait we just made!)
         let mut result_set = ResultSet {
-            headers: query.axes.clone(),
+            headers: query.output_columns.clone(),
             rows: Vec::new(),
         };
 
-        for (axis_ids, total_val) in grouped_results {
-            let mut string_row = Vec::new();
+        let display_axis_indices: Vec<usize> = axis_indices.into_iter()
+            .filter(|&i| Some(i) != measure_dim_idx || query.requested_measures.is_empty())
+            .collect();
+
+        for (axis_ids, measure_map) in grouped_results {
+            let mut final_row = Vec::new();
+            let mut row_dim_strings = HashMap::new();
             
-            // Map the IDs in the row_key back to their Dimension Names
-            for (idx, &id) in axis_indices.iter().zip(axis_ids.iter()) {
-                let dim = self.dimensions[*idx].read().unwrap();
-                string_row.push(dim.get_name(id));
+            for (idx, &id) in display_axis_indices.iter().zip(axis_ids.iter()) {
+                let dim_name = &self.dimension_names[*idx];
+                let dim_val = self.dimensions[*idx].read().unwrap().get_name(id);
+                row_dim_strings.insert(dim_name.clone(), dim_val);
             }
-            
-            result_set.rows.push((string_row, total_val));
+
+            for col in &query.output_columns {
+                if let Some(dim_val) = row_dim_strings.get(col) {
+                    final_row.push(dim_val.clone());
+                } else if query.requested_measures.contains(col) || col == "value" {
+                    // Safely get the value or print "-"
+                    if let Some(val) = measure_map.get(col) {
+                        final_row.push(val.to_string());
+                    } else {
+                        final_row.push("-".to_string());
+                    }
+                }
+            }
+            result_set.rows.push(final_row);
         }
 
         Ok(result_set)
     }
-
 }

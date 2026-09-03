@@ -14,7 +14,7 @@ fn test_basic_consolidation() {
     }
 
     // Setup Cube
-    catalog.add_cube("Sales", &["Geography", "Product"]);
+    catalog.add_cube("Sales", &["Geography", "Product"],None);
     let sales_cube = catalog.get_cube_mut("Sales").unwrap();
 
     // Insert Data

@@ -3,19 +3,33 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap; 
 
+use crate::cube::node::CellValue;
+
 use crate::catalog::catalog::Catalog;
 use crate::cube::cube::{SliceQuery, ResultSet}; 
 
 // Changed return type from f64 to String to support textual success messages
 pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, String> {
+	    // 1. Intercept custom "ATTRIBUTE" keyword
+    let mut is_aggregating = true;
+    let mut parseable_sql = sql_query.trim().to_string();
+    let upper_sql = parseable_sql.to_uppercase();
+
+    if upper_sql.starts_with("CREATE ATTRIBUTE TABLE") {
+        is_aggregating = false;
+        // Slice off "CREATE ATTRIBUTE TABLE" (22 chars) and prepend standard SQL
+        parseable_sql = format!("CREATE TABLE {}", &sql_query.trim()[22..]);
+	}
+    
     let dialect = GenericDialect {};
     
-    let ast = Parser::parse_sql(&dialect, sql_query)
+    let ast = Parser::parse_sql(&dialect, &parseable_sql)
         .map_err(|e| format!("SQL Parse Error: {:?}", e))?;
 
     let statement = &ast[0];
     
     match statement {
+// 1. SELECT (Query)
 // 1. SELECT (Query)
         Statement::Query(query) => {
             if let SetExpr::Select(select) = &*query.body {
@@ -23,41 +37,65 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 let cube = catalog.get_cube_mut(&cube_name)
                     .ok_or_else(|| format!("Cube '{}' not found", cube_name))?;
 
-                // Extract the columns the user wants to group by (Axes)
+                let mut output_columns = Vec::new();
                 let mut axes = Vec::new();
+                let mut requested_measures = Vec::new();
+                let mut measure_dim_requested = false;
+
+                let m_dim_name = cube.measure_dimension.clone();
+
+                // Pass 1: Categorize columns
                 for proj in &select.projection {
                     let col_name = proj.to_string();
-                    if col_name != "value" && col_name != "*" { // 'value' is our measure column
-                        axes.push(col_name);
+                    output_columns.push(col_name.clone());
+
+                    if cube.dimension_names.contains(&col_name) {
+                        axes.push(col_name.clone());
+                        if Some(&col_name) == m_dim_name.as_ref() {
+                            measure_dim_requested = true;
+                        }
+                    } else if let Some(m_dim) = &m_dim_name {
+                        // Check if it's a member of the measure dimension
+                        let dim_idx = cube.dimension_names.iter().position(|n| n == m_dim).unwrap();
+                        let dim = cube.dimensions[dim_idx].read().unwrap();
+                        if dim.get_id(&col_name).is_some() {
+                            requested_measures.push(col_name);
+                        } else if col_name != "value" {
+                            return Err(format!("Column '{}' not found.", col_name));
+                        }
+                    } else if col_name != "value" {
+                        return Err(format!("Column '{}' not found.", col_name));
                     }
                 }
 
-                // Extract the WHERE clause filters
+                // Pass 2: Conflict Validation
+                if measure_dim_requested && !requested_measures.is_empty() {
+                    return Err("Cannot select both the measure dimension and specific measures.".to_string());
+                }
+
+                // Parse WHERE clause
                 let mut filters = HashMap::new();
                 if let Some(selection) = &select.selection {
                     extract_where_map(selection, &mut filters)?;
                 }
 
-                // If they ONLY asked for 'value', we execute the old cell-based query
-                if axes.is_empty() {
-                    let mut final_query = Vec::new();
-                    for dim in &cube.dimension_names {
-                        match filters.get(dim) {
-                            Some(val) => final_query.push(val.as_str()),
-                            None => return Err(format!("Dimension '{}' must be specified if not selected as an axis", dim)),
+                if !requested_measures.is_empty() {
+                    if let Some(m_dim) = &m_dim_name {
+                        if filters.contains_key(m_dim) {
+                            return Err(format!("Cannot filter on '{}' when pivoting specific measures.", m_dim));
                         }
                     }
-                    let result = cube.query_consolidated(&final_query);
-                    return Ok(result.to_string());
+                } else if !measure_dim_requested && axes.is_empty() {
+                    // Fallback for single cell query
+                    if !output_columns.contains(&"value".to_string()) {
+                        output_columns.push("value".to_string());
+                    }
                 }
 
-                // Otherwise, they asked for a Slice (Table output)!
-                let slice_query = SliceQuery { axes, filters };
+                // Execute!
+                let slice_query = SliceQuery { output_columns, axes, requested_measures, filters };
                 match cube.query_slice(&slice_query) {
-                    Ok(result_set) => {
-                        // Format the ResultSet into a nice ASCII table string
-                        return Ok(format_result_set(result_set));
-                    }
+                    Ok(result_set) => return Ok(format_result_set(result_set)),
                     Err(e) => return Err(e),
                 }
             }
@@ -70,13 +108,41 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
             let cube_name = name.to_string();
             
             // Extract the column names (which act as our Dimensions)
-            let dim_names: Vec<String> = columns.iter().map(|c| c.name.to_string()).collect();
+            let mut dim_names = Vec::new(); 
+			
+			// No longer use this to get dims: columns.iter().map(|c| c.name.to_string()).collect();
+
+			// Store the measure dimension name here if we find it
+            let mut measure_dim: Option<String> = None;
+			
+			for col in columns {
+                let col_name = col.name.to_string();
+                let data_type = col.data_type.to_string().to_uppercase();
+
+                // If the user specified MEASURE in the SQL, we save it
+                if data_type == "MEASURE" {
+                    measure_dim = Some(col_name.clone());
+                }
+                
+                dim_names.push(col_name);
+            }
+
             let dim_refs: Vec<&str> = dim_names.iter().map(|s| s.as_str()).collect();
+			
+
 
             // The Catalog creates the dimensions automatically if they don't exist
-            catalog.add_cube(&cube_name, &dim_refs);
+            catalog.add_cube(&cube_name, &dim_refs, measure_dim.as_deref(), is_aggregating);
+			
+			let type_str = if is_aggregating { "Transactional" } else { "Attribute" };
             
-            Ok(format!("Cube '{}' created with dimensions: {:?}", cube_name, dim_names))
+			// Return a nice message to the shell
+            let msg = match measure_dim {
+                Some(m) => format!("Cube '{}' created. Measure dimension: {}", cube_name, m),
+                None => format!("Cube '{}' created with no explicit measure dimension.", cube_name),
+            };
+            
+            Ok(msg)
         }
 
         // 3. INSERT INTO (Upsert)
@@ -105,7 +171,10 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
 
                         // Extract the final numeric value
                         let measure_str = row.last().unwrap().to_string();
-                        let measure_val: f64 = measure_str.parse().unwrap_or(0.0);
+                        let measure_val = match measure_str.parse::<f64>() {
+                            Ok(n) => CellValue::Numeric(n),
+                            Err(_) => CellValue::String(measure_str.replace("'", "")),
+                        };
 
                         // Write to the Cube (This acts as an UPSERT)
                         let member_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
@@ -167,25 +236,17 @@ fn extract_where_map(expr: &Expr, filters: &mut HashMap<String, String>) -> Resu
 
 // Helper: Formats the ResultSet into an ASCII table
 fn format_result_set(rs: ResultSet) -> String {
-    if rs.rows.is_empty() {
-        return "0 rows returned.".to_string();
-    }
-
+    if rs.rows.is_empty() { return "0 rows returned.".to_string(); }
     let mut output = String::new();
     
-    // Header Row
     output.push_str(&rs.headers.join(" | "));
-    output.push_str(" | Value\n");
-    
-    // Separator line
-    output.push_str(&"-".repeat(output.len() - 1));
+    output.push('\n');
+    output.push_str(&"-".repeat(rs.headers.len() * 10));
     output.push('\n');
 
-    // Data Rows
-    for (row, value) in rs.rows {
+    for row in rs.rows {
         output.push_str(&row.join(" | "));
-        output.push_str(&format!(" | {}\n", value));
+        output.push('\n');
     }
-
     output
 }

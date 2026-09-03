@@ -72,7 +72,9 @@ fn process_command(catalog: &mut Catalog, line: &str) {
             ".cubes" => {
                 println!("Cubes in Catalog:");
                 for (name, cube) in &catalog.cubes {
-                    println!("  - {} (Dimensions: {:?})", name, cube.dimension_names);
+                    let m_dim = cube.measure_dimension.clone().unwrap_or_else(|| "None".to_string());
+                    let cube_type = if cube.is_aggregating { "Transactional" } else { "Attribute" };
+                    println!("  - {} [{}] (Dims: {:?}) [Measure Dim: {}]", name, cube_type, cube.dimension_names, m_dim);
                 }
             }
             
@@ -172,7 +174,7 @@ fn process_command(catalog: &mut Catalog, line: &str) {
 
                     if let Some(dim_arc) = catalog.dimensions.get(dim_name) {
                         println!("Hierarchy for '{}' in {}:", member, dim_name);
-                        dim_arc.read().unwrap().print_tree(member, 0);
+                        dim_arc.read().unwrap().print_tree(member, 0, 1.0);
                     } else {
                         println!("Error: Dimension '{}' not found.", dim_name);
                     }

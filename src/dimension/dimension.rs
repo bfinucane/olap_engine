@@ -99,9 +99,10 @@ fn get_or_create(&mut self, name: &str, m_type: MemberType) -> u32 {
     }
 
     // Recursively prints an ASCII tree of the hierarchy
-pub fn print_tree(&self, member: &str, depth: usize) {
+
+    pub fn print_tree(&self, member: &str, depth: usize, current_weight: f64) {
         let prefix = "  ".repeat(depth);
-        let key = member.to_lowercase(); // Lookup using lowercase
+        let key = member.to_lowercase(); 
         
         if let Some(&id) = self.member_to_id.get(&key) {
             let node_type = match self.member_types.get(&id) {
@@ -110,20 +111,22 @@ pub fn print_tree(&self, member: &str, depth: usize) {
                 None => "(Unknown)",
             };
             
-            // Fetch the beautiful original casing to print!
+            // Format the weight if it's not exactly 1.0
+            let weight_str = if (current_weight - 1.0).abs() > 0.001 {
+                format!(" [w: {}]", current_weight)
+            } else {
+                "".to_string()
+            };
+            
             let display_name = self.get_name(id);
-            println!("{}└─ {} {}", prefix, display_name, node_type);
+            // Print the weight right next to the node!
+            println!("{}└─ {} {}{}", prefix, display_name, node_type, weight_str);
 
             if let Some(children) = self.consolidations.get(&id) {
-                for &(child_id, weight) in children {
+                for &(child_id, child_weight) in children {
                     let child_name = self.get_name(child_id);
-                    let weight_str = if (weight - 1.0).abs() > 0.001 {
-                        format!(" [w: {}]", weight)
-                    } else {
-                        "".to_string()
-                    };
-                    
-                    self.print_tree(&child_name, depth + 1);
+                    // Pass the child's weight into the recursive call
+                    self.print_tree(&child_name, depth + 1, child_weight);
                 }
             }
         } else {

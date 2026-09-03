@@ -1,6 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
-use crate::cube::node::Node;
+use crate::cube::node::{Node, CellValue};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SparseStore {
@@ -19,7 +19,7 @@ impl SparseStore {
     }
 
     // --- WRITE LOGIC ---
-    pub fn write(&mut self, coords: &[u32], value: f64) {
+    pub fn write(&mut self, coords: &[u32], value: CellValue) {
         let mut current_node = &mut self.root;
         
         for &id in coords {
@@ -33,71 +33,46 @@ impl SparseStore {
         current_node.value = Some(value);
     }
 
-    // --- QUERY LOGIC (Moved from query.rs) ---
-    pub fn query(&self, coords: &[Option<u32>]) -> f64 {
-        Self::query_recursive(&self.root, coords, 0)
-    }
-	// --- EXACT QUERY FOR JIT CALCULATION ---
+
+// --- EXACT QUERY FOR JIT CALCULATION ---
     // Takes an exact path of leaf IDs and fetches the value. No wildcards.
-    pub fn query_exact(&self, coords: &[u32]) -> f64 {
+    // Changed return type from f64 to Option<CellValue>
+    pub fn query_exact(&self, coords: &[u32]) -> Option<CellValue> {
         let mut current_node = &self.root;
         
-        // Walk down the tree following the IDs
         for id in coords {
             match current_node.children.get(id) {
                 Some(child) => current_node = child,
-                None => return 0.0, // If the path breaks, there is no data here
+                None => return None, // If the path breaks, there is no data here
             }
         }
         
-        // Return the value if it exists, otherwise 0.0
-        current_node.value.unwrap_or(0.0)
+        // Return a clone of the value if it exists, otherwise None
+        current_node.value.clone()
     }
-	
-    fn query_recursive(node: &Node, coords: &[Option<u32>], depth: usize) -> f64 {
-        // Base case: we reached the target depth
-        if depth == coords.len() {
-            return node.value.unwrap_or(0.0);
-        }
 
-        match coords[depth] {
-            // Case 1: Exact Match (Drill down)
-            Some(id) => {
-                match node.children.get(&id) {
-                    Some(child) => Self::query_recursive(child, coords, depth + 1),
-                    None => 0.0,
-                }
-            }
-            // Case 2: Wildcard/None (Aggregate all children)
-            None => {
-                let mut sum = 0.0;
-                for child in node.children.values() {
-                    sum += Self::query_recursive(child, coords, depth + 1);
-                }
-                sum
-            }
-        }
-    }
+
 
     // --- SUB-CUBE SCANNER ---
     // allowed_leaves: For each dimension, a Set of valid IDs, or None to allow all.
-    pub fn scan_subcube(&self, allowed_leaves: &[Option<HashSet<u32>>]) -> Vec<(Vec<u32>, f64)> {
+    pub fn scan_subcube(&self, allowed_leaves: &[Option<HashSet<u32>>]) -> Vec<(Vec<u32>, CellValue)> {
         let mut results = Vec::new();
         self.scan_recursive(&self.root, allowed_leaves, 0, &mut Vec::new(), &mut results);
         results
     }
-    fn scan_recursive(
+    
+	fn scan_recursive(
         &self, 
         node: &Node, 
         allowed_leaves: &[Option<HashSet<u32>>], 
         depth: usize, 
         current_path: &mut Vec<u32>, 
-        results: &mut Vec<(Vec<u32>, f64)>
+        results: &mut Vec<(Vec<u32>, CellValue)>
     ) {
         // Base case: We reached the bottom of the tree
         if depth == allowed_leaves.len() {
-            if let Some(val) = node.value {
-                results.push((current_path.clone(), val));
+            if let Some(val) = &node.value {
+                results.push((current_path.clone(), val.clone()));
             }
             return;
         }

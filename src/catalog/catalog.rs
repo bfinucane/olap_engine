@@ -39,7 +39,7 @@ impl Catalog {
         new_dim
     }
 
-	pub fn add_cube(&mut self, name: &str, dim_names: &[&str]) {
+	pub fn add_cube(&mut self, name: &str, dim_names: &[&str], measure_dim: Option<&str>, is_aggregating : bool) {
         let mut dim_arcs = Vec::new();
         let mut dim_names_vec = Vec::new();
 
@@ -47,8 +47,11 @@ impl Catalog {
             dim_arcs.push(self.get_or_create_dimension(d));
             dim_names_vec.push(d.to_string()); // Cube remembers original dimension casing
         }
-
-        let cube = Cube::new(name, dim_names_vec, dim_arcs);
+        // Convert the Option<&str> to Option<String>
+        let measure_string = measure_dim.map(|s| s.to_string());
+		
+		// Pass information to cube
+        let cube = Cube::new(name, dim_names_vec, dim_arcs, measure_string, is_aggregating);
         // Save the cube under a lowercase key
         self.cubes.insert(name.to_lowercase(), cube);
     }
