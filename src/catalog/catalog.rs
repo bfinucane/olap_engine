@@ -60,7 +60,10 @@ impl Catalog {
         // Always look up using lowercase
         self.cubes.get_mut(&name.to_lowercase())
     }
-
+	
+	pub fn get_cube(&self, name: &str) -> Option<&Cube> {
+			self.cubes.get(&name.to_lowercase())
+		}
     // --- PERSISTENCE ---
 
 	pub fn save_to_disk(&self, filepath: &str) {

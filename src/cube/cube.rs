@@ -8,10 +8,10 @@ use crate::storage::sparse_store::SparseStore;
 use crate::cube::node::CellValue;
 
 pub struct SliceQuery {
-    pub output_columns: Vec<String>,      // The exact order requested in SELECT
-    pub axes: Vec<String>,                // The dimensions to group by
-    pub requested_measures: Vec<String>,  // The specific measures to pivot (if any)
-    pub filters: HashMap<String, String>, // The WHERE clause
+    pub output_columns: Vec<String>,      		// The exact order requested in SELECT
+    pub axes: Vec<String>,                		// The dimensions to group by
+    pub requested_measures: Vec<String>,  		// The specific measures to pivot (if any)
+    pub filters: HashMap<String, Vec<String>>, // The WHERE clause
 }
 
 pub struct ResultSet {
@@ -123,6 +123,23 @@ impl Cube {
         total
     }
 
+// Fast O(1) lookup for exact strings (Perfect for Attribute Joins)
+    pub fn read_cell(&self, members: &[&str]) -> Option<CellValue> {
+        if members.len() != self.dimensions.len() { return None; }
+        
+        let mut coords = Vec::new();
+        for (i, m) in members.iter().enumerate() {
+            let dim = self.dimensions[i].read().unwrap();
+            if let Some(id) = dim.get_id(m) {
+                coords.push(id);
+            } else {
+                return None; // If the member doesn't exist, the cell doesn't exist
+            }
+        }
+        
+        self.store.query_exact(&coords)
+    }
+
     // Helper: Recursively combine leaves. (e.g., [France, Germany] x [Laptop] x [Q1])
 fn calculate_jit(
         &self, 
@@ -197,6 +214,8 @@ fn calculate_jit(
     }
 
 pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
+        println!("DEBUG: Cube dim_names={:?}, Cube measure_dim={:?}", self.dimension_names, self.measure_dimension);
+        println!("DEBUG [query_slice]: requested_measures={:?}, filters={:?}", query.requested_measures, query.filters);
         let dim_count = self.dimensions.len();
         let mut scanner_filters: Vec<Option<HashSet<u32>>> = vec![None; dim_count];
         let mut weight_maps: Vec<HashMap<u32, f64>> = vec![HashMap::new(); dim_count];
@@ -210,34 +229,25 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                 axis_indices.push(i);
             }
 
-            if let Some(filter_val) = query.filters.get(dim_name) {
-                if self.is_aggregating {
-                    // Standard Cube: Resolve to Leaves!
-                    let leaves = dim.get_leaf_descendants(filter_val);
-                    if leaves.is_empty() { return Err(format!("Member '{}' not found", filter_val)); }
-                    scanner_filters[i] = Some(leaves.keys().cloned().collect());
-                    weight_maps[i] = leaves;
-                } else {
-                    // Attribute Cube: Do NOT resolve to leaves. Just fetch the exact ID!
-                    if let Some(id) = dim.get_id(filter_val) {
-                        let mut exact_id = HashSet::new();
-                        exact_id.insert(id);
-                        scanner_filters[i] = Some(exact_id);
-                        weight_maps[i].insert(id, 1.0); // Weight is irrelevant here, just set to 1.0
+			if let Some(filter_vals) = query.filters.get(dim_name) {
+                let mut combined_leaf_ids = HashSet::new();
+                
+                for filter_val in filter_vals {
+                    if self.is_aggregating {
+                        let leaves = dim.get_leaf_descendants(filter_val);
+                        if leaves.is_empty() { return Err(format!("Member '{}' not found", filter_val)); }
+                        combined_leaf_ids.extend(leaves.keys().cloned());
+                        weight_maps[i].extend(leaves);
                     } else {
-                        return Err(format!("Member '{}' not found", filter_val));
+                        if let Some(id) = dim.get_id(filter_val) {
+                            combined_leaf_ids.insert(id);
+                            weight_maps[i].insert(id, 1.0); // Attribute
+                        } else {
+                            return Err(format!("Member '{}' not found", filter_val));
+                        }
                     }
                 }
-            } else if Some(dim_name) == self.measure_dimension.as_ref() && !query.requested_measures.is_empty() {
-                // PIVOT MODE (Unchanged)
-                if !axis_indices.contains(&i) { axis_indices.push(i); }
-                let mut valid_measures = HashSet::new();
-                for m_name in &query.requested_measures {
-                    if let Some(id) = dim.get_id(m_name) {
-                        valid_measures.insert(id);
-                    }
-                }
-                scanner_filters[i] = Some(valid_measures);
+                scanner_filters[i] = Some(combined_leaf_ids);
             }
         }
 
@@ -253,6 +263,9 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             let mut row_key = Vec::new();
             let mut current_measure_name = "value".to_string();
 
+            // DEBUG PHASE 1: What did the Trie actually find?
+            println!("DEBUG [Trie]: Found coords: {:?} with value: {}", coords, final_val);
+
             for i in 0..dim_count {
                 // Only apply math if the cell is Numeric AND the cube is aggregating
                 if self.is_aggregating {
@@ -263,15 +276,24 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                     }
                 }
                 
-                if axis_indices.contains(&i) {
+                if axis_indices.contains(&i) || Some(i) == measure_dim_idx{
                     if Some(i) == measure_dim_idx && !query.requested_measures.is_empty() {
                         let dim = self.dimensions[i].read().unwrap();
-                        current_measure_name = dim.get_name(coords[i]);
+						let raw_name = dim.get_name(coords[i]);
+						// Find the exact casing the user asked for in the SELECT, or fallback to the dictionary casing
+						current_measure_name = query.requested_measures.iter()
+							.find(|m| m.eq_ignore_ascii_case(&raw_name))
+							.cloned()
+							.unwrap_or(raw_name);
                     } else {
                         row_key.push(coords[i]);
                     }
                 }
             }
+
+            // DEBUG PHASE 2: How is it being grouped?
+            println!("DEBUG [Grouping]: row_key={:?}, measure_name='{}', accumulated_val={}", 
+                     row_key, current_measure_name, final_val);
 
             // Accumulate (Add numbers, or just overwrite strings)
             let measure_map = grouped_results.entry(row_key).or_insert_with(HashMap::new);
@@ -293,31 +315,46 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             .filter(|&i| Some(i) != measure_dim_idx || query.requested_measures.is_empty())
             .collect();
 
-        for (axis_ids, measure_map) in grouped_results {
+ for (axis_ids, measure_map) in grouped_results {
             let mut final_row = Vec::new();
             let mut row_dim_strings = HashMap::new();
             
+            // 1. Safely map any available axis IDs to their String names
             for (idx, &id) in display_axis_indices.iter().zip(axis_ids.iter()) {
                 let dim_name = &self.dimension_names[*idx];
                 let dim_val = self.dimensions[*idx].read().unwrap().get_name(id);
                 row_dim_strings.insert(dim_name.clone(), dim_val);
             }
 
+            // 2. Build the output row exactly matching the requested SELECT order
             for col in &query.output_columns {
+                // DEBUG PHASE 3: What column is the formatter looking for?
+                
+                println!("DEBUG [Format]: Looking for col='{}'. Current measure_map keys: {:?}", 
+                         col, measure_map.keys());
+                
                 if let Some(dim_val) = row_dim_strings.get(col) {
+                    // It's a dimension
                     final_row.push(dim_val.clone());
                 } else if query.requested_measures.contains(col) || col == "value" {
-                    // Safely get the value or print "-"
-                    if let Some(val) = measure_map.get(col) {
+                    // It's a measure! Make sure we lookup the EXACT string, case-sensitive!
+                    let matched_val = query.requested_measures.iter().find(|m| m.eq_ignore_ascii_case(col));
+                    let lookup_key = matched_val.unwrap_or(col);
+                    
+                    if let Some(val) = measure_map.get(lookup_key) {
                         final_row.push(val.to_string());
                     } else {
                         final_row.push("-".to_string());
                     }
+                } else {
+                    // It's a Joined Attribute placeholder
+                    final_row.push(String::new());
                 }
             }
+            
             result_set.rows.push(final_row);
         }
-
+		
         Ok(result_set)
     }
 }

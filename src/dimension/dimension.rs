@@ -23,6 +23,9 @@ pub struct Dimension {
     consolidations: HashMap<u32, Vec<(u32, f64)>>,
     
     next_id: u32,
+	
+	// Tracks the explicit default, or the first element added
+    pub default_member_id: Option<u32>,
 }
 
 impl Dimension {
@@ -40,6 +43,7 @@ impl Dimension {
             member_types: HashMap::new(),
             consolidations: HashMap::new(),
             next_id: 1,
+			default_member_id: None, // Starts empty
         }
     }
 
@@ -78,7 +82,7 @@ impl Dimension {
         }
     }
 
-fn get_or_create(&mut self, name: &str, m_type: MemberType) -> u32 {
+    fn get_or_create(&mut self, name: &str, m_type: MemberType) -> u32 {
         let key = name.to_lowercase(); // The hidden lookup key
 
         if let Some(&id) = self.member_to_id.get(&key) {
@@ -90,10 +94,34 @@ fn get_or_create(&mut self, name: &str, m_type: MemberType) -> u32 {
         self.id_to_name.insert(id, name.to_string()); // Save original casing for output formatting!
         self.member_types.insert(id, m_type);
         self.next_id += 1;
+
+		// If this is the very first element added, it becomes the default!
+        if self.default_member_id.is_none() {
+            self.default_member_id = Some(id);
+        }		
+		
+		
         id
     }
 
-// Returns how many unique strings are stored in this dimension
+    // Allows a user to explicitly change the default member
+    pub fn set_default_member(&mut self, name: &str) -> Result<(), String> {
+        if let Some(id) = self.get_id(name) {
+            self.default_member_id = Some(id);
+            Ok(())
+        } else {
+            Err(format!("Member '{}' does not exist in dimension '{}'", name, self.name))
+        }
+    }
+    
+    // Safely fetches the name of the default member
+    pub fn get_default_member_name(&self) -> Option<String> {
+        self.default_member_id.map(|id| self.get_name(id))
+    }
+
+
+
+	// Returns how many unique strings are stored in this dimension
     pub fn len(&self) -> usize {
         self.member_to_id.len()
     }
@@ -134,10 +162,10 @@ fn get_or_create(&mut self, name: &str, m_type: MemberType) -> u32 {
         }
     }
 
-pub fn get_id(&self, member: &str) -> Option<u32> {
+	pub fn get_id(&self, member: &str) -> Option<u32> {
         // Automatically lowercase any incoming query string
         self.member_to_id.get(&member.to_lowercase()).copied()
-    }
+		}
 
     /// THE MAGIC: Resolves any member into a list of its LEAF descendants and their aggregated weights.
     /// If you pass a Leaf, it just returns itself with weight 1.0.

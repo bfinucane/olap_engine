@@ -59,6 +59,7 @@ fn process_command(catalog: &mut Catalog, line: &str) {
             ".help" => {
                 println!("Available Commands:");
                 println!("  .cubes                       - List all cubes in the catalog");
+				println!("  .dimensions                  - List all dimensions in the catalog");
                 println!("  .import <file.csv> <cube>    - Import data from CSV");
                 println!("  .rollup <dim> <p> <c> <wt>   - Create parent/child hierarchy relation");
                 println!("  .run <script.sql>            - Run a batch script of commands");
@@ -78,6 +79,39 @@ fn process_command(catalog: &mut Catalog, line: &str) {
                 }
             }
             
+            ".cube" => {
+                // Usage: .cube Financials
+                if parts.len() == 2 {
+                    let cube_name = parts[1];
+                    if let Some(cube) = catalog.get_cube(cube_name) {
+                        println!("======================================");
+                        println!("Cube '{}' State Dump", cube.name);
+                        println!("======================================");
+                        
+                        let c_type = if cube.is_aggregating { "Transactional (Aggregates)" } else { "Attribute (No Math)" };
+                        println!("Type: {}", c_type);
+                        
+                        let m_dim = cube.measure_dimension.clone().unwrap_or_else(|| "None".to_string());
+                        println!("Measure Dimension: {}", m_dim);
+                        
+                        println!("Dimensions ({}):", cube.dimension_names.len());
+                        for (i, dim_name) in cube.dimension_names.iter().enumerate() {
+                            let dim = cube.dimensions[i].read().unwrap();
+                            let is_m = if Some(dim_name) == cube.measure_dimension.as_ref() { "[MEASURE]" } else { "" };
+                            println!("  [{}] {} (Size: {}) {}", i, dim.name, dim.len(), is_m);
+                        }
+
+                        println!("Raw Trie Data:");
+                        cube.store.print_tree();
+                        
+                        println!("======================================");
+                    } else {
+                        println!("Error: Cube '{}' not found.", cube_name);
+                    }
+                } else {
+                    println!("Usage: .cube <name>");
+                }
+            }            
 			//IMPORT Commands
 			".import" => {
                 if parts.len() == 3 {

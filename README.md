@@ -1,8 +1,8 @@
-# Patria OLAP Engine
+# Patricia OLAP Engine
 
 An experimental, high-performance, in-memory Multidimensional OLAP database written in Rust. 
 
-Inspired by enterprise OLAP systems like IBM TM1 and Infor OLAP Server, Patria uses a **Sparse Patria Trie** for storage and supports **Parent-Child Ragged Hierarchies** with Just-In-Time (JIT) aggregations. It wraps this multidimensional core in a standard ANSI SQL parser for easy querying.
+Inspired by enterprise OLAP systems like IBM TM1 and Infor OLAP Server, Patria uses a **Sparse Patricia Trie** for storage and supports **Parent-Child Ragged Hierarchies** with Just-In-Time (JIT) aggregations. It wraps this multidimensional core in a standard ANSI SQL parser for easy querying.
 
 ## Features
 

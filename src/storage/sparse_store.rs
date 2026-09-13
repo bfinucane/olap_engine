@@ -18,6 +18,26 @@ impl SparseStore {
         }
     }
 
+// A quick debug printer for the Trie
+    pub fn print_tree(&self) {
+        if self.root.children.is_empty() {
+            println!("    (Trie is empty)");
+            return;
+        }
+        self.print_node(&self.root, &mut Vec::new());
+    }
+
+    fn print_node(&self, node: &Node, path: &mut Vec<u32>) {
+        if let Some(val) = &node.value {
+            println!("    Coords: {:?} -> Value: {}", path, val);
+        }
+        for (id, child) in &node.children {
+            path.push(*id);
+            self.print_node(child, path);
+            path.pop();
+        }
+    }
+
     // --- WRITE LOGIC ---
     pub fn write(&mut self, coords: &[u32], value: CellValue) {
         let mut current_node = &mut self.root;

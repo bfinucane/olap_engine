@@ -10,10 +10,23 @@ use crate::cube::cube::{SliceQuery, ResultSet};
 
 // Changed return type from f64 to String to support textual success messages
 pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, String> {
-	    // 1. Intercept custom "ATTRIBUTE" keyword
-    let mut is_aggregating = true;
+	
     let mut parseable_sql = sql_query.trim().to_string();
     let upper_sql = parseable_sql.to_uppercase();
+	
+	// The following two interceptions allow us to use the standard SQL interpreter without modifications. 
+    // 1. Intercept CREATE DIMENSION
+    if upper_sql.starts_with("CREATE DIMENSION") {
+        let dim_name = sql_query[16..].trim().trim_end_matches(';');
+        catalog.get_or_create_dimension(dim_name);
+        return Ok(format!("Dimension '{}' created successfully.", dim_name));
+    }
+
+	
+	// 2. Intercept custom "ATTRIBUTE" keyword
+    let mut is_aggregating = true;
+
+
 
     if upper_sql.starts_with("CREATE ATTRIBUTE TABLE") {
         is_aggregating = false;
@@ -29,75 +42,216 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
     let statement = &ast[0];
     
     match statement {
-// 1. SELECT (Query)
+
 // 1. SELECT (Query)
         Statement::Query(query) => {
             if let SetExpr::Select(select) = &*query.body {
-                let cube_name = select.from[0].relation.to_string();
-                let cube = catalog.get_cube_mut(&cube_name)
-                    .ok_or_else(|| format!("Cube '{}' not found", cube_name))?;
+                
+                // --- 1. IDENTIFY PRIMARY AND JOINED CUBES ---
+                // Get Primary Cube (e.g., Transactions)
+                let relation = &select.from[0];
+                let primary_cube_name = match &relation.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err("Unsupported FROM clause.".to_string()),
+                };
+                let primary_cube = catalog.get_cube(&primary_cube_name)
+                    .ok_or_else(|| format!("Cube '{}' not found", primary_cube_name))?;
 
-                let mut output_columns = Vec::new();
-                let mut axes = Vec::new();
-                let mut requested_measures = Vec::new();
-                let mut measure_dim_requested = false;
-
-                let m_dim_name = cube.measure_dimension.clone();
-
-                // Pass 1: Categorize columns
-                for proj in &select.projection {
-                    let col_name = proj.to_string();
-                    output_columns.push(col_name.clone());
-
-                    if cube.dimension_names.contains(&col_name) {
-                        axes.push(col_name.clone());
-                        if Some(&col_name) == m_dim_name.as_ref() {
-                            measure_dim_requested = true;
-                        }
-                    } else if let Some(m_dim) = &m_dim_name {
-                        // Check if it's a member of the measure dimension
-                        let dim_idx = cube.dimension_names.iter().position(|n| n == m_dim).unwrap();
-                        let dim = cube.dimensions[dim_idx].read().unwrap();
-                        if dim.get_id(&col_name).is_some() {
-                            requested_measures.push(col_name);
-                        } else if col_name != "value" {
-                            return Err(format!("Column '{}' not found.", col_name));
-                        }
-                    } else if col_name != "value" {
-                        return Err(format!("Column '{}' not found.", col_name));
+                // Check for JOINs (e.g., Attribute Cubes)
+                let mut joined_cube_name = None;
+                if !relation.joins.is_empty() {
+                    if let sqlparser::ast::TableFactor::Table { name, .. } = &relation.joins[0].relation {
+                        joined_cube_name = Some(name.to_string());
                     }
                 }
 
-                // Pass 2: Conflict Validation
-                if measure_dim_requested && !requested_measures.is_empty() {
-                    return Err("Cannot select both the measure dimension and specific measures.".to_string());
+                // --- 2. CATEGORIZE COLUMNS ---
+                let mut output_columns = Vec::new();
+                let mut axes = Vec::new();
+                let mut requested_measures = Vec::new();
+                let mut requested_attributes = Vec::new(); // NEW: Track attribute columns
+                let mut measure_dim_requested = false;
+
+                let p_m_dim = primary_cube.measure_dimension.clone();
+
+				for proj in &select.projection {
+                    let col_raw = proj.to_string();
+                    let col_name = col_raw.split('.').last().unwrap().trim().to_string();
+
+					println!("DEBUG: col_name='{}', bytes={:?}", col_name, col_name.as_bytes());
+					println!("DEBUG: Parser is looking for column: '{}'", col_name); // DEBUG!!
+                    
+                    output_columns.push(col_name.clone());
+                    
+                    let mut found = false; // Track if we successfully categorized the column
+
+                    println!("DEBUG [Parser Check]: col_name='{}', p_m_dim='{:?}'", col_name, p_m_dim);
+
+                    // 1. Is it a primary dimension?
+                    if primary_cube.dimension_names.contains(&col_name) {
+                        axes.push(col_name.clone());
+                        if Some(&col_name) == p_m_dim.as_ref() { measure_dim_requested = true; }
+                        found = true;
+                    } 
+                    // 2. Is it a primary measure?
+                    else if let Some(m_dim) = &p_m_dim {
+                        let dim_idx = primary_cube.dimension_names.iter().position(|n| n == m_dim).unwrap();
+                        
+                        // NEW: Pull it out into a variable so we can print it
+                        let target_dim = primary_cube.dimensions[dim_idx].read().unwrap();
+                        
+                        println!("DEBUG [Measure Check]: Checking for '{}' inside dimension named '{}' (Size: {})", 
+                                 col_name, target_dim.name, target_dim.len());
+
+                        if target_dim.get_id(&col_name).is_some() {
+                            // FETCH THE OFFICIAL CASING FROM THE DICTIONARY!
+                            // (We fixed this earlier to ensure casing was perfect)
+                            if let Some(id) = target_dim.get_id(&col_name) {
+                                requested_measures.push(target_dim.get_name(id)); 
+                                found = true;
+                            }
+                        } else {
+                            println!("DEBUG [Measure Check]: get_id failed!");
+                        }
+                    }
+                    
+                    // 3. Is it a joined attribute?
+                    if !found {
+                        if let Some(j_name) = &joined_cube_name {
+                            if let Some(j_cube) = catalog.get_cube(j_name) {
+                                if let Some(jm_dim) = &j_cube.measure_dimension {
+                                    let j_dim_idx = j_cube.dimension_names.iter().position(|n| n == jm_dim).unwrap();
+                                    if j_cube.dimensions[j_dim_idx].read().unwrap().get_id(&col_name).is_some() {
+                                        requested_attributes.push(col_name.clone());
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 4. If it wasn't found anywhere, throw the error!
+                    if !found && col_name != "value" {
+                        return Err(format!("Column '{}' not found in primary or joined cube.", col_name));
+                    }
                 }
 
-                // Parse WHERE clause
-                let mut filters = HashMap::new();
+                // --- 3. EXECUTE MAIN QUERY ---
+                if measure_dim_requested && !requested_measures.is_empty() {
+                    return Err("Cannot select both measure dimension and specific measures.".to_string());
+                }
+
+				let mut filters = HashMap::new();
                 if let Some(selection) = &select.selection {
                     extract_where_map(selection, &mut filters)?;
                 }
 
+                // Inject Default Members for omitted dimensions
+                for dim_name in &primary_cube.dimension_names {
+                    // We skip the Measure Dimension (it has special pivot rules)
+                    if Some(dim_name) == p_m_dim.as_ref() { continue; }
+                    
+                    // If it's not an Axis and not Filtered, we must default it
+                    if !axes.contains(dim_name) && !filters.contains_key(dim_name) {
+                        let dim_idx = primary_cube.dimension_names.iter().position(|n| n == dim_name).unwrap();
+                        let dim = primary_cube.dimensions[dim_idx].read().unwrap();
+                        
+                        if let Some(default_name) = dim.get_default_member_name() {
+                            // Inject it into the WHERE clause dynamically
+                            // We use a vector because we are about to upgrade filters to handle IN (...)
+                            filters.insert(dim_name.clone(), vec![default_name]);
+                        }
+                    }
+                }
+
+                // Fallback for single cell query
                 if !requested_measures.is_empty() {
-                    if let Some(m_dim) = &m_dim_name {
+
+                    if let Some(m_dim) = &p_m_dim {
                         if filters.contains_key(m_dim) {
                             return Err(format!("Cannot filter on '{}' when pivoting specific measures.", m_dim));
                         }
                     }
                 } else if !measure_dim_requested && axes.is_empty() {
-                    // Fallback for single cell query
                     if !output_columns.contains(&"value".to_string()) {
                         output_columns.push("value".to_string());
                     }
                 }
 
-                // Execute!
-                let slice_query = SliceQuery { output_columns, axes, requested_measures, filters };
-                match cube.query_slice(&slice_query) {
-                    Ok(result_set) => return Ok(format_result_set(result_set)),
-                    Err(e) => return Err(e),
+                let slice_query = SliceQuery { 
+                    output_columns: output_columns.clone(), 
+                    axes, 
+                    requested_measures, 
+                    filters 
+                };
+                
+                let mut result_set = primary_cube.query_slice(&slice_query)?;
+
+ 
+                // --- 4. ENRICH WITH JOINED ATTRIBUTES (BULK METHOD) ---
+                if let Some(j_name) = &joined_cube_name {
+                    if !requested_attributes.is_empty() {
+                        let j_cube = catalog.get_cube(j_name).unwrap();
+                        
+                        // Enforce Rule 1: Must share exactly the same dimension object
+                        let shared_dim = primary_cube.dimension_names.iter()
+                            .find(|d| j_cube.dimension_names.contains(d))
+                            .ok_or_else(|| "JOIN strictly requires a Conformed Dimension (shared name) between cubes.".to_string())?;
+
+                        let shared_col_idx = result_set.headers.iter().position(|h| h == shared_dim)
+                            .ok_or_else(|| format!("Shared dimension '{}' must be in SELECT to join attributes.", shared_dim))?;
+
+                        // Rule 3: Bulk Request! 
+                        // We query the Attribute Cube ONCE for all requested attributes.
+                        // Combine the shared dimension and the requested attributes into the output
+                        let mut attr_outputs = vec![shared_dim.clone()];
+                        attr_outputs.extend(requested_attributes.clone());
+
+                        let attr_slice = SliceQuery {
+                            output_columns: attr_outputs, // Include the attributes!
+                            axes: vec![shared_dim.clone()],
+                            requested_measures: requested_attributes.clone(),
+                            filters: HashMap::new(), 
+                        };
+                        
+                        let attr_results = j_cube.query_slice(&attr_slice)?;
+                        
+                        // Build an O(1) Hash Index in memory: Map<SharedKey, Map<AttrName, Value>>
+                        let mut attr_index = HashMap::new();
+                        for row in attr_results.rows {
+                            let key = row[0].clone(); // Shared Dim Value
+                            let mut attrs = HashMap::new();
+                            for (i, attr_name) in requested_attributes.iter().enumerate() {
+                                 // Measures start at index 1
+                                attrs.insert(attr_name.clone(), row[i + 1].clone()); 
+                            }
+                            attr_index.insert(key, attrs);
+                        }
+
+                        // Stitch the bulk attributes into the primary result set
+                        for row in &mut result_set.rows {
+                            let shared_val = &row[shared_col_idx];
+                            let attrs_for_row = attr_index.get(shared_val);
+
+                            for attr_name in &requested_attributes {
+                                let display_val = match attrs_for_row.and_then(|m| m.get(attr_name)) {
+                                    Some(val) => val.clone(),
+                                    None => "-".to_string(), // Null handling
+                                };
+
+                                // Inject at the requested SELECT column index
+                                let out_idx = result_set.headers.iter().position(|h| h == attr_name).unwrap();
+                                if out_idx < row.len() {
+                                    row[out_idx] = display_val;
+                                } else {
+                                    row.push(display_val);
+                                }
+                            }
+                        }
+                    }
                 }
+
+                return Ok(format_result_set(result_set));
             }
             Err("Unsupported SELECT format.".to_string())
         }
@@ -218,7 +372,9 @@ fn extract_where_conditions(
 }
 
 // Helper: Extracts WHERE Geography = 'Europe' into a HashMap{"Geography": "Europe"}
-fn extract_where_map(expr: &Expr, filters: &mut HashMap<String, String>) -> Result<(), String> {
+// Supports IN
+// Takes a HashMap<String, Vec<String>> to support multiple filter targets
+fn extract_where_map(expr: &Expr, filters: &mut HashMap<String, Vec<String>>) -> Result<(), String> {
     match expr {
         Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
             extract_where_map(left, filters)?;
@@ -227,9 +383,18 @@ fn extract_where_map(expr: &Expr, filters: &mut HashMap<String, String>) -> Resu
         Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
             let dim_target = left.to_string();
             let val_target = right.to_string().replace("'", "");
-            filters.insert(dim_target, val_target);
+            filters.insert(dim_target, vec![val_target]);
         }
-        _ => return Err("Unsupported WHERE clause format. Use Dim = 'Value'".to_string()),
+        Expr::InList { expr, list, negated } => {
+            if *negated { return Err("NOT IN is currently unsupported.".to_string()); }
+            let dim_target = expr.to_string();
+            let mut values = Vec::new();
+            for item in list {
+                values.push(item.to_string().replace("'", ""));
+            }
+            filters.insert(dim_target, values);
+        }
+        _ => return Err("Unsupported WHERE format. Use Dim = 'Val' or Dim IN ('Val1', 'Val2')".to_string()),
     }
     Ok(())
 }
