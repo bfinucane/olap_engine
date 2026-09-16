@@ -1,0 +1,4 @@
+Running script 'select_no_from.sql'...
+> SELECT 1
+Error: SELECT must include a FROM clause naming a cube.
+

@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MemberType {
@@ -126,9 +127,9 @@ impl Dimension {
         self.member_to_id.len()
     }
 
-    // Recursively prints an ASCII tree of the hierarchy
-
-    pub fn print_tree(&self, member: &str, depth: usize, current_weight: f64) {
+        // Recursively appends an ASCII tree of the hierarchy to `out`.
+    // (Previously printed to stdout; now the caller controls the destination.)
+    pub fn print_tree(&self, member: &str, depth: usize, current_weight: f64, out: &mut String) {
         let prefix = "  ".repeat(depth);
         let key = member.to_lowercase(); 
         
@@ -147,18 +148,18 @@ impl Dimension {
             };
             
             let display_name = self.get_name(id);
-            // Print the weight right next to the node!
-            println!("{}└─ {} {}{}", prefix, display_name, node_type, weight_str);
+            // Write the weight right next to the node!
+            let _ = writeln!(out, "{}└─ {} {}{}", prefix, display_name, node_type, weight_str);
 
             if let Some(children) = self.consolidations.get(&id) {
                 for &(child_id, child_weight) in children {
                     let child_name = self.get_name(child_id);
                     // Pass the child's weight into the recursive call
-                    self.print_tree(&child_name, depth + 1, child_weight);
+                    self.print_tree(&child_name, depth + 1, child_weight, out);
                 }
             }
         } else {
-            println!("{}└─ {} (Not Found)", prefix, member);
+            let _ = writeln!(out, "{}└─ {} (Not Found)", prefix, member);
         }
     }
 

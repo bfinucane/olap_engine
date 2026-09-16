@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use crate::cube::node::{Node, CellValue};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -18,22 +19,23 @@ impl SparseStore {
         }
     }
 
-// A quick debug printer for the Trie
-    pub fn print_tree(&self) {
+// A quick debug printer for the Trie.
+    // Appends the tree representation to `out` instead of printing to stdout.
+    pub fn print_tree(&self, out: &mut String) {
         if self.root.children.is_empty() {
-            println!("    (Trie is empty)");
+            let _ = writeln!(out, "    (Trie is empty)");
             return;
         }
-        self.print_node(&self.root, &mut Vec::new());
+        self.print_node(&self.root, &mut Vec::new(), out);
     }
 
-    fn print_node(&self, node: &Node, path: &mut Vec<u32>) {
+    fn print_node(&self, node: &Node, path: &mut Vec<u32>, out: &mut String) {
         if let Some(val) = &node.value {
-            println!("    Coords: {:?} -> Value: {}", path, val);
+            let _ = writeln!(out, "    Coords: {:?} -> Value: {}", path, val);
         }
         for (id, child) in &node.children {
             path.push(*id);
-            self.print_node(child, path);
+            self.print_node(child, path, out);
             path.pop();
         }
     }

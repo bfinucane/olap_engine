@@ -1,0 +1,7 @@
+Running script 'create_duplicate.sql'...
+> CREATE TABLE Sales (Region STRING, Product STRING, M MEASURE)
+Cube 'Sales' created. Measure dimension: M
+
+> CREATE TABLE Sales (Region STRING, Product STRING, M MEASURE)
+Error: Cube 'Sales' already exists.
+

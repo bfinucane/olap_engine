@@ -1,0 +1,142 @@
+Running script 'aggregation.sql'...
+> CREATE TABLE Financials (Calendar STRING, Geography STRING, Scenario STRING, Measure MEASURE)
+Cube 'Financials' created. Measure dimension: Measure
+
+> .rollup Calendar Q1 Jan 1.0
+Rollup added.
+
+> .rollup Calendar Q1 Feb 1.0
+Rollup added.
+
+> .rollup Calendar Q1 Mar 1.0
+Rollup added.
+
+> .rollup Calendar Q2 Apr 1.0
+Rollup added.
+
+> .rollup Calendar Q2 May 1.0
+Rollup added.
+
+> .rollup Calendar Q2 Jun 1.0
+Rollup added.
+
+> .rollup Calendar Total Q1 1.0
+Rollup added.
+
+> .rollup Calendar Total Q2 1.0
+Rollup added.
+
+> .rollup Geography Europe England 1.0
+Rollup added.
+
+> .rollup Geography Europe France 1.0
+Rollup added.
+
+> .rollup Geography Europe Germany 1.0
+Rollup added.
+
+> .rollup Geography "North America" USA 1.0
+Rollup added.
+
+> .rollup Geography "North America" Canada 1.0
+Rollup added.
+
+> .rollup Geography "North America" Mexico 1.0
+Rollup added.
+
+> .rollup Geography All Europe 1.0
+Rollup added.
+
+> .rollup Geography All "North America" 1.0
+Rollup added.
+
+> .rollup Scenario Variant Actuals 1.0
+Rollup added.
+
+> .rollup Scenario Variant Plan -1.0
+Rollup added.
+
+> INSERT INTO Financials VALUES ('Jan', 'France', 'Actuals', 'Sales', 100)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'France', 'Actuals', 'Costs', 40)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'France', 'Plan', 'Sales', 90)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'France', 'Plan', 'Costs', 45)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'Germany', 'Actuals', 'Sales', 200)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'Germany', 'Actuals', 'Costs', 80)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'Germany', 'Plan', 'Sales', 210)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'Germany', 'Plan', 'Costs', 70)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'USA', 'Actuals', 'Sales', 500)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'USA', 'Actuals', 'Costs', 300)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'USA', 'Plan', 'Sales', 450)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Jan', 'USA', 'Plan', 'Costs', 280)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Feb', 'France', 'Actuals', 'Sales', 110)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Feb', 'France', 'Actuals', 'Costs', 50)
+Upserted 1 row(s) into 'Financials'.
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'France' AND Scenario = 'Actuals'
+Sales
+----------
+100
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'Europe' AND Scenario = 'Actuals'
+Sales
+----------
+300
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'North America' AND Scenario = 'Plan'
+Sales
+----------
+450
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'All' AND Scenario = 'Actuals'
+Sales
+----------
+800
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'Europe' AND Scenario = 'Variant'
+Sales
+----------
+0
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Q1' AND Geography = 'France' AND Scenario = 'Actuals'
+Sales
+----------
+210
+
+
+> SELECT Geography, Sales, Costs FROM Financials WHERE Calendar = 'Jan' AND Geography = 'Germany' AND Scenario = 'Actuals'
+Geography | Sales | Costs
+------------------------------
+Germany | 200 | 80
+
+

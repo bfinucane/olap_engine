@@ -1,0 +1,16 @@
+Running script 'basic_query.sql'...
+> CREATE TABLE Financials (Scenario STRING, Geo STRING, Acc MEASURE)
+Cube 'Financials' created. Measure dimension: Acc
+
+> INSERT INTO Financials VALUES ('Actual', 'France', 'Sales', 100)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Budget', 'France', 'Sales', 500)
+Upserted 1 row(s) into 'Financials'.
+
+> SELECT Sales FROM Financials WHERE Scenario = 'Actual' AND Geo = 'France'
+Sales
+----------
+100
+
+

@@ -47,9 +47,10 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
         Statement::Query(query) => {
             if let SetExpr::Select(select) = &*query.body {
                 
-                // --- 1. IDENTIFY PRIMARY AND JOINED CUBES ---
+                                // --- 1. IDENTIFY PRIMARY AND JOINED CUBES ---
                 // Get Primary Cube (e.g., Transactions)
-                let relation = &select.from[0];
+                let relation = select.from.first()
+                    .ok_or_else(|| "SELECT must include a FROM clause naming a cube.".to_string())?;
                 let primary_cube_name = match &relation.relation {
                     sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
                     _ => return Err("Unsupported FROM clause.".to_string()),
@@ -72,20 +73,15 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 let mut requested_attributes = Vec::new(); // NEW: Track attribute columns
                 let mut measure_dim_requested = false;
 
-                let p_m_dim = primary_cube.measure_dimension.clone();
+                                let p_m_dim = primary_cube.measure_dimension.clone();
 
-				for proj in &select.projection {
+                for proj in &select.projection {
                     let col_raw = proj.to_string();
                     let col_name = col_raw.split('.').last().unwrap().trim().to_string();
 
-					println!("DEBUG: col_name='{}', bytes={:?}", col_name, col_name.as_bytes());
-					println!("DEBUG: Parser is looking for column: '{}'", col_name); // DEBUG!!
-                    
                     output_columns.push(col_name.clone());
                     
                     let mut found = false; // Track if we successfully categorized the column
-
-                    println!("DEBUG [Parser Check]: col_name='{}', p_m_dim='{:?}'", col_name, p_m_dim);
 
                     // 1. Is it a primary dimension?
                     if primary_cube.dimension_names.contains(&col_name) {
@@ -95,23 +91,14 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     } 
                     // 2. Is it a primary measure?
                     else if let Some(m_dim) = &p_m_dim {
-                        let dim_idx = primary_cube.dimension_names.iter().position(|n| n == m_dim).unwrap();
-                        
-                        // NEW: Pull it out into a variable so we can print it
-                        let target_dim = primary_cube.dimensions[dim_idx].read().unwrap();
-                        
-                        println!("DEBUG [Measure Check]: Checking for '{}' inside dimension named '{}' (Size: {})", 
-                                 col_name, target_dim.name, target_dim.len());
+                                                let dim_idx = primary_cube.dimension_names.iter().position(|n| n == m_dim).unwrap();
 
-                        if target_dim.get_id(&col_name).is_some() {
+                        let target_dim = primary_cube.dimensions[dim_idx].read().unwrap();
+
+                        if let Some(id) = target_dim.get_id(&col_name) {
                             // FETCH THE OFFICIAL CASING FROM THE DICTIONARY!
-                            // (We fixed this earlier to ensure casing was perfect)
-                            if let Some(id) = target_dim.get_id(&col_name) {
-                                requested_measures.push(target_dim.get_name(id)); 
-                                found = true;
-                            }
-                        } else {
-                            println!("DEBUG [Measure Check]: get_id failed!");
+                            requested_measures.push(target_dim.get_name(id)); 
+                            found = true;
                         }
                     }
                     
@@ -256,13 +243,18 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
             Err("Unsupported SELECT format.".to_string())
         }
 
-        // 2. CREATE TABLE
+                // 2. CREATE TABLE
         // Syntax: CREATE TABLE Sales (Geography, Product)
         Statement::CreateTable { name, columns, .. } => {
             let cube_name = name.to_string();
-            
-            // Extract the column names (which act as our Dimensions)
-            let mut dim_names = Vec::new(); 
+
+            // Refuse to overwrite an existing cube/table.
+            if catalog.get_cube(&cube_name).is_some() {
+                return Err(format!("Cube '{}' already exists.", cube_name));
+            }
+
+                        // Extract the column names (which act as our Dimensions)
+            let mut dim_names = Vec::new();   
 			
 			// No longer use this to get dims: columns.iter().map(|c| c.name.to_string()).collect();
 
@@ -285,11 +277,9 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
 			
 
 
-            // The Catalog creates the dimensions automatically if they don't exist
+                                    // The Catalog creates the dimensions automatically if they don't exist
             catalog.add_cube(&cube_name, &dim_refs, measure_dim.as_deref(), is_aggregating);
-			
-			let type_str = if is_aggregating { "Transactional" } else { "Attribute" };
-            
+
 			// Return a nice message to the shell
             let msg = match measure_dim {
                 Some(m) => format!("Cube '{}' created. Measure dimension: {}", cube_name, m),
@@ -343,32 +333,6 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
 
         _ => Err("Unsupported SQL command.".to_string()),
     }
-}
-
-// Keep the existing extract_where_conditions helper exactly the same!
-fn extract_where_conditions(
-    expr: &Expr, 
-    query_params: &mut Vec<Option<String>>, 
-    dim_names: &[String]
-) -> Result<(), String> {
-    match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            extract_where_conditions(left, query_params, dim_names)?;
-            extract_where_conditions(right, query_params, dim_names)?;
-        }
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-            let dim_target = left.to_string();
-            let val_target = right.to_string().replace("'", "");
-
-            if let Some(index) = dim_names.iter().position(|name| name == &dim_target) {
-                query_params[index] = Some(val_target);
-            } else {
-                return Err(format!("Dimension '{}' does not exist in cube", dim_target));
-            }
-        }
-        _ => return Err("Unsupported WHERE clause format".to_string()),
-    }
-    Ok(())
 }
 
 // Helper: Extracts WHERE Geography = 'Europe' into a HashMap{"Geography": "Europe"}

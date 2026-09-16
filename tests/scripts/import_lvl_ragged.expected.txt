@@ -1,0 +1,55 @@
+Running script 'import_lvl_ragged.sql'...
+> CREATE TABLE Financials (Geography STRING, Measure MEASURE)
+Cube 'Financials' created. Measure dimension: Measure
+
+> .import_lvl tests/scripts/import_lvl_ragged.csv Geography
+Imported 20 level relations into 'Geography'.
+
+> INSERT INTO Financials VALUES ('Paris', 'Sales', 10)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Lyon', 'Sales', 5)
+Upserted 1 row(s) into 'Financials'.
+
+> INSERT INTO Financials VALUES ('Africa', 'Sales', 100)
+Upserted 1 row(s) into 'Financials'.
+
+> SELECT Sales FROM Financials WHERE Geography = 'Paris'
+Sales
+----------
+10
+
+
+> SELECT Sales FROM Financials WHERE Geography = 'France'
+Sales
+----------
+15
+
+
+> SELECT Sales FROM Financials WHERE Geography = 'Europe'
+Sales
+----------
+15
+
+
+> SELECT Sales FROM Financials WHERE Geography = 'All'
+Sales
+----------
+115
+
+
+> INSERT INTO Financials VALUES ('Reykjavik', 'Sales', 7)
+Upserted 1 row(s) into 'Financials'.
+
+> SELECT Sales FROM Financials WHERE Geography = 'Iceland'
+Sales
+----------
+7
+
+
+> SELECT Sales FROM Financials WHERE Geography = 'All'
+Sales
+----------
+122
+
+

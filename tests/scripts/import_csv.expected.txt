@@ -1,0 +1,43 @@
+Running script 'import_csv.sql'...
+> CREATE TABLE Financials (Calendar STRING, Geography STRING, Scenario STRING, Measure MEASURE)
+Cube 'Financials' created. Measure dimension: Measure
+
+> .import tests/scripts/import_data.csv Financials
+Successfully imported 3 rows into cube 'Financials'.
+
+> .import_pc tests/scripts/import_pc.csv Geography
+Imported 8 parent-child relations into 'Geography'.
+
+> .import_lvl tests/scripts/import_lvl_calendar.csv Calendar
+Imported 12 level relations into 'Calendar'.
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'France' AND Scenario = 'Actuals'
+Sales
+----------
+100
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'Germany' AND Scenario = 'Actuals'
+Sales
+----------
+200
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'Europe' AND Scenario = 'Actuals'
+Sales
+----------
+300
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'All' AND Scenario = 'Actuals'
+Sales
+----------
+300
+
+
+> SELECT Sales FROM Financials WHERE Calendar = 'Q1' AND Geography = 'France' AND Scenario = 'Actuals'
+Sales
+----------
+210
+
+

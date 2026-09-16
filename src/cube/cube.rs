@@ -170,12 +170,14 @@ fn calculate_jit(
         self.query_cache.clear();
     }
 	/// Streams data from a CSV file directly into the Cube.
-    /// Assumes the CSV columns exactly match the Dimension order, 
-    /// and the LAST column is the numeric Value.
-    pub fn import_csv(&mut self, filepath: &str, has_headers: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Create a CSV reader
+	/// Assumes the CSV columns exactly match the Dimension order, 
+	/// and the LAST column is the numeric Value.
+	/// Returns a human-readable summary of the import on success.
+	pub fn import_csv(&mut self, filepath: &str, has_headers: bool) -> Result<String, Box<dyn std::error::Error>> {
+                // Create a CSV reader
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(has_headers)
+            .flexible(true)
             .from_path(filepath)?;
 
         let dim_count = self.dimensions.len();
@@ -209,13 +211,10 @@ fn calculate_jit(
             row_count += 1;
         }
 
-        println!("Successfully imported {} rows into cube '{}'.", row_count, self.name);
-        Ok(())
+                Ok(format!("Successfully imported {} rows into cube '{}'.", row_count, self.name))
     }
 
 pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
-        println!("DEBUG: Cube dim_names={:?}, Cube measure_dim={:?}", self.dimension_names, self.measure_dimension);
-        println!("DEBUG [query_slice]: requested_measures={:?}, filters={:?}", query.requested_measures, query.filters);
         let dim_count = self.dimensions.len();
         let mut scanner_filters: Vec<Option<HashSet<u32>>> = vec![None; dim_count];
         let mut weight_maps: Vec<HashMap<u32, f64>> = vec![HashMap::new(); dim_count];
@@ -260,11 +259,8 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
 
         for (coords, base_val) in raw_data {
             let mut final_val = base_val.clone(); // Can be String or Numeric
-            let mut row_key = Vec::new();
+                        let mut row_key = Vec::new();
             let mut current_measure_name = "value".to_string();
-
-            // DEBUG PHASE 1: What did the Trie actually find?
-            println!("DEBUG [Trie]: Found coords: {:?} with value: {}", coords, final_val);
 
             for i in 0..dim_count {
                 // Only apply math if the cell is Numeric AND the cube is aggregating
@@ -290,10 +286,6 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                     }
                 }
             }
-
-            // DEBUG PHASE 2: How is it being grouped?
-            println!("DEBUG [Grouping]: row_key={:?}, measure_name='{}', accumulated_val={}", 
-                     row_key, current_measure_name, final_val);
 
             // Accumulate (Add numbers, or just overwrite strings)
             let measure_map = grouped_results.entry(row_key).or_insert_with(HashMap::new);
@@ -326,13 +318,8 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                 row_dim_strings.insert(dim_name.clone(), dim_val);
             }
 
-            // 2. Build the output row exactly matching the requested SELECT order
+                        // 2. Build the output row exactly matching the requested SELECT order
             for col in &query.output_columns {
-                // DEBUG PHASE 3: What column is the formatter looking for?
-                
-                println!("DEBUG [Format]: Looking for col='{}'. Current measure_map keys: {:?}", 
-                         col, measure_map.keys());
-                
                 if let Some(dim_val) = row_dim_strings.get(col) {
                     // It's a dimension
                     final_row.push(dim_val.clone());

@@ -1,0 +1,13 @@
+Running script 'import_missing_file.sql'...
+> CREATE TABLE T (A STRING, B STRING, V MEASURE)
+Cube 'T' created. Measure dimension: V
+
+> .import_pc tests/scripts/does_not_exist.csv Geography
+Could not open 'tests/scripts/does_not_exist.csv'.
+
+> .import_lvl tests/scripts/also_missing.csv Calendar
+Could not open 'tests/scripts/also_missing.csv'.
+
+> .import tests/scripts/no_such_data.csv T
+Import failed for 'tests/scripts/no_such_data.csv'.
+
