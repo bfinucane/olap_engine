@@ -1,0 +1,17 @@
+Running script 'measureless.sql'...
+> CREATE TABLE Sales (Region STRING, Product STRING, Measure MEASURE)
+Cube 'Sales' created. Measure dimension: Measure
+
+> INSERT INTO Sales VALUES ('North', 'Widget', 'Sales', 100)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('South', 'Widget', 'Sales', 200)
+Upserted 1 row(s) into 'Sales'.
+
+> SELECT Region, Sales FROM Sales
+Region | Sales
+--------------------
+North | 100
+South | 200
+
+

@@ -17,7 +17,7 @@ INSERT INTO Sales VALUES ('Germany', 'Widget', 20)
 INSERT INTO Sales VALUES ('USA', 'Widget', 30)
 INSERT INTO Sales VALUES ('Canada', 'Widget', 40)
 
--- Baseline: Europe = 30, All regions via North America = 70.
+-- Baseline: Europe = 30, North America = 70.
 SELECT Region, value FROM Sales
 SELECT value FROM Sales WHERE Region = 'Europe'
 

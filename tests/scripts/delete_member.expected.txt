@@ -1,0 +1,113 @@
+Running script 'delete_member.sql'...
+> CREATE TABLE Sales (Region STRING, Product STRING)
+Cube 'Sales' created with no explicit measure dimension.
+
+> .rollup Region Europe France 1.0
+Rollup added.
+
+> .rollup Region Europe Germany 1.0
+Rollup added.
+
+> .rollup Region "North America" USA 1.0
+Rollup added.
+
+> .rollup Region "North America" Canada 1.0
+Rollup added.
+
+> INSERT INTO Sales VALUES ('France', 'Widget', 10)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Germany', 'Widget', 20)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('USA', 'Widget', 30)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Canada', 'Widget', 40)
+Upserted 1 row(s) into 'Sales'.
+
+> SELECT Region, value FROM Sales
+Region | value
+--------------------
+France | 10
+Germany | 20
+USA | 30
+Canada | 40
+
+
+> SELECT value FROM Sales WHERE Region = 'Europe'
+value
+----------
+30
+
+
+> CREATE TABLE Plan (Region STRING, Product STRING)
+Cube 'Plan' created with no explicit measure dimension.
+
+> INSERT INTO Plan VALUES ('France', 'Widget', 100)
+Upserted 1 row(s) into 'Plan'.
+
+> INSERT INTO Plan VALUES ('Germany', 'Widget', 200)
+Upserted 1 row(s) into 'Plan'.
+
+> INSERT INTO Plan VALUES ('USA', 'Widget', 300)
+Upserted 1 row(s) into 'Plan'.
+
+> SELECT value FROM Plan WHERE Region = 'Europe'
+value
+----------
+300
+
+
+> .detach Region Europe France
+Detached 'France' from 'Europe'.
+
+> .tree Region Europe
+Hierarchy for 'Europe' in Region:
+└─ Europe (Parent)
+  └─ Germany (Leaf)
+
+> SELECT value FROM Sales WHERE Region = 'Europe'
+value
+----------
+20
+
+
+> .rollup Region Europe France 1.0
+Rollup added.
+
+> .delete_member Region Europe
+Deleted member 'Europe' from dimension 'Region' (data purged from 2 cube(s)).
+
+> SELECT Region, value FROM Sales
+Region | value
+--------------------
+USA | 30
+Canada | 40
+Germany | 20
+France | 10
+
+
+> SELECT Region, value FROM Plan
+Region | value
+--------------------
+USA | 300
+Germany | 200
+France | 100
+
+
+> SELECT value FROM Sales WHERE Region = 'Europe'
+Error: Member 'Europe' not found
+
+> .rollup Region Europe2 France 1.0
+Rollup added.
+
+> .rollup Region Europe2 Germany 1.0
+Rollup added.
+
+> SELECT value FROM Sales WHERE Region = 'Europe2'
+value
+----------
+30
+
+

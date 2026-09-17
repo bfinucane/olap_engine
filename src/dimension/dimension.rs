@@ -19,21 +19,44 @@ pub struct Dimension {
     // Element Types
     member_types: HashMap<u32, MemberType>,
 
-    // The Hierarchy: Parent ID -> Vec<(Child ID, Weight)>
+        // The Hierarchy: Parent ID -> Vec<(Child ID, Weight)>
     // Example: "Profit" (ID: 10) -> [("Revenue" (ID: 11), 1.0), ("Costs" (ID: 12), -1.0)]
+    // The Vec preserves SIBLING ORDER (used for display ordering).
     consolidations: HashMap<u32, Vec<(u32, f64)>>,
+
+    // Reverse index: Child ID -> its single Parent ID.
+    // Enforces one-parent-per-hierarchy and makes membership tests O(1) instead
+    // of scanning a parent's child Vec (which is O(N) per add, i.e. O(N^2) for
+    // N children - ruinous for large imports).
+    #[serde(default)]
+    child_to_parent: HashMap<u32, u32>,
     
         next_id: u32,
 	
 	// Tracks the explicit default, or the first element added
-    pub default_member_id: Option<u32>,
+	pub default_member_id: Option<u32>,
 
-    // The authoritative presentation order of members (by ID). New members
-    // are appended, so by default this is creation order. A cube author can
-    // reorder it at design time (see `set_display_order` / `move_member`),
-    // and query results honour this order for their rows.
-    #[serde(default)]
-    display_order: Vec<u32>,
+	// MODEL 1 (tree-native ordering):
+	// The authoritative order of members is defined by the hierarchy itself.
+	//   * `consolidations[parent]` is an ORDERED Vec of (child, weight),
+	//     so sibling order lives in the tree.
+	//   * `root_order` holds the order of top-level members (those with no
+	//     parent). New members are appended, so it defaults to creation order.
+	// `display_order` is a DERIVED, flat depth-first flattening of the tree
+	// (roots in `root_order`, then each parent's children in sibling order).
+	// It exists only so flat axes (e.g. a measure list) and run-time row
+	// output have a stable, deterministic sequence. It is rebuilt from the
+	// tree whenever the hierarchy changes; never edit it directly.
+		#[serde(default)]
+	root_order: Vec<u32>,
+	#[serde(default)]
+	display_order: Vec<u32>,
+	// When true, `display_order` is stale and must be rebuilt from the tree
+	// before it is read. Rebuilding on every structural change would make bulk
+	// imports O(N^2); instead we mark dirty here and rebuild lazily on first
+	// read. Not serialized: it is recomputed on load (see `dimension_hydrated`).
+	#[serde(skip)]
+	display_order_dirty: bool,
 }
 
 impl Dimension {
@@ -48,11 +71,14 @@ impl Dimension {
             name: name.to_string(),
             member_to_id: HashMap::new(),
             id_to_name: HashMap::new(),
-            member_types: HashMap::new(),
+                        member_types: HashMap::new(),
             consolidations: HashMap::new(),
-                        next_id: 1,
+            child_to_parent: HashMap::new(),
+			next_id: 1,
 			default_member_id: None, // Starts empty
+                        root_order: Vec::new(),
             display_order: Vec::new(),
+            display_order_dirty: false,
         }
     }
 
@@ -72,24 +98,54 @@ impl Dimension {
         id
     }
 
-    // Connects a child to a parent (and prevents duplicates)
-    pub fn add_component(&mut self, parent: &str, child: &str, weight: f64) {
-        let parent_id = self.add_consolidated(parent);
-        let child_id = self.get_or_create(child, MemberType::Leaf); 
+        // Connects a child to a parent (and prevents duplicates).
+        //
+        // ONE-PARENT-PER-HIERARCHY RULE: a member may belong to at most one parent.
+        // If the child already has a DIFFERENT parent, it is automatically detached
+        // from that old parent first (so `.rollup` re-parents rather than creating
+        // a second parent). Returns the name of the old parent if a move happened,
+        // so callers can report it; None if this was a plain add / weight update.
+        pub fn add_component(&mut self, parent: &str, child: &str, weight: f64) -> Option<String> {
+            let parent_id = self.add_consolidated(parent);
+            let child_id = self.get_or_create(child, MemberType::Leaf);
 
-        let children = self.consolidations
-            .entry(parent_id)
-            .or_insert_with(Vec::new);
+            // Enforce the single-parent rule via the O(1) reverse index: if the
+            // child already has a DIFFERENT parent, detach it from that one first.
+            let mut moved_from: Option<String> = None;
+            if let Some(&old_parent) = self.child_to_parent.get(&child_id) {
+                if old_parent != parent_id {
+                    moved_from = self.id_to_name.get(&old_parent).cloned();
+                    if let Some(kids) = self.consolidations.get_mut(&old_parent) {
+                        kids.retain(|(cid, _)| *cid != child_id);
+                        if kids.is_empty() {
+                            self.consolidations.remove(&old_parent);
+                            self.member_types.insert(old_parent, MemberType::Leaf);
+                        }
+                    }
+                }
+            }
 
-        // Prevent Duplicate Relationships!
-                // If the child is already linked to this parent, just update the weight.
-        if let Some(existing_child) = children.iter_mut().find(|(id, _)| *id == child_id) {
-            existing_child.1 = weight; // Update weight just in case it changed
-        } else {
-            // Otherwise, add the new child
-            children.push((child_id, weight));
+            let children = self.consolidations
+                .entry(parent_id)
+                .or_insert_with(Vec::new);
+
+            // Membership test is O(1) via the reverse index; only when the child is
+            // already a child of THIS parent do we scan the Vec to update its weight
+            // (a rare case, not the bulk-import hot path).
+            if self.child_to_parent.get(&child_id) == Some(&parent_id) {
+                if let Some(existing) = children.iter_mut().find(|(id, _)| *id == child_id) {
+                    existing.1 = weight; // Update weight just in case it changed
+                }
+            } else {
+                children.push((child_id, weight));
+                self.child_to_parent.insert(child_id, parent_id);
+            }
+
+            // The child now has a parent, so it is no longer a top-level root.
+            self.root_order.retain(|&x| x != child_id);
+            self.mark_display_order_dirty();
+            moved_from
         }
-    }
 
     /// Detaches `child` from `parent` in the hierarchy - the inverse of
     /// `add_component`, viewed from either endpoint ("remove the parent from
@@ -108,21 +164,32 @@ impl Dimension {
             return Err(format!("Member '{}' is not a parent in dimension '{}'.", parent, self.name));
         }
 
-        let children = self.consolidations
-            .get_mut(&parent_id)
-            .ok_or_else(|| format!("Member '{}' has no children.", parent))?;
+                // Remove the relationship (single-parent rule: just remove the one).
+        let removed = {
+            let children = self.consolidations
+                .get_mut(&parent_id)
+                .ok_or_else(|| format!("Member '{}' has no children.", parent))?;
+            let before = children.len();
+            children.retain(|(id, _)| *id != child_id);
+            let removed = children.len() != before;
+            if removed && children.is_empty() {
+                // A parent that lost its last child is no longer a consolidation.
+                self.consolidations.remove(&parent_id);
+                self.member_types.insert(parent_id, MemberType::Leaf);
+            }
+            removed
+        };
 
-        let before = children.len();
-        children.retain(|(id, _)| *id != child_id);
-        if children.len() == before {
+        if !removed {
             return Err(format!("'{}' is not a child of '{}'.", child, parent));
         }
 
-        // A parent that lost its last child is no longer a consolidation.
-        if children.is_empty() {
-            self.consolidations.remove(&parent_id);
-            self.member_types.insert(parent_id, MemberType::Leaf);
+        // Drop the reverse-index entry so the child becomes a root again.
+        self.child_to_parent.remove(&child_id);
+        if !self.root_order.contains(&child_id) {
+            self.root_order.push(child_id);
         }
+        self.mark_display_order_dirty();
         Ok(())
     }
 
@@ -145,35 +212,55 @@ impl Dimension {
         let id = self.get_id(name)
             .ok_or_else(|| format!("Member '{}' does not exist in dimension '{}'.", name, self.name))?;
 
-        // 1. Detach this member from every parent that lists it as a child.
-        let mut emptied_parents: Vec<u32> = Vec::new();
-        for (&parent_id, children) in self.consolidations.iter_mut() {
-            let before = children.len();
-            children.retain(|(cid, _)| *cid != id);
-            if children.is_empty() && before > 0 {
-                emptied_parents.push(parent_id);
+                // 1. Detach this member from its (single) parent, if any.
+        if let Some(&parent_id) = self.child_to_parent.get(&id) {
+            let emptied = {
+                if let Some(children) = self.consolidations.get_mut(&parent_id) {
+                    children.retain(|(cid, _)| *cid != id);
+                    children.is_empty()
+                } else {
+                    false
+                }
+            };
+            if emptied {
+                self.consolidations.remove(&parent_id);
+                self.member_types.insert(parent_id, MemberType::Leaf);
             }
-        }
-        // A parent that lost its last child is no longer a consolidation.
-        for parent_id in emptied_parents {
-            self.consolidations.remove(&parent_id);
-            self.member_types.insert(parent_id, MemberType::Leaf);
+            self.child_to_parent.remove(&id);
         }
 
         // 2. Drop the member's own consolidation entry. Its children are not
         //    removed; they simply have no parent left and pop to the top level.
+        let orphaned_children: Vec<u32> = self.consolidations
+            .get(&id)
+            .map(|cs| cs.iter().map(|(c, _)| *c).collect())
+            .unwrap_or_default();
         self.consolidations.remove(&id);
+        // Each orphan loses its reverse-index entry and becomes a root.
+        for child_id in &orphaned_children {
+            self.child_to_parent.remove(child_id);
+        }
 
-        // 3. Remove from all dictionaries and the display order.
+        // 3. Remove from all dictionaries, the root list, and the display order.
         let key = name.to_lowercase();
         self.member_to_id.remove(&key);
         self.id_to_name.remove(&id);
         self.member_types.remove(&id);
-        self.display_order.retain(|&x| x != id);
+        self.root_order.retain(|&x| x != id);
+
+        // Children that are now parentless become roots so they stay visible.
+        for child_id in orphaned_children {
+            if !self.root_order.contains(&child_id) {
+                self.root_order.push(child_id);
+            }
+        }
+                self.mark_display_order_dirty();
 
         // 4. Fix the default member if it pointed at the deleted member.
         if self.default_member_id == Some(id) {
-            self.default_member_id = self.display_order.first().copied();
+            self.ensure_display_order();
+            self.default_member_id = self.root_order.first().copied()
+                .or_else(|| self.display_order.first().copied());
         }
 
         Ok(id)
@@ -186,14 +273,16 @@ impl Dimension {
             return id;
         }
 
-                let id = self.next_id;
+                                let id = self.next_id;
         self.member_to_id.insert(key, id);            // Save lowercase for fast lookups
         self.id_to_name.insert(id, name.to_string()); // Save original casing for output formatting!
         self.member_types.insert(id, m_type);
         self.next_id += 1;
 
-        // New members are appended, so display order defaults to creation order.
-        self.display_order.push(id);
+        // A brand-new member has no parent yet, so it is a root. Roots default
+        // to creation order, which we preserve simply by appending.
+        self.root_order.push(id);
+        self.mark_display_order_dirty();
 
 		// If this is the very first element added, it becomes the default!
         if self.default_member_id.is_none() {
@@ -204,8 +293,70 @@ impl Dimension {
         id
     }
 
-    /// Returns the presentation rank of a member id: its index in the
-    /// authoritative display order. Unknown ids sort last. Rows in query
+        /// Moves a member from `root_order` into (or out of) the tree is implicit:
+    /// a member is a root iff no parent lists it as a child. O(1) via the
+    /// reverse index.
+    fn parent_of(&self, id: u32) -> Option<u32> {
+        self.child_to_parent.get(&id).copied()
+    }
+
+            /// Rebuilds the flat `display_order` as a depth-first flattening of the
+    /// tree: roots in `root_order`, then each parent's children in sibling
+    /// order. Any member not reachable from a root (should not happen in a
+    /// well-formed tree, but can occur with loaded legacy data) is appended at
+    /// the end so it is never lost. O(members).
+    fn rebuild_display_order(&mut self) {
+        let mut flat = Vec::with_capacity(self.member_to_id.len());
+        let roots = self.root_order.clone();
+        for rid in roots {
+            self.flatten_dfs(rid, &mut flat);
+        }
+        // Safety net: include any member not visited. O(1) membership via a set.
+        if flat.len() != self.member_to_id.len() {
+            let seen: std::collections::HashSet<u32> = flat.iter().copied().collect();
+            for &id in self.id_to_name.keys() {
+                if !seen.contains(&id) {
+                    flat.push(id);
+                }
+            }
+        }
+        self.display_order = flat;
+        self.display_order_dirty = false;
+    }
+
+    /// Marks the derived display order stale. Cheap (O(1)); the rebuild is
+    /// deferred to `ensure_display_order`, so bulk imports that touch thousands
+    /// of cells do not pay O(N) per insert.
+    fn mark_display_order_dirty(&mut self) {
+        self.display_order_dirty = true;
+    }
+
+        /// Rebuilds the display order if it is stale. Call this at read boundaries
+    /// (before sorting query rows, printing `.order`, etc.).
+    pub fn ensure_display_order(&mut self) {
+        if self.display_order_dirty {
+            self.rebuild_display_order();
+        }
+    }
+
+    /// Unconditionally rebuilds the derived display order. Used after loading
+    /// from disk, where the (non-serialized) dirty flag cannot be trusted.
+    pub fn refresh_display_order(&mut self) {
+        self.rebuild_display_order();
+    }
+
+    fn flatten_dfs(&self, id: u32, out: &mut Vec<u32>) {
+        out.push(id);
+        if let Some(children) = self.consolidations.get(&id) {
+            for &(child_id, _) in children {
+                self.flatten_dfs(child_id, out);
+            }
+        }
+    }
+
+
+            /// Returns the presentation rank of a member id: its index in the
+    /// depth-first flattening of the tree. Unknown ids sort last. Rows in query
     /// results are ordered by this rank, giving deterministic output that
     /// defaults to creation order but can be authored at design time.
     pub fn display_order_rank(&self, id: u32) -> usize {
@@ -215,14 +366,15 @@ impl Dimension {
             .unwrap_or(usize::MAX)
     }
 
-    /// Returns the current display order as member names (handy for output).
+    /// Returns the current depth-first display order as member names.
     pub fn member_order_names(&self) -> Vec<String> {
         self.display_order.iter().map(|&id| self.get_name(id)).collect()
     }
 
-    /// Moves `name` so that it appears immediately before `reference` in the
-    /// display order. Both members must already exist. This is a design-time
-    /// authoring operation (the order is persisted and used at run time).
+    /// Moves `name` so it appears immediately before `reference` in the
+    /// TREE order. They must be siblings (share a parent, or both be roots);
+    /// moving across different parents is rejected rather than silently
+    /// corrupting the hierarchy.
     pub fn move_member_before(&mut self, name: &str, reference: &str) -> Result<(), String> {
         let id = self.get_id(name)
             .ok_or_else(|| format!("Member '{}' does not exist in dimension '{}'.", name, self.name))?;
@@ -232,19 +384,62 @@ impl Dimension {
             return Ok(()); // No-op: moving a member before itself.
         }
 
-        self.display_order.retain(|&x| x != id);
-        let pos = self.display_order.iter().position(|&x| x == ref_id)
-            .expect("reference member must be present in display order");
-        self.display_order.insert(pos, id);
+        let id_parent = self.parent_of(id);
+        let ref_parent = self.parent_of(ref_id);
+        if id_parent != ref_parent {
+            return Err(format!(
+                "'{}' and '{}' are not siblings in dimension '{}', so they cannot be reordered relative to each other. (Re-parenting is a separate operation.)",
+                name, reference, self.name
+            ));
+        }
+
+        match id_parent {
+            // Both are children of the same consolidation: reorder that Vec.
+            Some(pid) => {
+                let children = self.consolidations.get_mut(&pid)
+                    .expect("parent must have a children entry");
+                let moved = children.iter().position(|(c, _)| *c == id)
+                    .map(|i| children.remove(i))
+                    .expect("member must be a child of its parent");
+                let pos = children.iter().position(|(c, _)| *c == ref_id)
+                    .expect("reference sibling must be present");
+                children.insert(pos, moved);
+            }
+            // Both are roots: reorder root_order.
+            None => {
+                self.root_order.retain(|&x| x != id);
+                let pos = self.root_order.iter().position(|&x| x == ref_id)
+                    .expect("reference root must be present");
+                self.root_order.insert(pos, id);
+            }
+        }
+
+        self.mark_display_order_dirty();
         Ok(())
     }
 
-    /// Moves `name` to the very front of the display order.
+    /// Moves `name` to the first position among its siblings (first child of
+    /// its parent, or first root).
     pub fn move_member_to_front(&mut self, name: &str) -> Result<(), String> {
         let id = self.get_id(name)
             .ok_or_else(|| format!("Member '{}' does not exist in dimension '{}'.", name, self.name))?;
-        self.display_order.retain(|&x| x != id);
-        self.display_order.insert(0, id);
+
+        match self.parent_of(id) {
+            Some(pid) => {
+                let children = self.consolidations.get_mut(&pid)
+                    .expect("parent must have a children entry");
+                let moved = children.iter().position(|(c, _)| *c == id)
+                    .map(|i| children.remove(i))
+                    .expect("member must be a child of its parent");
+                children.insert(0, moved);
+            }
+            None => {
+                self.root_order.retain(|&x| x != id);
+                self.root_order.insert(0, id);
+            }
+        }
+
+        self.mark_display_order_dirty();
         Ok(())
     }
 

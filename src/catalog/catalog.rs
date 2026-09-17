@@ -134,7 +134,7 @@ impl Catalog {
             catalog.dimensions.insert(name, Arc::new(RwLock::new(dim)));
         }
 
-        // 2. Restore cubes & reconnect shared dimensions
+                // 2. Restore cubes & reconnect shared dimensions
         for (name, mut cube) in disk_data.cubes {
             let mut dim_arcs = Vec::new();
             for dim_name in &cube.dimension_names {
@@ -142,6 +142,13 @@ impl Catalog {
             }
             cube.attach_dimensions(dim_arcs);
             catalog.cubes.insert(name, cube);
+        }
+
+        // 3. Rebuild each dimension's derived display order. The dirty flag is
+        //    not serialized, so force a rebuild to be safe against a dimension
+        //    that was saved before its order was regenerated.
+        for dim_arc in catalog.dimensions.values() {
+            dim_arc.write().unwrap().refresh_display_order();
         }
 
         catalog

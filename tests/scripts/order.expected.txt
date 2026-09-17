@@ -52,3 +52,52 @@ East | 20
 North | 30
 
 
+> CREATE TABLE Sales2 (Region STRING, Product STRING)
+Cube 'Sales2' created with no explicit measure dimension.
+
+> .rollup Region Zones West 1.0
+Rollup added.
+
+> .rollup Region Zones East 1.0
+Rollup added.
+
+> .rollup Region Zones North 1.0
+Rollup added.
+
+> .rollup Region Zones South 1.0
+Rollup added.
+
+> .order Region
+Display order for 'Region':
+  1. Zones
+  2. West
+  3. East
+  4. North
+  5. South
+
+> .tree Region Zones
+Hierarchy for 'Zones' in Region:
+└─ Zones (Parent)
+  └─ West (Leaf)
+  └─ East (Leaf)
+  └─ North (Leaf)
+  └─ South (Leaf)
+
+> .rollup Region Coast North 1.0
+Rollup added. 'North' moved from 'Zones' to 'Coast' (one parent per hierarchy).
+
+> .order Region West before North
+Error: 'West' and 'North' are not siblings in dimension 'Region', so they cannot be reordered relative to each other. (Re-parenting is a separate operation.)
+
+> .tree Region Zones
+Hierarchy for 'Zones' in Region:
+└─ Zones (Parent)
+  └─ West (Leaf)
+  └─ East (Leaf)
+  └─ South (Leaf)
+
+> .tree Region Coast
+Hierarchy for 'Coast' in Region:
+└─ Coast (Parent)
+  └─ North (Leaf)
+

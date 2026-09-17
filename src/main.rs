@@ -422,13 +422,23 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                 }
             }
 			
-                        ".rollup" => {
+                                                ".rollup" => {
                 if parts.len() == 5 {
                     if let Ok(weight) = parts[4].parse::<f64>() {
                         let dim_arc = catalog.get_or_create_dimension(parts[1]);
-                        dim_arc.write().unwrap().add_component(parts[2], parts[3], weight);
+                        let moved = dim_arc.write().unwrap().add_component(parts[2], parts[3], weight);
                         catalog.clear_all_caches();
-                        let _ = writeln!(out, "Rollup added.");
+                        match moved {
+                            Some(old_parent) => {
+                                // One-parent-per-hierarchy: re-parenting auto-detached it.
+                                let _ = writeln!(
+                                    out,
+                                    "Rollup added. '{}' moved from '{}' to '{}' (one parent per hierarchy).",
+                                    parts[3], old_parent, parts[2]
+                                );
+                            }
+                            None => { let _ = writeln!(out, "Rollup added."); }
+                        }
                     } else {
                         let _ = writeln!(out, "Error: weight '{}' is not a number.", parts[4]);
                         ok = false;
@@ -575,9 +585,10 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                             let _ = writeln!(out, "Error: Dimension '{}' not found.", dim_name);
                             ok = false;
                         }
-                        Some(arc) => {
+                                                Some(arc) => {
                             if parts.len() == 2 {
-                                let dim = arc.read().unwrap();
+                                let mut dim = arc.write().unwrap();
+                                dim.ensure_display_order();
                                 let _ = writeln!(out, "Display order for '{}':", dim.name);
                                 for (i, name) in dim.member_order_names().iter().enumerate() {
                                     let _ = writeln!(out, "  {}. {}", i + 1, name);

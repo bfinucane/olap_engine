@@ -337,16 +337,21 @@ fn calculate_jit(
             .flexible(true)
             .from_path(filepath)?;
 
-        let dim_count = self.dimensions.len();
+                let dim_count = self.dimensions.len();
         let mut row_count = 0;
+        let mut skipped = 0;
 
         // Iterate through each row in the CSV
         for result in rdr.records() {
             let record = result?; // This is a single row
             
-            // Ensure the row has enough columns (Dimensions + 1 Value column)
+            // Every dimension is a column; the value is the "extra" trailing
+            // column, so a well-formed row has exactly dim_count + 1 fields.
+            // (In the classic measureless form, a 'Measure' dimension is just
+            // another coordinate, not a magic value slot.)
             if record.len() < dim_count + 1 {
-                continue; 
+                skipped += 1;
+                continue;
             }
 
             // 1. Extract the string members for the dimensions
@@ -368,11 +373,26 @@ fn calculate_jit(
             row_count += 1;
         }
 
-                Ok(format!("Successfully imported {} rows into cube '{}'.", row_count, self.name))
+        if skipped > 0 {
+            Ok(format!(
+                "Successfully imported {} rows into cube '{}' (skipped {} row(s) with fewer than {} column(s)).",
+                row_count, self.name, skipped, dim_count + 1
+            ))
+        } else {
+            Ok(format!("Successfully imported {} rows into cube '{}'.", row_count, self.name))
+        }
     }
 
 pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         let dim_count = self.dimensions.len();
+
+        // Make sure each dimension's derived display order is up to date before
+        // the result rows are sorted by it. This is cheap when nothing changed
+        // (the dirty flag is set only by structural edits, not by data writes).
+        for dim_arc in &self.dimensions {
+            dim_arc.write().unwrap().ensure_display_order();
+        }
+
         let mut scanner_filters: Vec<Option<HashSet<u32>>> = vec![None; dim_count];
         let mut weight_maps: Vec<HashMap<u32, f64>> = vec![HashMap::new(); dim_count];
         let mut axis_indices = Vec::new();
