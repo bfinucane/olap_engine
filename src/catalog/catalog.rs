@@ -61,9 +61,50 @@ impl Catalog {
         self.cubes.get_mut(&name.to_lowercase())
     }
 	
-	pub fn get_cube(&self, name: &str) -> Option<&Cube> {
+		pub fn get_cube(&self, name: &str) -> Option<&Cube> {
 			self.cubes.get(&name.to_lowercase())
 		}
+
+    /// Deletes a member from a dimension AND purges every data cell that
+    /// referenced it in ANY cube sharing that dimension. This is the inverse
+    /// of adding a member and is intentionally a "big operation":
+    ///   1. the member is removed from the dimension (children pop to top
+    ///      level; see `Dimension::delete_member`),
+    ///   2. every cube that uses this dimension has all cells with that member
+    ///      as a coordinate deleted from its trie,
+    ///   3. all caches are cleared.
+    ///
+    /// Returns a short human-readable summary.
+    pub fn delete_member(&mut self, dimension: &str, member: &str) -> Result<String, String> {
+        // Resolve the dimension (case-insensitive) and remove the member.
+        let dim_arc = self.dimensions.get(dimension)
+            .or_else(|| self.dimensions.iter().find(|(k, _)| k.eq_ignore_ascii_case(dimension)).map(|(_, v)| v))
+            .cloned()
+            .ok_or_else(|| format!("Dimension '{}' not found.", dimension))?;
+
+        let dim_name = dim_arc.read().unwrap().name.clone();
+        let member_id = dim_arc.write().unwrap().delete_member(member)?;
+
+        // Sweep every cube that references this dimension. `dim_index` is the
+        // position of the dimension within that cube; the member id can only
+        // appear at that depth in the trie.
+        let mut cubes_touched = 0;
+        for cube in self.cubes.values_mut() {
+            let dim_index = cube.dimension_names.iter()
+                .position(|d| d.eq_ignore_ascii_case(&dim_name));
+            if let Some(idx) = dim_index {
+                cube.store.remove_cells_with_id_at(idx, member_id);
+                cube.clear_cache();
+                cubes_touched += 1;
+            }
+        }
+
+        Ok(format!(
+            "Deleted member '{}' from dimension '{}' (data purged from {} cube(s)).",
+            member, dim_name, cubes_touched
+        ))
+    }
+
     // --- PERSISTENCE ---
 
 	pub fn save_to_disk(&self, filepath: &str) {

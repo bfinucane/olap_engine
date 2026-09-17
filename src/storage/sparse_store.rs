@@ -75,6 +75,32 @@ impl SparseStore {
 
 
 
+        /// Removes every stored cell whose coordinate at `dim_index` equals
+    /// `target_id`. Used when a member is deleted from a dimension: all data
+    /// referencing that member must disappear from every cube.
+    /// Empty branches left behind by the deletion are pruned.
+    pub fn remove_cells_with_id_at(&mut self, dim_index: usize, target_id: u32) {
+        Self::prune_recursive(&mut self.root, dim_index, target_id, 0);
+    }
+
+    fn prune_recursive(node: &mut Node, dim_index: usize, target_id: u32, depth: usize) -> bool {
+        if depth == dim_index {
+            // At the member's dimension, drop the entire subtree under target_id.
+            node.children.remove(&target_id);
+        } else {
+            // Recurse into existing children.
+            for child in node.children.values_mut() {
+                Self::prune_recursive(child, dim_index, target_id, depth + 1);
+            }
+        }
+
+        // Prune children that became empty (no value and no descendants).
+        node.children.retain(|_, child| child.value.is_some() || !child.children.is_empty());
+
+        // Return whether this node is now empty (used by the parent's retain).
+        node.value.is_none() && node.children.is_empty()
+    }
+
     // --- SUB-CUBE SCANNER ---
     // allowed_leaves: For each dimension, a Set of valid IDs, or None to allow all.
     pub fn scan_subcube(&self, allowed_leaves: &[Option<HashSet<u32>>]) -> Vec<(Vec<u32>, CellValue)> {

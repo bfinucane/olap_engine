@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::cube::node::CellValue;
 
 use crate::catalog::catalog::Catalog;
-use crate::cube::cube::{SliceQuery, ResultSet}; 
+use crate::cube::cube::{SliceQuery, ResultSet, SplashMode};  
 
 // Changed return type from f64 to String to support textual success messages
 pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, String> {
@@ -297,8 +297,9 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 .ok_or_else(|| format!("Cube '{}' not found", cube_name))?;
 
             if let Some(query) = source {
-                if let SetExpr::Values(values) = &*query.body {
+                                if let SetExpr::Values(values) = &*query.body {
                     let mut row_count = 0;
+                    let mut splashed_count = 0;
 
                     for row in &values.rows {
                         // Ensure we have exactly Dim_Count + 1 (the measure)
@@ -320,10 +321,34 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                             Err(_) => CellValue::String(measure_str.replace("'", "")),
                         };
 
-                        // Write to the Cube (This acts as an UPSERT)
+                                                // Write to the Cube (This acts as an UPSERT)
                         let member_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+
+                        // Does any coordinate name a CONSOLIDATED (aggregated)
+                        // member? If so AND the value is numeric, splash the value
+                        // down to the leaf descendants instead of storing it at
+                        // the aggregate node.
+                        if let CellValue::Numeric(n) = &measure_val {
+                            if cube.has_consolidated_coordinate(&member_refs) {
+                                match cube.write_splashed(&member_refs, *n, SplashMode::Replace) {
+                                    Ok(leaf_count) => {
+                                        splashed_count += leaf_count;
+                                        row_count += 1;
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                        }
+
                         cube.write(&member_refs, measure_val);
                         row_count += 1;
+                    }
+                    if splashed_count > 0 {
+                        return Ok(format!(
+                            "Upserted {} row(s) into '{}' (splashed across {} leaf cell(s)).",
+                            row_count, cube_name, splashed_count
+                        ));
                     }
                     return Ok(format!("Upserted {} row(s) into '{}'.", row_count, cube_name));
                 }

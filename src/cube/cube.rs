@@ -3,9 +3,44 @@ use std::sync::{Arc, RwLock};
 // use std::error::Error;
 use std::collections::{HashMap, HashSet};
 
-use crate::dimension::dimension::Dimension;
+use crate::dimension::dimension::{Dimension, MemberType};
 use crate::storage::sparse_store::SparseStore;
 use crate::cube::node::CellValue;
+
+/// How `write_splashed` treats existing leaf data when distributing a value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SplashMode {
+    /// Overwrite each leaf with its allocated share of the total.
+    Replace,
+    /// Add each leaf's allocated share on top of whatever is already there.
+    Add,
+}
+
+/// Recursively forms the cross-product of per-dimension leaf lists, multiplying
+/// the per-dimension weights together for each resulting cell.
+fn build_leaf_product(
+    per_dim_leaves: &[Vec<(u32, f64)>],
+    current_coords: &mut Vec<u32>,
+    depth: usize,
+    current_weight: f64,
+    out: &mut Vec<(Vec<u32>, f64)>,
+) {
+    if depth == per_dim_leaves.len() {
+        out.push((current_coords.clone(), current_weight));
+        return;
+    }
+    for &(leaf_id, weight) in &per_dim_leaves[depth] {
+        current_coords.push(leaf_id);
+        build_leaf_product(
+            per_dim_leaves,
+            current_coords,
+            depth + 1,
+            current_weight * weight,
+            out,
+        );
+        current_coords.pop();
+    }
+}
 
 pub struct SliceQuery {
     pub output_columns: Vec<String>,      		// The exact order requested in SELECT
@@ -82,10 +117,132 @@ impl Cube {
             coords.push(id);
         }
 
-        self.store.write(&coords, value);
+                self.store.write(&coords, value);
         
         // Point 2: Cache invalidation. Base data changed, so aggregates are invalid.
         self.query_cache.clear(); 
+    }
+
+            /// True when at least one of the given coordinates names a Consolidated
+    /// (aggregated) member of this cube. Used by INSERT to decide whether a
+    /// numeric write should be splashed down to leaves.
+    pub fn has_consolidated_coordinate(&self, members: &[&str]) -> bool {
+        members.iter().enumerate().any(|(i, m)| {
+            self.dimensions
+                .get(i)
+                .map(|d| d.read().unwrap().is_consolidated(m))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Writes `value` to a cell, but if any coordinate names a CONSOLIDATED
+    /// (aggregated) member, the value is "splashed" down to that member's leaf
+    /// descendants instead of being stored at the aggregate node.
+    ///
+    /// This is data allocation. The written total, when read back through the
+    /// aggregation path, equals `value`:
+    ///
+    ///   * Each consolidated dimension is expanded into its leaf descendants
+    ///     (the cross-product across dimensions is taken).
+    ///   * Weights combine multiplicatively down each dimension.
+    ///   * The target total is distributed aThere aer still cross leaves proportionally to the
+    ///     ABSOLUTE weight share, with each leaf's sign following its own
+    ///     weight. This keeps the weighted read-back exactly equal to `value`,
+    ///     even when a parent has negative weights (e.g. Profit = Rev - Costs).
+    ///
+    /// If no coordinate is consolidated this behaves exactly like `write`.
+    ///
+    /// `mode` selects how existing leaf data is treated:
+    ///   * `SplashMode::Replace` - leaves are overwritten with their share.
+    ///   * `SplashMode::Add`     - the share is added on top of the current leaf.
+    pub fn write_splashed(
+        &mut self,
+        members: &[&str],
+        value: f64,
+        mode: SplashMode,
+    ) -> Result<usize, String> {
+        if self.dimensions.len() != members.len() {
+            return Err(format!(
+                "Expected {} coordinate(s), got {}.",
+                self.dimensions.len(),
+                members.len()
+            ));
+        }
+
+        // 1. For every dimension, resolve the member into leaf -> weight pairs.
+        //    A leaf resolves to itself (weight 1.0); a consolidated member
+        //    resolves to its descendants with aggregated weights.
+        let mut per_dim_leaves: Vec<Vec<(u32, f64)>> = Vec::with_capacity(members.len());
+        let mut any_consolidated = false;
+
+                for (i, m) in members.iter().enumerate() {
+            let mut dim = self.dimensions[i].write().unwrap();
+
+            // Missing members are auto-created as leaves, mirroring `write`.
+            // (A brand-new name can never be a consolidated node, since we
+            //  cannot guess its children.)
+            let id = match dim.get_id(m) {
+                Some(id) => id,
+                None => dim.add_leaf(m),
+            };
+
+            if dim.member_type(id) == Some(MemberType::Consolidated) {
+                any_consolidated = true;
+                let leaves = dim.get_leaf_descendants(m);
+                if leaves.is_empty() {
+                    return Err(format!(
+                        "Consolidated member '{}' has no leaf descendants to allocate to.",
+                        m
+                    ));
+                }
+                per_dim_leaves.push(leaves.into_iter().collect());
+            } else {
+                per_dim_leaves.push(vec![(id, 1.0)]);
+            }
+        }
+
+        // Fast path: nothing to splash, behave like a normal leaf write.
+        if !any_consolidated {
+            let mut coords = Vec::with_capacity(members.len());
+            for leaves in &per_dim_leaves {
+                coords.push(leaves[0].0);
+            }
+            self.store.write(&coords, CellValue::Numeric(value));
+            self.query_cache.clear();
+            return Ok(1);
+        }
+
+        // 2. Build the cross-product of leaf cells and their combined weights.
+        let mut cells: Vec<(Vec<u32>, f64)> = Vec::new();
+        build_leaf_product(&per_dim_leaves, &mut Vec::new(), 0, 1.0, &mut cells);
+
+        // 3. Total absolute weight, used to split `value` proportionally.
+        let total_abs: f64 = cells.iter().map(|(_, w)| w.abs()).sum();
+        if total_abs == 0.0 {
+            return Err("Cannot allocate: total absolute weight is zero.".to_string());
+        }
+        let scale = value / total_abs;
+
+        // 4. Write each leaf. Sign follows the leaf's own weight so that the
+        //    weighted read-back equals the requested total.
+        for (coords, weight) in &cells {
+            let share = scale * weight.abs() * weight.signum();
+            let to_store = match mode {
+                SplashMode::Replace => share,
+                SplashMode::Add => {
+                    let existing = match self.store.query_exact(coords) {
+                        Some(CellValue::Numeric(n)) => n,
+                        _ => 0.0,
+                    };
+                    existing + share
+                }
+            };
+            self.store.write(coords, CellValue::Numeric(to_store));
+        }
+
+        // Point 2: Cache invalidation.
+        self.query_cache.clear();
+        Ok(cells.len())
     }
 
     /// Point 2: JIT Calculation & Caching
@@ -303,11 +460,31 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             rows: Vec::new(),
         };
 
-        let display_axis_indices: Vec<usize> = axis_indices.into_iter()
+                let display_axis_indices: Vec<usize> = axis_indices.into_iter()
             .filter(|&i| Some(i) != measure_dim_idx || query.requested_measures.is_empty())
             .collect();
 
- for (axis_ids, measure_map) in grouped_results {
+        // Deterministic row order. HashMap iteration order is randomized per
+        // process, so we sort rows by the DISPLAY ORDER of each shown axis.
+        // Display order defaults to member creation order but can be authored
+        // at design time on the dimension, in which case run-time output
+        // follows the authored order.
+        let mut ordered: Vec<(Vec<u32>, HashMap<String, CellValue>)> =
+            grouped_results.into_iter().collect();
+        ordered.sort_by(|(a, _), (b, _)| {
+            for &i in &display_axis_indices {
+                let dim = self.dimensions[i].read().unwrap();
+                let ra = a.get(i).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
+                let rb = b.get(i).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
+                match ra.cmp(&rb) {
+                    std::cmp::Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+ for (axis_ids, measure_map) in ordered {
             let mut final_row = Vec::new();
             let mut row_dim_strings = HashMap::new();
             

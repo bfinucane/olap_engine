@@ -248,6 +248,10 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                 let _ = writeln!(out, "  .dimensions                  - List all dimensions in the catalog");
                 let _ = writeln!(out, "  .import <file.csv> <cube>    - Import data from CSV");
                 let _ = writeln!(out, "  .rollup <dim> <p> <c> <wt>   - Create parent/child hierarchy relation");
+                let _ = writeln!(out, "  .detach <dim> <p> <c>        - Remove a parent/child hierarchy relation");
+                let _ = writeln!(out, "  .delete_member <dim> <member>- Delete a member and purge its data");
+                let _ = writeln!(out, "  .splash [ADD] <cube> <val> <m...> - Allocate a value to leaf descendants");
+                let _ = writeln!(out, "  .order <dim> [<m> front | <m> before <r>] - Set/show member display order");
                 let _ = writeln!(out, "  .run <script.sql>            - Run a batch script of commands");
                 let _ = writeln!(out, "  .save                        - Save database to disk");
                 let _ = writeln!(out, "  .exit / .quit                - Save database and exit");
@@ -429,13 +433,178 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                         let _ = writeln!(out, "Error: weight '{}' is not a number.", parts[4]);
                         ok = false;
                     }
-                } else {
+                                } else {
                     let _ = writeln!(out, "Usage: .rollup <dimension> <parent> <child> <weight>");
                     let _ = writeln!(out, "       (quote names that contain spaces)");
                     ok = false;
                 }
             }
-            
+
+            // Inverse of .rollup: detach a child from its parent. The child
+            // stays in the dimension; only the relationship is removed.
+            ".detach" => {
+                if parts.len() == 4 {
+                    let dim_arc = catalog.get_or_create_dimension(parts[1]);
+                    let res = dim_arc.write().unwrap().remove_component(parts[2], parts[3]);
+                    match res {
+                        Ok(()) => { catalog.clear_all_caches(); let _ = writeln!(out, "Detached '{}' from '{}'.", parts[3], parts[2]); }
+                        Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                    }
+                } else {
+                    let _ = writeln!(out, "Usage: .detach <dimension> <parent> <child>");
+                    ok = false;
+                }
+            }
+
+            // Delete a member ENTIRELY (a big operation): removed from the
+            // dimension and all referencing data purged from every cube.
+            ".delete_member" | ".drop_member" => {
+                if parts.len() == 3 {
+                    match catalog.delete_member(parts[1], parts[2]) {
+                        Ok(msg) => { let _ = writeln!(out, "{}", msg); }
+                        Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                    }
+                } else {
+                    let _ = writeln!(out, "Usage: .delete_member <dimension> <member>");
+                    ok = false;
+                }
+            }
+
+            ".splash" => {
+                // Data allocation: distribute a value to the leaf descendants of
+                // any consolidated coordinate.
+                //
+                // Syntax: .splash [ADD] <cube> <value> <m1> <m2> ... <mN>
+                //   * Use '*' for any dimension to fall back to its default member.
+                //   * 'ADD' (optional, right after .splash) spreads the value on
+                //     top of existing leaves instead of overwriting them.
+                //
+                // Example:
+                //   .splash Financials 1200 Jan Europe Actuals Sales
+                //   .splash ADD Financials 100 Jan * Actuals Sales
+                let mut rest = &parts[1..];
+                let mode = if rest.first() == Some(&"ADD") {
+                    rest = &rest[1..];
+                    olap_engine::cube::cube::SplashMode::Add
+                } else {
+                    olap_engine::cube::cube::SplashMode::Replace
+                };
+
+                if rest.len() < 3 {
+                    let _ = writeln!(out, "Usage: .splash [ADD] <cube> <value> <m1> [<m2> ...]");
+                    let _ = writeln!(out, "       Use '*' to select a dimension's default member.");
+                    ok = false;
+                } else {
+                    let cube_name = rest[0];
+                    let value: Option<f64> = rest[1].parse().ok();
+
+                    match value {
+                        None => {
+                            let _ = writeln!(out, "Error: '{}' is not a number.", rest[1]);
+                            ok = false;
+                        }
+                                                Some(val) => {
+                            let member_args = &rest[2..];
+                            // Resolve '*' (and omitted trailing coordinates) to a
+                            // dimension's default member so the caller can omit
+                            // "impractical" coordinates concisely.
+                            let resolved: Result<Vec<String>, String> = match catalog.get_cube(cube_name) {
+                                Some(cube) => {
+                                    let mut v = Vec::with_capacity(cube.dimension_names.len());
+                                    let mut resolve_err: Option<String> = None;
+                                    for (i, dim_name) in cube.dimension_names.iter().enumerate() {
+                                        let arg = member_args.get(i).copied().unwrap_or("*");
+                                        if arg == "*" {
+                                            let dim = cube.dimensions[i].read().unwrap();
+                                            match dim.get_default_member_name() {
+                                                Some(d) => v.push(d),
+                                                None => {
+                                                    resolve_err = Some(format!(
+                                                        "Dimension '{}' has no default member; specify a value explicitly.",
+                                                        dim_name
+                                                    ));
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            v.push(arg.to_string());
+                                        }
+                                    }
+                                    match resolve_err {
+                                        Some(e) => Err(e),
+                                        None => Ok(v),
+                                    }
+                                }
+                                None => Err(format!("Cube '{}' not found.", cube_name)),
+                            };
+
+                            match resolved {
+                                Ok(v) => {
+                                    let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+                                    if let Some(cube) = catalog.get_cube_mut(cube_name) {
+                                        match cube.write_splashed(&refs, val, mode) {
+                                            Ok(n) => {
+                                                let verb = if mode == olap_engine::cube::cube::SplashMode::Add { "Added" } else { "Splashed" };
+                                                let _ = writeln!(out, "{} {} across {} leaf cell(s) in '{}'.", verb, val, n, cube_name);
+                                            }
+                                            Err(e) => { let _ = writeln!(out, "Splash failed: {}", e); ok = false; }
+                                        }
+                                    }
+                                }
+                                Err(e) => { let _ = writeln!(out, "Splash failed: {}", e); ok = false; }
+                            }
+                        }
+                    }
+                }
+            }
+
+			            // Design-time member ordering. The dimension's display order is
+            // persisted and used to order rows in run-time query results.
+            ".order" => {
+                // .order <dimension>                        -> show current order
+                // .order <dimension> <member> front         -> move member to front
+                // .order <dimension> <member> before <ref>  -> move member before <ref>
+                if parts.len() < 2 {
+                    let _ = writeln!(out, "Usage: .order <dimension> [<member> front | <member> before <ref>]");
+                    ok = false;
+                } else {
+                    let dim_name = parts[1];
+                    let dim_arc = catalog.dimensions.get(dim_name).cloned();
+                    match dim_arc {
+                        None => {
+                            let _ = writeln!(out, "Error: Dimension '{}' not found.", dim_name);
+                            ok = false;
+                        }
+                        Some(arc) => {
+                            if parts.len() == 2 {
+                                let dim = arc.read().unwrap();
+                                let _ = writeln!(out, "Display order for '{}':", dim.name);
+                                for (i, name) in dim.member_order_names().iter().enumerate() {
+                                    let _ = writeln!(out, "  {}. {}", i + 1, name);
+                                }
+                            } else if parts.len() == 4 && parts[3] == "front" {
+                                let mut dim = arc.write().unwrap();
+                                match dim.move_member_to_front(parts[2]) {
+                                    Ok(()) => { let _ = writeln!(out, "Moved '{}' to front in '{}'.", parts[2], dim.name); }
+                                    Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                                }
+                                catalog.clear_all_caches();
+                            } else if parts.len() == 5 && parts[3] == "before" {
+                                let mut dim = arc.write().unwrap();
+                                match dim.move_member_before(parts[2], parts[4]) {
+                                    Ok(()) => { let _ = writeln!(out, "Moved '{}' before '{}' in '{}'.", parts[2], parts[4], dim.name); }
+                                    Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                                }
+                                catalog.clear_all_caches();
+                            } else {
+                                let _ = writeln!(out, "Usage: .order <dimension> [<member> front | <member> before <ref>]");
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+            }
+
 			".dimensions" => {
                 let _ = writeln!(out, "Dimensions in Catalog:");
                 for (name, dim_arc) in &catalog.dimensions {
@@ -499,15 +668,20 @@ fn run_script(catalog: &mut Catalog, filepath: &str, out: &mut String) -> bool {
         }
     };
 
-    let reader = io::BufReader::new(file);
+        let reader = io::BufReader::new(file);
     let mut line_count = 0;
     let mut all_ok = true;
 
     let _ = writeln!(out, "Running script '{}'...", filepath);
     let script_start = Instant::now();
 
-    for line_result in reader.lines() {
-        let line = line_result.unwrap_or_default();
+    for (idx, line_result) in reader.lines().enumerate() {
+        let mut line = line_result.unwrap_or_default();
+        // Strip a UTF-8 BOM that Windows editors/tools often prepend, which
+        // would otherwise corrupt the very first SQL statement.
+        if idx == 0 {
+            line = line.trim_start_matches('\u{feff}').to_string();
+        }
         let trimmed = line.trim();
 
         // Skip empty lines and SQL comments

@@ -1,0 +1,54 @@
+Running script 'order.sql'...
+> CREATE TABLE Sales (Region STRING, Product STRING)
+Cube 'Sales' created with no explicit measure dimension.
+
+> INSERT INTO Sales VALUES ('West', 'Widget', 10)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('East', 'Widget', 20)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('North', 'Widget', 30)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('South', 'Widget', 40)
+Upserted 1 row(s) into 'Sales'.
+
+> SELECT Region, value FROM Sales
+Region | value
+--------------------
+West | 10
+East | 20
+North | 30
+South | 40
+
+
+> .order Region
+Display order for 'Region':
+  1. West
+  2. East
+  3. North
+  4. South
+
+> .order Region South front
+Moved 'South' to front in 'Region'.
+
+> .order Region East before North
+Moved 'East' before 'North' in 'Region'.
+
+> .order Region
+Display order for 'Region':
+  1. South
+  2. West
+  3. East
+  4. North
+
+> SELECT Region, value FROM Sales
+Region | value
+--------------------
+South | 40
+West | 10
+East | 20
+North | 30
+
+

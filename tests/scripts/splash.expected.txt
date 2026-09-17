@@ -1,0 +1,95 @@
+Running script 'splash.sql'...
+> CREATE TABLE Splash (Geography STRING, Scenario STRING, Measure MEASURE)
+Cube 'Splash' created. Measure dimension: Measure
+
+> .rollup Geography Europe England 1.0
+Rollup added.
+
+> .rollup Geography Europe France 1.0
+Rollup added.
+
+> .rollup Geography Europe Germany 1.0
+Rollup added.
+
+> .rollup Geography "North America" USA 1.0
+Rollup added.
+
+> .rollup Geography "North America" Canada 1.0
+Rollup added.
+
+> .rollup Geography All Europe 1.0
+Rollup added.
+
+> .rollup Geography All "North America" 1.0
+Rollup added.
+
+> .rollup Scenario Variant Actuals 1.0
+Rollup added.
+
+> .rollup Scenario Variant Plan -1.0
+Rollup added.
+
+> .splash Splash 300 Europe Actuals Sales
+Splashed 300 across 3 leaf cell(s) in 'Splash'.
+
+> SELECT Geography, Sales FROM Splash
+Geography | Sales
+--------------------
+England | 100
+France | 100
+Germany | 100
+
+
+> SELECT Sales FROM Splash WHERE Geography = 'Europe' AND Scenario = 'Actuals'
+Sales
+----------
+300
+
+
+> .splash Splash 1000 All Actuals Sales
+Splashed 1000 across 5 leaf cell(s) in 'Splash'.
+
+> SELECT Sales FROM Splash WHERE Geography = 'All' AND Scenario = 'Actuals'
+Sales
+----------
+1000
+
+
+> INSERT INTO Splash VALUES ('USA', 'Plan', 'Sales', 10)
+Upserted 1 row(s) into 'Splash'.
+
+> .splash ADD Splash 90 "North America" Plan Sales
+Added 90 across 2 leaf cell(s) in 'Splash'.
+
+> SELECT Geography, Sales FROM Splash WHERE Geography IN ('USA', 'Canada') AND Scenario = 'Plan'
+Geography | Sales
+--------------------
+USA | 55
+Canada | 45
+
+
+> SELECT Sales FROM Splash WHERE Geography = 'North America' AND Scenario = 'Plan'
+Sales
+----------
+100
+
+
+> CREATE TABLE Neg (Scenario STRING, Geography STRING, Measure MEASURE)
+Cube 'Neg' created. Measure dimension: Measure
+
+> .splash Neg 300 Variant Europe Sales
+Splashed 300 across 6 leaf cell(s) in 'Neg'.
+
+> SELECT Scenario, Sales FROM Neg WHERE Geography = 'Europe'
+Scenario | Sales
+--------------------
+Actuals | 150
+Plan | -150
+
+
+> SELECT Sales FROM Neg WHERE Scenario = 'Variant' AND Geography = 'Europe'
+Sales
+----------
+300
+
+
