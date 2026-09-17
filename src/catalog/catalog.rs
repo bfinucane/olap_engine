@@ -18,6 +18,12 @@ pub struct Catalog {
     pub cubes: HashMap<String, Cube>, // The Catalog now owns the Cubes
 }
 
+impl Default for Catalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Catalog {
     pub fn new() -> Self {
         Catalog {

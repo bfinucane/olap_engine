@@ -112,8 +112,8 @@ impl Dimension {
             // Enforce the single-parent rule via the O(1) reverse index: if the
             // child already has a DIFFERENT parent, detach it from that one first.
             let mut moved_from: Option<String> = None;
-            if let Some(&old_parent) = self.child_to_parent.get(&child_id) {
-                if old_parent != parent_id {
+            if let Some(&old_parent) = self.child_to_parent.get(&child_id)
+                && old_parent != parent_id {
                     moved_from = self.id_to_name.get(&old_parent).cloned();
                     if let Some(kids) = self.consolidations.get_mut(&old_parent) {
                         kids.retain(|(cid, _)| *cid != child_id);
@@ -123,11 +123,10 @@ impl Dimension {
                         }
                     }
                 }
-            }
 
             let children = self.consolidations
                 .entry(parent_id)
-                .or_insert_with(Vec::new);
+                .or_default();
 
             // Membership test is O(1) via the reverse index; only when the child is
             // already a child of THIS parent do we scan the Vec to update its weight
@@ -460,9 +459,14 @@ impl Dimension {
 
 
 
-	// Returns how many unique strings are stored in this dimension
+		// Returns how many unique strings are stored in this dimension
     pub fn len(&self) -> usize {
         self.member_to_id.len()
+    }
+
+    /// True when the dimension has no members at all.
+    pub fn is_empty(&self) -> bool {
+        self.member_to_id.is_empty()
     }
 
         // Recursively appends an ASCII tree of the hierarchy to `out`.

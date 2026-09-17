@@ -287,10 +287,9 @@ impl Cube {
         let mut coords = Vec::new();
         for (i, m) in members.iter().enumerate() {
             let dim = self.dimensions[i].read().unwrap();
-            if let Some(id) = dim.get_id(m) {
+            {
+                let id = dim.get_id(m)?;
                 coords.push(id);
-            } else {
-                return None; // If the member doesn't exist, the cell doesn't exist
             }
         }
         
@@ -434,20 +433,18 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         let measure_dim_idx = self.measure_dimension.as_ref()
             .and_then(|m| self.dimension_names.iter().position(|d| d == m));
 
-        for (coords, base_val) in raw_data {
+                for (coords, base_val) in raw_data {
             let mut final_val = base_val.clone(); // Can be String or Numeric
                         let mut row_key = Vec::new();
             let mut current_measure_name = "value".to_string();
 
             for i in 0..dim_count {
                 // Only apply math if the cell is Numeric AND the cube is aggregating
-                if self.is_aggregating {
-                    if let Some(weight) = weight_maps[i].get(&coords[i]) {
-                        if let CellValue::Numeric(n) = &mut final_val {
+                if self.is_aggregating
+                    && let Some(weight) = weight_maps[i].get(&coords[i])
+                        && let CellValue::Numeric(n) = &mut final_val {
                             *n *= weight; 
                         }
-                    }
-                }
                 
                 if axis_indices.contains(&i) || Some(i) == measure_dim_idx{
                     if Some(i) == measure_dim_idx && !query.requested_measures.is_empty() {
@@ -459,13 +456,18 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
 							.cloned()
 							.unwrap_or(raw_name);
                     } else {
+                        // NOTE: `row_key` is COMPACTED - it holds only the members
+                        // for dimensions that are actually displayed as a row axis
+                        // (the measure dimension is excluded when measures are
+                        // pivoted). So position in `row_key` is NOT the dimension
+                        // index; we record the mapping below.
                         row_key.push(coords[i]);
                     }
                 }
             }
 
             // Accumulate (Add numbers, or just overwrite strings)
-            let measure_map = grouped_results.entry(row_key).or_insert_with(HashMap::new);
+            let measure_map = grouped_results.entry(row_key).or_default();
             let existing_val = measure_map.entry(current_measure_name).or_insert(CellValue::Numeric(0.0));
             
             match (existing_val, final_val) {
@@ -480,7 +482,12 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             rows: Vec::new(),
         };
 
-                let display_axis_indices: Vec<usize> = axis_indices.into_iter()
+                        // Dimensions that produce a row axis AND end up as a column in the
+        // compacted `row_key` (i.e. everything shown except the pivoted measure
+        // dimension). `row_key` stores members in this exact order, so the
+        // position of a dimension in this list is its offset within `row_key`.
+        let display_axis_indices: Vec<usize> = axis_indices.iter()
+            .copied()
             .filter(|&i| Some(i) != measure_dim_idx || query.requested_measures.is_empty())
             .collect();
 
@@ -489,13 +496,19 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         // Display order defaults to member creation order but can be authored
         // at design time on the dimension, in which case run-time output
         // follows the authored order.
+        //
+        // IMPORTANT: `row_key` is COMPACTED (see the aggregation loop above), so
+        // we must index it by the axis's position WITHIN `display_axis_indices`,
+        // not by its dimension index `i`. Using the dimension index would read
+        // past the end of short keys and silently collapse every comparison to
+        // Equal, leaving the (randomized) HashMap order intact.
         let mut ordered: Vec<(Vec<u32>, HashMap<String, CellValue>)> =
             grouped_results.into_iter().collect();
         ordered.sort_by(|(a, _), (b, _)| {
-            for &i in &display_axis_indices {
+            for (slot, &i) in display_axis_indices.iter().enumerate() {
                 let dim = self.dimensions[i].read().unwrap();
-                let ra = a.get(i).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
-                let rb = b.get(i).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
+                let ra = a.get(slot).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
+                let rb = b.get(slot).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
                 match ra.cmp(&rb) {
                     std::cmp::Ordering::Equal => continue,
                     other => return other,

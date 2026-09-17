@@ -25,6 +25,12 @@ pub struct Node {
     pub value: Option<CellValue>,
 }
 
+impl Default for Node {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Node {
     pub fn new() -> Self {
         Node {

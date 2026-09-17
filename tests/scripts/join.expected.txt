@@ -1,0 +1,86 @@
+Running script 'join.sql'...
+> CREATE TABLE Transactions (Region STRING, Account STRING, Acc MEASURE)
+Cube 'Transactions' created. Measure dimension: Acc
+
+> CREATE ATTRIBUTE TABLE Account_Attr (Account STRING, Property MEASURE)
+Cube 'Account_Attr' created. Measure dimension: Property
+
+> INSERT INTO Transactions VALUES ('NA', '1000', 'Sales', 500)
+Upserted 1 row(s) into 'Transactions'.
+
+> INSERT INTO Transactions VALUES ('NA', '1000', 'Units', 50)
+Upserted 1 row(s) into 'Transactions'.
+
+> INSERT INTO Transactions VALUES ('NA', '2000', 'Sales', 300)
+Upserted 1 row(s) into 'Transactions'.
+
+> INSERT INTO Transactions VALUES ('NA', '2000', 'Units', 75)
+Upserted 1 row(s) into 'Transactions'.
+
+> INSERT INTO Account_Attr VALUES ('1000', 'Name', 'Cash Account')
+Upserted 1 row(s) into 'Account_Attr'.
+
+> INSERT INTO Account_Attr VALUES ('1000', 'Type', 'Asset')
+Upserted 1 row(s) into 'Account_Attr'.
+
+> INSERT INTO Account_Attr VALUES ('2000', 'Name', 'Revenue Account')
+Upserted 1 row(s) into 'Account_Attr'.
+
+> INSERT INTO Account_Attr VALUES ('2000', 'Type', 'Income')
+Upserted 1 row(s) into 'Account_Attr'.
+
+> SELECT Account, Name, Type, Sales, Units FROM Transactions JOIN Account_Attr USING (Account)
+Account | Name | Type | Sales | Units
+--------------------------------------------------
+1000 | Cash Account | Asset | 500 | 50
+2000 | Revenue Account | Income | 300 | 75
+
+
+> SELECT Account, Name, Sales FROM Transactions JOIN Account_Attr
+Account | Name | Sales
+------------------------------
+1000 | Cash Account | 500
+2000 | Revenue Account | 300
+
+
+> INSERT INTO Transactions VALUES ('NA', '3000', 'Sales', 120)
+Upserted 1 row(s) into 'Transactions'.
+
+> SELECT Account, Name, Type, Sales FROM Transactions JOIN Account_Attr USING (Account)
+Account | Name | Type | Sales
+----------------------------------------
+1000 | Cash Account | Asset | 500
+2000 | Revenue Account | Income | 300
+3000 | - | - | 120
+
+
+> SELECT Account, Name, Sales FROM Transactions JOIN Account_Attr USING (Region)
+Error: Cannot JOIN 'Transactions' with 'Account_Attr' USING 'Region': it must be a conformed dimension (present in both cubes).
+
+> SELECT Name, Sales FROM Transactions JOIN Account_Attr USING (Account)
+Error: Cannot JOIN 'Transactions' with 'Account_Attr': the conformed dimension 'Account' is not projected, so there is no key to join the attributes onto.
+
+> SELECT Account, Bogus, Sales FROM Transactions JOIN Account_Attr USING (Account)
+Error: Column 'Bogus' not found in primary or joined cube.
+
+> SELECT Account, Name, Sales FROM Transactions JOIN Account_Attr ON Account = Account
+Error: JOIN ... ON is not supported. Since the only thing two cubes can join on is a shared (conformed) dimension, use USING (<dimension>).
+
+> CREATE TABLE Other (Product STRING, Amt MEASURE)
+Cube 'Other' created. Measure dimension: Amt
+
+> CREATE ATTRIBUTE TABLE Solo_Attr (Solo STRING, Property MEASURE)
+Cube 'Solo_Attr' created. Measure dimension: Property
+
+> SELECT Product, value FROM Other JOIN Solo_Attr
+Error: Cannot JOIN 'Other' with 'Solo_Attr': they share no conformed dimension. A JOIN keys off a dimension with the same name in both cubes; write JOIN ... USING (<dimension>).
+
+> CREATE TABLE A (Dim1 STRING, Dim2 STRING, V MEASURE)
+Cube 'A' created. Measure dimension: V
+
+> CREATE ATTRIBUTE TABLE B (Dim1 STRING, Dim2 STRING, Property MEASURE)
+Cube 'B' created. Measure dimension: Property
+
+> SELECT Dim1, V FROM A JOIN B
+Error: Cannot infer how to JOIN 'A' with 'B': they share 2 conformed dimensions (Dim1, Dim2). Specify one with USING (<dimension>).
+

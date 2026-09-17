@@ -49,7 +49,7 @@ impl SparseStore {
             // get a value or create it if missing.
             current_node = current_node.children
                 .entry(id)
-                .or_insert_with(Node::new);
+                .or_default();
         }
         
         current_node.value = Some(value);
@@ -63,9 +63,9 @@ impl SparseStore {
         let mut current_node = &self.root;
         
         for id in coords {
-            match current_node.children.get(id) {
-                Some(child) => current_node = child,
-                None => return None, // If the path breaks, there is no data here
+            {
+                let child = current_node.children.get(id)?;
+                current_node = child
             }
         }
         
