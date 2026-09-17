@@ -13,5 +13,8 @@ INSERT INTO Account_Attr VALUES ('1000', 'Type', 'Asset')
 INSERT INTO Account_Attr VALUES ('2000', 'Name', 'Revenue Account')
 INSERT INTO Account_Attr VALUES ('2000', 'Type', 'Income')
 
--- 4. Execute the JOIN Query
-SELECT Account, Name, Type, Sales, Units FROM Transactions JOIN Account_Attr
+-- 4. Execute the JOIN Query.
+-- A JOIN keys off a CONFORMED DIMENSION: a dimension with the same name in
+-- both cubes. Since that is the only thing they can join on, USING names the
+-- column once (equivalent here: 'Account').
+SELECT Account, Name, Type, Sales, Units FROM Transactions JOIN Account_Attr USING (Account)
