@@ -29,6 +29,13 @@ pub enum MemberType {
 ///   * Every dimension is born with a DEFAULT hierarchy named after the
 ///     dimension itself, so single-hierarchy usage is unchanged and existing
 ///     scripts/tests keep working.
+///
+/// WHERE DATA LIVES: measures are stored ONLY at leaf coordinates (see
+/// `Cube::write`). Because a leaf belongs to EVERY hierarchy, a single stored
+/// value aggregates differently under each hierarchy purely via that
+/// hierarchy's tree - no per-hierarchy duplication. Writes therefore resolve a
+/// member in the DEFAULT hierarchy; only reads address a specific hierarchy
+/// (via a `Hierarchy:Member` qualifier).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Dimension {
     pub name: String,

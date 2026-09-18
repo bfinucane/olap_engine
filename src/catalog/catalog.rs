@@ -1,12 +1,82 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use crate::dimension::dimension::Dimension;
 use crate::cube::cube::Cube;
 
-// A temporary struct just for moving data to/from the hard drive
+/// Magic bytes at the head of a saved catalog file. Lets us reject a file that
+/// is not one of ours before attempting a (positional, non-self-describing)
+/// bincode decode.
+const CATALOG_MAGIC: [u8; 4] = *b"OLAP";
+
+/// Current on-disk format version. Bump this whenever the serialized layout
+/// changes (new fields, changed types) and add a migration branch in
+/// `load_from_disk`.
+const FORMAT_VERSION: u32 = 1;
+
+/// Errors that can occur while persisting or loading a catalog.
+#[derive(Debug)]
+pub enum PersistError {
+    /// An underlying I/O failure (create, write, fsync, rename, open, read).
+    Io(std::io::Error),
+    /// Serialization of the in-memory catalog failed.
+    Encode(bincode::Error),
+    /// Deserialization of the on-disk catalog failed.
+    Decode(bincode::Error),
+    /// The file is not a catalog file (bad magic bytes).
+    NotACatalog,
+    /// The file was written by a NEWER format than this binary understands.
+    UnsupportedVersion { found: u32, supported: u32 },
+}
+
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PersistError::Io(e) => write!(f, "I/O error: {}", e),
+            PersistError::Encode(e) => write!(f, "Could not encode catalog: {}", e),
+            PersistError::Decode(e) => write!(f, "Could not decode catalog: {}", e),
+            PersistError::NotACatalog => write!(f, "File is not an OLAP catalog."),
+            PersistError::UnsupportedVersion { found, supported } => write!(
+                f,
+                "Catalog format v{} is newer than this binary supports (v{}). Upgrade to open it.",
+                found, supported
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PersistError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PersistError::Io(e) => Some(e),
+            PersistError::Encode(e) | PersistError::Decode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for PersistError {
+    fn from(e: std::io::Error) -> Self {
+        PersistError::Io(e)
+    }
+}
+
+/// The self-identifying envelope written to disk: magic + version + payload.
+/// The header lets us detect foreign or newer files BEFORE we attempt the
+/// positional bincode decode, and gives future versions a place to hang
+/// migrations.
+#[derive(Serialize, Deserialize)]
+struct PersistedCatalog {
+    magic: [u8; 4],
+    version: u32,
+    payload: CatalogDiskFormat,
+}
+
+// The serialized shape of the catalog. This is the PAYLOAD of `PersistedCatalog`
+// and should change only in lockstep with `FORMAT_VERSION`.
 #[derive(Serialize, Deserialize)]
 struct CatalogDiskFormat {
     dimensions: HashMap<String, Dimension>,
@@ -230,9 +300,15 @@ impl Catalog {
         ))
     }
 
-    // --- PERSISTENCE ---
+        // --- PERSISTENCE ---
 
-	pub fn save_to_disk(&self, filepath: &str) {
+    /// Takes a consistent point-in-time snapshot of the whole catalog.
+    ///
+    /// This is the DURABILITY snapshot (Phase 1a): everything is cloned once so
+    /// the on-disk file reflects a single coherent moment, never a half-applied
+    /// write. (Phase 1b will replace the deep clone with a copy-on-write version
+    /// store that does not freeze writers.)
+    fn snapshot(&self) -> CatalogDiskFormat {
         let mut disk_data = CatalogDiskFormat {
             dimensions: HashMap::new(),
             cubes: self.cubes.clone(),
@@ -240,18 +316,104 @@ impl Catalog {
         for (name, dim_arc) in &self.dimensions {
             disk_data.dimensions.insert(name.clone(), dim_arc.read().unwrap().clone());
         }
-        let file = File::create(filepath).expect("Failed to create database file");
-        let writer = BufWriter::new(file);
-        // Changed to bincode!
-        bincode::serialize_into(writer, &disk_data).expect("Failed to serialize"); 
+        disk_data
     }
 
-	pub fn load_from_disk(filepath: &str) -> Self {
-        let file = File::open(filepath).expect("Failed to open database file");
-        let reader = BufReader::new(file);
-        // Changed to bincode!
-        let disk_data: CatalogDiskFormat = bincode::deserialize_from(reader).expect("Failed to parse");
+    /// Durably saves the catalog to `filepath`.
+    ///
+    /// Crash-safety: we NEVER write into the live file. `File::create` would
+    /// truncate it to zero bytes before a single byte is written, so a crash
+    /// mid-save would destroy the database. Instead we:
+    ///   1. serialize to a uniquely-named SIBLING temp file (same filesystem, so
+    ///      the later rename is atomic),
+    ///   2. flush + `sync_all` (fsync) it so the bytes are truly on disk,
+        ///   3. atomically `rename` it over the target.
+    ///
+    /// A reader (or a crash) therefore sees either the complete OLD file or the
+    /// complete NEW file - never a partial one.
+    pub fn save_to_disk(&self, filepath: &str) -> Result<(), PersistError> {
+        let snapshot = self.snapshot();
+        let envelope = PersistedCatalog {
+            magic: CATALOG_MAGIC,
+            version: FORMAT_VERSION,
+            payload: snapshot,
+        };
 
+        let target = Path::new(filepath);
+        let tmp = temp_sibling_path(target);
+
+        // Scope the writer so its fd is closed before the rename (required on
+        // Windows, where you cannot rename over an open handle).
+        {
+            let file = File::create(&tmp)?;
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, &envelope).map_err(PersistError::Encode)?;
+            writer.flush()?;
+            // fsync: without it the bytes may still be buffered in the OS when
+            // the rename lands, so a power loss could leave a renamed-but-empty
+            // file.
+            writer.into_inner().map_err(|e| PersistError::Io(e.into_error()))?.sync_all()?;
+        }
+
+                // Atomic publish. On Windows `rename` fails if the destination exists,
+                // so we remove it first; the window is tiny and, crucially, the temp
+                // file is already fully durable, so a crash here still leaves a valid
+                // (old) file rather than a truncated one.
+                match std::fs::rename(&tmp, target) {
+                    Ok(()) => {}
+                    Err(_e) => {
+                        #[cfg(windows)]
+                        {
+                            let _ = std::fs::remove_file(target);
+                            std::fs::rename(&tmp, target)?;
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            return Err(PersistError::Io(_e));
+                        }
+                    }
+                }
+                Ok(())
+    }
+
+    /// Loads a catalog from `filepath`, or returns an error.
+    ///
+    /// The file is validated (magic + version) BEFORE the positional bincode
+    /// decode, so a foreign or newer file is reported cleanly instead of being
+    /// silently mis-parsed.
+    pub fn load_from_disk(filepath: &str) -> Result<Self, PersistError> {
+        let mut file = File::open(filepath)?;
+
+        // Peek the fixed-size header: 4 magic bytes + 4 version bytes.
+        let mut header = [0u8; 8];
+        if let Err(e) = file.read_exact(&mut header) {
+            // A too-short file cannot be a valid catalog.
+            return Err(if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                PersistError::NotACatalog
+            } else {
+                PersistError::Io(e)
+            });
+        }
+        if header[0..4] != CATALOG_MAGIC {
+            return Err(PersistError::NotACatalog);
+        }
+        let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if version > FORMAT_VERSION {
+            return Err(PersistError::UnsupportedVersion {
+                found: version,
+                supported: FORMAT_VERSION,
+            });
+        }
+        // (When FORMAT_VERSION grows, migration branches for older versions go
+        //  here. For now there is only v1, so nothing to migrate.)
+
+        // Decode the payload. We re-read the whole file from the start because
+        // bincode consumes the header bytes again into the envelope struct.
+        let mut reader = BufReader::new(File::open(filepath)?);
+        let envelope: PersistedCatalog =
+            bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
+
+        let disk_data = envelope.payload;
         let mut catalog = Catalog::new();
 
         // 1. Restore dimensions and put them back into locks
@@ -259,7 +421,7 @@ impl Catalog {
             catalog.dimensions.insert(name, Arc::new(RwLock::new(dim)));
         }
 
-                // 2. Restore cubes & reconnect shared dimensions
+        // 2. Restore cubes & reconnect shared dimensions
         for (name, mut cube) in disk_data.cubes {
             let mut dim_arcs = Vec::new();
             for dim_name in &cube.dimension_names {
@@ -276,6 +438,25 @@ impl Catalog {
             dim_arc.write().unwrap().refresh_display_order();
         }
 
-        catalog
+        Ok(catalog)
+    }
+}
+
+/// Builds a unique sibling temp path for `target` (same directory, so the
+/// rename is atomic within one filesystem). Uniqueness uses the PID plus a
+/// process-wide counter, so two concurrent saves never collide.
+fn temp_sibling_path(target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = target.file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "database.bin".to_string());
+    let tmp_name = format!(".{}.{}.{}.tmp", file_name, std::process::id(), n);
+
+    match dir {
+        Some(d) => d.join(tmp_name),
+        None => PathBuf::from(tmp_name),
     }
 }

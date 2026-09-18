@@ -14,6 +14,9 @@ Inspired by enterprise OLAP systems like IBM TM1 and Infor OLAP Server, Patria u
 * **SQL Interface:** Query multidimensional slices using standard `SELECT` statements with dynamic Measure Pivoting.
 * **Zero-Dependency Core:** The engine relies on Rust's standard library, `sqlparser`, and `bincode` for binary persistence.
 
+See [ROADMAP.md](ROADMAP.md) for the planned direction (client/server, security,
+calculations, and multidimensional syntax).
+
 ## Getting Started
 
 ### Prerequisites

@@ -135,7 +135,15 @@ impl Cube {
         self.dimensions = dimensions;
     }
 
-    /// Point 1: Row-by-row data import. Auto-creates leaves if they don't exist.
+        /// Point 1: Row-by-row data import. Auto-creates leaves if they don't exist.
+    ///
+    /// WRITE SEMANTICS (multi-hierarchy dimensions): values are stored ONLY at
+    /// leaf coordinates. A leaf is shared by every hierarchy of its dimension,
+    /// so a member name here is resolved against the dimension's DEFAULT
+    /// hierarchy and auto-created as a (default-hierarchy) leaf. There is no way
+    /// to write "into" a named hierarchy - and none is needed, because a stored
+    /// leaf value is already visible through all of them. Addressing a specific
+    /// hierarchy is a READ-time concern (`Hierarchy:Member`).
     pub fn write(&mut self, members: &[&str], value: CellValue) {
         let mut coords = Vec::new();
 

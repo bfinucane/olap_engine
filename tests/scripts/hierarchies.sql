@@ -5,12 +5,25 @@
 -- so single-hierarchy scripts are unchanged. A DIMENSION NAME is a dynamic
 -- ALIAS for that dimension's default hierarchy; a HIERARCHY name stands for
 -- itself. Hierarchy names are unique across the database.
+--
+-- WHERE DATA LIVES (read this before writing):
+--   Measures are stored at LEAF coordinates only. A leaf belongs to EVERY
+--   hierarchy of its dimension, so a single stored value is aggregated
+--   differently by each hierarchy purely through that hierarchy's tree - no
+--   data is duplicated per hierarchy.
+--
+--   Consequently, INSERT and CSV .import resolve a coordinate against the
+--   dimension's DEFAULT hierarchy. You do NOT (and need not) write a value
+--   "into" a named hierarchy: writing the leaf once makes it visible through
+--   all of them. Only the READ path (SELECT/.splash/.tree with a
+--   `Hierarchy:Member` qualifier) addresses a specific hierarchy.
 
 CREATE TABLE Sales (Geography STRING, Scenario STRING, Measure MEASURE)
 
 -- Write data at leaves. Leaves are shared: the SAME leaf is reachable through
 -- every hierarchy of its dimension. Columns are (Geography, Scenario, Measure)
--- plus the trailing value, so each row has FOUR values.
+-- plus the trailing value, so each row has FOUR values. These writes land in
+-- the DEFAULT hierarchy, but the values are visible from 'Ops' too (see #6).
 INSERT INTO Sales VALUES ('Paris', 'Actuals', 'Sales', 100)
 INSERT INTO Sales VALUES ('Lyon', 'Actuals', 'Sales', 50)
 INSERT INTO Sales VALUES ('Berlin', 'Actuals', 'Sales', 70)

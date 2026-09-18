@@ -79,10 +79,17 @@ fn run_repl() {
     println!("      Patria OLAP Engine v0.1.0       ");
     println!("======================================");
 
-    let db_file = "database.bin";
+        let db_file = "database.bin";
     let mut catalog = if Path::new(db_file).exists() {
         println!("Loading existing database from '{}'...", db_file);
-        Catalog::load_from_disk(db_file)
+        match Catalog::load_from_disk(db_file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Could not load '{}': {}", db_file, e);
+                eprintln!("Starting a fresh in-memory database instead.");
+                Catalog::new()
+            }
+        }
     } else {
         println!("Starting fresh in-memory database.");
         Catalog::new()
@@ -104,11 +111,16 @@ fn run_repl() {
         let line = input.trim();
         if line.is_empty() { continue; }
 
-        // If the user types .exit, we handle it here to break the loop
+                // If the user types .exit, we handle it here to break the loop
         if line == ".exit" || line == ".quit" {
             println!("Saving database to disk...");
-            catalog.save_to_disk(db_file);
-            println!("Goodbye!");
+            match catalog.save_to_disk(db_file) {
+                Ok(()) => println!("Goodbye!"),
+                Err(e) => {
+                    eprintln!("Could not save '{}': {}", db_file, e);
+                    eprintln!("Your data is still in memory, but it was NOT written to disk.");
+                }
+            }
             break;
         }
 
@@ -259,9 +271,14 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                 let _ = writeln!(out, "  .save                        - Save database to disk");
                 let _ = writeln!(out, "  .exit / .quit                - Save database and exit");
             }
-            ".save" => {
-                catalog.save_to_disk("database.bin");
-                let _ = writeln!(out, "Database saved.");
+                        ".save" => {
+                match catalog.save_to_disk("database.bin") {
+                    Ok(()) => { let _ = writeln!(out, "Database saved."); }
+                    Err(e) => {
+                        let _ = writeln!(out, "Error: could not save database: {}", e);
+                        ok = false;
+                    }
+                }
             }
                         ".cubes" => {
                 let _ = writeln!(out, "Cubes in Catalog:");
