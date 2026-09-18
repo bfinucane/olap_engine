@@ -14,13 +14,45 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
     let mut parseable_sql = sql_query.trim().to_string();
     let upper_sql = parseable_sql.to_uppercase();
 	
-	// The following two interceptions allow us to use the standard SQL interpreter without modifications. 
+		// The following two interceptions allow us to use the standard SQL interpreter without modifications. 
     // 1. Intercept CREATE DIMENSION
     if upper_sql.starts_with("CREATE DIMENSION") {
         let dim_name = sql_query[16..].trim().trim_end_matches(';');
         catalog.get_or_create_dimension(dim_name);
         return Ok(format!("Dimension '{}' created successfully.", dim_name));
     }
+
+    // 1b. Intercept CREATE HIERARCHY <hierarchy> IN <dimension>
+    //
+    // A dimension owns one or more hierarchies over the SAME base (leaf)
+    // members. Every dimension is born with a default hierarchy named after
+    // itself; this creates an ADDITIONAL one. Hierarchy names are unique per
+    // database, so a hierarchy name can stand in for a dimension in queries.
+    if upper_sql.starts_with("CREATE HIERARCHY") {
+        let rest = sql_query[16..].trim().trim_end_matches(';').trim();
+        // Accept "Hier IN Dim" (IN is case-insensitive).
+        let (hier_name, dim_name) = match rest.to_uppercase().split_once(" IN ") {
+            Some(_) => {
+                let idx = rest.to_uppercase().find(" IN ").unwrap();
+                (rest[..idx].trim().to_string(), rest[idx + 4..].trim().to_string())
+            }
+            None => {
+                return Err(
+                    "Usage: CREATE HIERARCHY <hierarchy> IN <dimension>".to_string()
+                );
+            }
+        };
+        if hier_name.is_empty() || dim_name.is_empty() {
+            return Err("Usage: CREATE HIERARCHY <hierarchy> IN <dimension>".to_string());
+        }
+        let owner = catalog.create_hierarchy(&dim_name, &hier_name)?;
+        return Ok(format!(
+            "Hierarchy '{}' created in dimension '{}'.",
+            hier_name, owner
+        ));
+    }
+
+	
 
 	
 	// 2. Intercept custom "ATTRIBUTE" keyword
@@ -177,12 +209,18 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     }
                 };
 
-                // --- 2. CATEGORIZE COLUMNS ---
+                                // --- 2. CATEGORIZE COLUMNS ---
                 let mut output_columns = Vec::new();
                 let mut axes = Vec::new();
                 let mut requested_measures = Vec::new();
                 let mut requested_attributes = Vec::new(); // NEW: Track attribute columns
                 let mut measure_dim_requested = false;
+                // Output column -> the cube dimension it reads its member from.
+                // Usually the dimension of the same name; a HIERARCHY name maps to
+                // its OWNING dimension.
+                let mut column_dim_index: HashMap<String, usize> = HashMap::new();
+                // Dimension name -> hierarchy name to resolve that axis in.
+                let mut axis_hierarchies: HashMap<String, String> = HashMap::new();
 
                                 let p_m_dim = primary_cube.measure_dimension.clone();
 
@@ -196,8 +234,30 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
 
                     // 1. Is it a primary dimension?
                     if primary_cube.dimension_names.contains(&col_name) {
-                        axes.push(col_name.clone());
+                        if !axes.contains(&col_name) { axes.push(col_name.clone()); }
                         if Some(&col_name) == p_m_dim.as_ref() { measure_dim_requested = true; }
+                        let idx = primary_cube.dimension_names.iter().position(|n| n == &col_name).unwrap();
+                        column_dim_index.insert(col_name.clone(), idx);
+                        found = true;
+                    }
+                    // 1b. Is it a HIERARCHY owned by one of this cube's
+                    //     dimensions? A hierarchy name stands for itself and is a
+                    //     valid query axis (e.g. `SELECT Ops, value`).
+                    else if let Some((owner_dim, hier_name)) = catalog.dimension_of_reference(&col_name)
+                        && let Some(hier_name) = hier_name
+                        && let Some(idx) = primary_cube.dimension_names.iter().position(|n| n == &owner_dim)
+                    {
+                        if Some(&owner_dim) == p_m_dim.as_ref() {
+                            // The measure dimension with a non-default hierarchy is
+                            // not a supported axis.
+                            return Err(format!(
+                                "Hierarchy '{}' belongs to the measure dimension and cannot be used as an axis.",
+                                col_name
+                            ));
+                        }
+                        if !axes.contains(&owner_dim) { axes.push(owner_dim.clone()); }
+                        axis_hierarchies.insert(owner_dim.clone(), hier_name);
+                        column_dim_index.insert(col_name.clone(), idx);
                         found = true;
                     } 
                     // 2. Is it a primary measure?
@@ -242,10 +302,39 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     return Err("Cannot select both measure dimension and specific measures.".to_string());
                 }
 
-				let mut filters = HashMap::new();
+								let mut filters = HashMap::new();
                 if let Some(selection) = &select.selection {
                     extract_where_map(selection, &mut filters)?;
                 }
+
+                // A WHERE key may be a HIERARCHY name rather than a dimension
+                // name (e.g. `WHERE Ops = 'Warehouse_A'`). Rewrite such keys to
+                // the OWNING dimension and QUALIFY the value as `Hierarchy:Member`
+                // so the cube resolves it in the right hierarchy.
+                let mut normalized_filters: HashMap<String, Vec<String>> = HashMap::new();
+                for (key, vals) in filters.into_iter() {
+                    match catalog.dimension_of_reference(&key) {
+                        Some((owner_dim, Some(hier))) => {
+                            if Some(&owner_dim) == p_m_dim.as_ref() {
+                                return Err(format!(
+                                    "Hierarchy '{}' belongs to the measure dimension and cannot be filtered on.",
+                                    key
+                                ));
+                            }
+                            let qualified: Vec<String> = vals.into_iter()
+                                .map(|v| format!("{}:{}", hier, v))
+                                .collect();
+                            normalized_filters.entry(owner_dim).or_default().extend(qualified);
+                        }
+                        Some((owner_dim, None)) => {
+                            normalized_filters.entry(owner_dim).or_default().extend(vals);
+                        }
+                        None => {
+                            normalized_filters.entry(key).or_default().extend(vals);
+                        }
+                    }
+                }
+                let mut filters = normalized_filters;
 
                 // Inject Default Members for omitted dimensions
                 for dim_name in &primary_cube.dimension_names {
@@ -282,11 +371,13 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     output_columns.push("value".to_string());
                 }
 
-                let slice_query = SliceQuery { 
+                                let slice_query = SliceQuery { 
                     output_columns: output_columns.clone(), 
                     axes, 
                     requested_measures, 
-                    filters 
+                    filters,
+                    axis_hierarchies,
+                    column_dim_index,
                 };
                 
                 let mut result_set = primary_cube.query_slice(&slice_query)?;
@@ -312,11 +403,12 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                         let mut attr_outputs = vec![shared_dim.clone()];
                         attr_outputs.extend(requested_attributes.clone());
 
-                        let attr_slice = SliceQuery {
+                                                let attr_slice = SliceQuery {
                             output_columns: attr_outputs, // Include the attributes!
                             axes: vec![shared_dim.clone()],
                             requested_measures: requested_attributes.clone(),
                             filters: HashMap::new(),
+                            ..Default::default()
                         };
 
                         let attr_results = j_cube.query_slice(&attr_slice)?;

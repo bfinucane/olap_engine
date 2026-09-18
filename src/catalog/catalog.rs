@@ -36,13 +36,132 @@ impl Catalog {
             cube.clear_cache();
         }
     }
-    pub fn get_or_create_dimension(&mut self, name: &str) -> Arc<RwLock<Dimension>> {
+    	pub fn get_or_create_dimension(&mut self, name: &str) -> Arc<RwLock<Dimension>> {
         if let Some(dim) = self.dimensions.get(name) {
             return Arc::clone(dim);
         }
         let new_dim = Arc::new(RwLock::new(Dimension::new(name)));
         self.dimensions.insert(name.to_string(), Arc::clone(&new_dim));
         new_dim
+    }
+
+    /// Looks up a dimension by name, case-insensitively.
+    pub fn get_dimension(&self, name: &str) -> Option<Arc<RwLock<Dimension>>> {
+        self.dimensions.get(name).cloned().or_else(|| {
+            self.dimensions.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| Arc::clone(v))
+        })
+    }
+
+    /// Creates a hierarchy inside a dimension (creating the dimension if
+    /// needed). Hierarchy names are unique per DATABASE, so this also refuses a
+    /// name that already exists as a hierarchy of ANY dimension.
+    ///
+    /// Returns the name of the owning dimension on success.
+    pub fn create_hierarchy(&mut self, dimension: &str, hierarchy: &str) -> Result<String, String> {
+        let dim_arc = self.get_or_create_dimension(dimension);
+        let dim_name = dim_arc.read().unwrap().name.clone();
+
+                // Global uniqueness: no other dimension may already own this hierarchy.
+        if let Some(owner) = self.find_hierarchy_owner(hierarchy)
+            && !owner.eq_ignore_ascii_case(&dim_name)
+        {
+            return Err(format!(
+                "Hierarchy '{}' already exists in dimension '{}'; hierarchy names must be \
+                 unique across the database.",
+                hierarchy, owner
+            ));
+        }
+
+        dim_arc.write().unwrap().create_hierarchy(hierarchy)?;
+        // A new hierarchy changes nothing about stored data (leaves are shared),
+        // so no cache purge is strictly required; we clear anyway for safety.
+        self.clear_all_caches();
+        Ok(dim_name)
+    }
+
+    /// Finds the dimension that owns a hierarchy with this name (case-
+    /// insensitive). Used to enforce database-wide hierarchy-name uniqueness
+    /// and to resolve a bare hierarchy name to its dimension.
+    pub fn find_hierarchy_owner(&self, hierarchy: &str) -> Option<String> {
+        for dim_arc in self.dimensions.values() {
+            let dim = dim_arc.read().unwrap();
+            if dim.has_hierarchy(hierarchy) {
+                return Some(dim.name.clone());
+            }
+        }
+        None
+    }
+
+        /// Resolves a hierarchy name to (dimension_arc, hierarchy_display_name).
+    pub fn resolve_hierarchy(
+        &self,
+        hierarchy: &str,
+    ) -> Option<(Arc<RwLock<Dimension>>, String)> {
+        for dim_arc in self.dimensions.values() {
+            let dim = dim_arc.read().unwrap();
+            if let Some(h) = dim.hierarchy(hierarchy) {
+                return Some((Arc::clone(dim_arc), h.name.clone()));
+            }
+        }
+        None
+    }
+
+    /// Resolves a user-supplied reference (from `.rollup`, `.tree`, `.order`,
+    /// imports, etc.) to a concrete hierarchy.
+    ///
+    /// OPTION B RESOLUTION RULE - dimension names are dynamic ALIASES:
+    ///   1. If the reference names a HIERARCHY anywhere in the database, that
+    ///      hierarchy wins (hierarchy names are globally unique).
+    ///   2. Otherwise, if it names a DIMENSION, it resolves to that dimension's
+    ///      DEFAULT hierarchy (the one named after the dimension).
+    ///   3. If it names a dimension that does not yet exist, the dimension is
+    ///      created (with its implicit default hierarchy) and returned - this
+    ///      preserves the historic "first mention creates the dimension" flow.
+    ///
+    /// Returns `(dimension, hierarchy_name, dimension_was_created)`.
+    pub fn resolve_reference(
+        &mut self,
+        reference: &str,
+    ) -> (Arc<RwLock<Dimension>>, String, bool) {
+        // 1. An existing hierarchy anywhere?
+        if let Some((arc, name)) = self.resolve_hierarchy(reference) {
+            return (arc, name, false);
+        }
+        // 2/3. A dimension -> its default hierarchy (creating if needed).
+        let existed = self.get_dimension(reference).is_some();
+        let arc = self.get_or_create_dimension(reference);
+        let name = arc.read().unwrap().default_hierarchy_name().to_string();
+        (arc, name, !existed)
+    }
+
+    /// Resolves a user reference to the DIMENSION it belongs to, plus the
+    /// specific hierarchy it names (if any).
+    ///
+    ///   * If `reference` is a hierarchy name, returns its owning dimension and
+    ///     `Some(hierarchy)` - so a query axis/filter can be qualified as
+    ///     `Hierarchy:Member`.
+    ///   * If `reference` is a dimension name only, returns `(dimension, None)`
+    ///     meaning "the dimension's default hierarchy".
+    ///   * Returns `None` if the name is neither a known hierarchy nor a known
+    ///     dimension.
+        pub fn dimension_of_reference(&self, reference: &str) -> Option<(String, Option<String>)> {
+                // A DIMENSION name is the common case and always means "this dimension,
+        // default hierarchy" - even though the default hierarchy shares its name.
+        if let Some(dim_arc) = self.get_dimension(reference) {
+            return Some((dim_arc.read().unwrap().name.clone(), None));
+        }
+        // Otherwise, an ADDITIONAL hierarchy name: return its owning dimension
+        // and the hierarchy name so callers can qualify members as
+        // `Hierarchy:Member`.
+        for dim_arc in self.dimensions.values() {
+            let dim = dim_arc.read().unwrap();
+            if let Some(h) = dim.hierarchy(reference) {
+                return Some((dim.name.clone(), Some(h.name.clone())));
+            }
+        }
+        None
     }
 
 	pub fn add_cube(&mut self, name: &str, dim_names: &[&str], measure_dim: Option<&str>, is_aggregating : bool) {

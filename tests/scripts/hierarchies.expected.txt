@@ -1,0 +1,155 @@
+Running script 'hierarchies.sql'...
+> CREATE TABLE Sales (Geography STRING, Scenario STRING, Measure MEASURE)
+Cube 'Sales' created. Measure dimension: Measure
+
+> INSERT INTO Sales VALUES ('Paris', 'Actuals', 'Sales', 100)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Lyon', 'Actuals', 'Sales', 50)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Berlin', 'Actuals', 'Sales', 70)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Rome', 'Actuals', 'Sales', 30)
+Upserted 1 row(s) into 'Sales'.
+
+> .dimensions
+Dimensions in Catalog:
+  - Geography (4 members, 4 leaves)
+      hierarchy: Geography (default)
+  - Measure (1 members, 1 leaves)
+      hierarchy: Measure (default)
+  - Scenario (1 members, 1 leaves)
+      hierarchy: Scenario (default)
+
+> .create_hierarchy Geography Ops
+Hierarchy 'Ops' created in dimension 'Geography'.
+
+> .rollup Geography Europe Paris 1.0
+Rollup added.
+
+> .rollup Geography Europe Lyon 1.0
+Rollup added.
+
+> .rollup Geography Europe Berlin 1.0
+Rollup added.
+
+> .rollup Geography Southern Rome 1.0
+Rollup added.
+
+> .rollup Ops Warehouse_A Paris 1.0
+Rollup added.
+
+> .rollup Ops Warehouse_A Berlin 1.0
+Rollup added.
+
+> .rollup Ops Warehouse_B Lyon 1.0
+Rollup added.
+
+> .rollup Ops Warehouse_B Rome 1.0
+Rollup added.
+
+> SELECT Geography, Sales FROM Sales WHERE Geography = 'Europe'
+Geography | Sales
+--------------------
+Paris | 100
+Lyon | 50
+Berlin | 70
+
+
+> SELECT Ops, Sales FROM Sales WHERE Ops = 'Warehouse_A'
+Ops | Sales
+--------------------
+Paris | 100
+Berlin | 70
+
+
+> .rollup Geography All_Geo Europe 1.0
+Rollup added.
+
+> .rollup Geography All_Geo Southern 1.0
+Rollup added.
+
+> .rollup Ops All_Ops Warehouse_A 1.0
+Rollup added.
+
+> .rollup Ops All_Ops Warehouse_B 1.0
+Rollup added.
+
+> SELECT Geography, Sales FROM Sales WHERE Geography = 'All_Geo'
+Geography | Sales
+--------------------
+Paris | 100
+Lyon | 50
+Berlin | 70
+Rome | 30
+
+
+> SELECT Ops, Sales FROM Sales WHERE Ops = 'All_Ops'
+Ops | Sales
+--------------------
+Paris | 100
+Berlin | 70
+Lyon | 50
+Rome | 30
+
+
+> SELECT Geography, Sales FROM Sales
+Geography | Sales
+--------------------
+Paris | 100
+Lyon | 50
+Berlin | 70
+Rome | 30
+
+
+> .tree Geography All_Geo
+Hierarchy for 'All_Geo' in Geography:
+└─ All_Geo (Parent)
+  └─ Europe (Parent)
+    └─ Paris (Leaf)
+    └─ Lyon (Leaf)
+    └─ Berlin (Leaf)
+  └─ Southern (Parent)
+    └─ Rome (Leaf)
+
+> .tree Ops All_Ops
+Hierarchy for 'All_Ops' in Ops:
+└─ All_Ops (Parent)
+  └─ Warehouse_A (Parent)
+    └─ Paris (Leaf)
+    └─ Berlin (Leaf)
+  └─ Warehouse_B (Parent)
+    └─ Lyon (Leaf)
+    └─ Rome (Leaf)
+
+> .order Geography Southern front
+Moved 'Southern' to front in 'Geography'.
+
+> .order Geography
+Display order for 'Geography':
+  1. All_Geo
+  2. Southern
+  3. Rome
+  4. Europe
+  5. Paris
+  6. Lyon
+  7. Berlin
+
+> .order Ops
+Display order for 'Ops':
+  1. All_Ops
+  2. Warehouse_A
+  3. Paris
+  4. Berlin
+  5. Warehouse_B
+  6. Lyon
+  7. Rome
+
+> .create_hierarchy Scenario Geography
+Error: Hierarchy 'Geography' already exists in dimension 'Geography'; hierarchy names must be unique across the database.
+
+> .create_hierarchy Geography Ops
+Error: Hierarchy 'Ops' already exists in dimension 'Geography'.
+

@@ -87,7 +87,7 @@ Hierarchy for 'Zones' in Region:
 Rollup added. 'North' moved from 'Zones' to 'Coast' (one parent per hierarchy).
 
 > .order Region West before North
-Error: 'West' and 'North' are not siblings in dimension 'Region', so they cannot be reordered relative to each other. (Re-parenting is a separate operation.)
+Error: 'West' and 'North' are not siblings in hierarchy 'Region', so they cannot be reordered relative to each other. (Re-parenting is a separate operation.)
 
 > .tree Region Zones
 Hierarchy for 'Zones' in Region:

@@ -244,14 +244,17 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
         match parts[0] {
             ".help" => {
                 let _ = writeln!(out, "Available Commands:");
-                let _ = writeln!(out, "  .cubes                       - List all cubes in the catalog");
-                let _ = writeln!(out, "  .dimensions                  - List all dimensions in the catalog");
+                                let _ = writeln!(out, "  .cubes                       - List all cubes in the catalog");
+                let _ = writeln!(out, "  .dimensions                  - List all dimensions and their hierarchies");
+                let _ = writeln!(out, "  .create_hierarchy <dim> <h>  - Create a hierarchy inside a dimension");
                 let _ = writeln!(out, "  .import <file.csv> <cube>    - Import data from CSV");
-                let _ = writeln!(out, "  .rollup <dim> <p> <c> <wt>   - Create parent/child hierarchy relation");
-                let _ = writeln!(out, "  .detach <dim> <p> <c>        - Remove a parent/child hierarchy relation");
+                let _ = writeln!(out, "  .rollup <hier> <p> <c> <wt>  - Create parent/child hierarchy relation");
+                let _ = writeln!(out, "  .detach <hier> <p> <c>       - Remove a parent/child hierarchy relation");
                 let _ = writeln!(out, "  .delete_member <dim> <member>- Delete a member and purge its data");
                 let _ = writeln!(out, "  .splash [ADD] <cube> <val> <m...> - Allocate a value to leaf descendants");
-                let _ = writeln!(out, "  .order <dim> [<m> front | <m> before <r>] - Set/show member display order");
+                let _ = writeln!(out, "                                 (qualify a member as Hierarchy:Member)");
+                let _ = writeln!(out, "  .order <hier> [<m> front | <m> before <r>] - Set/show member display order");
+                let _ = writeln!(out, "  .tree <hier> <root_member>   - Print a hierarchy tree");
                 let _ = writeln!(out, "  .run <script.sql>            - Run a batch script of commands");
                 let _ = writeln!(out, "  .save                        - Save database to disk");
                 let _ = writeln!(out, "  .exit / .quit                - Save database and exit");
@@ -260,9 +263,13 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                 catalog.save_to_disk("database.bin");
                 let _ = writeln!(out, "Database saved.");
             }
-            ".cubes" => {
+                        ".cubes" => {
                 let _ = writeln!(out, "Cubes in Catalog:");
-                for (name, cube) in &catalog.cubes {
+                // Deterministic order (HashMap iteration is randomized per run).
+                let mut names: Vec<&String> = catalog.cubes.keys().collect();
+                names.sort();
+                for name in names {
+                    let cube = &catalog.cubes[name];
                     let m_dim = cube.measure_dimension.clone().unwrap_or_else(|| "None".to_string());
                     let cube_type = if cube.is_aggregating { "Transactional" } else { "Attribute" };
                     let _ = writeln!(out, "  - {} [{}] (Dims: {:?}) [Measure Dim: {}]", name, cube_type, cube.dimension_names, m_dim);
@@ -321,12 +328,15 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                     ok = false;
                 }
             }		
-						".import_pc" => {
+												".import_pc" => {
                 // Format: Parent, Child, Weight
+                //
+                // The third argument is a HIERARCHY name (globally unique); a
+                // dimension name resolves to its default hierarchy.
                                 if parts.len() == 3 {
                     match csv::ReaderBuilder::new().has_headers(true).flexible(true).from_path(parts[1]) {
-                        Ok(mut rdr) => {
-                            let dim_arc = catalog.get_or_create_dimension(parts[2]);
+                                                                                                Ok(mut rdr) => {
+                            let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[2]);
                             let mut count = 0;
                             let mut failed = false;
 
@@ -344,7 +354,14 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                                     let parent = &record[0];
                                     let child = &record[1];
                                     let weight: f64 = record[2].parse().unwrap_or(1.0);
-                                    dim_arc.write().unwrap().add_component(parent, child, weight);
+                                    let res = dim_arc.write().unwrap()
+                                        .add_component_in(Some(&hier_name), parent, child, weight);
+                                    if let Err(e) = res {
+                                        let _ = writeln!(out, "Import failed: {}", e);
+                                        ok = false;
+                                        failed = true;
+                                        break;
+                                    }
                                     count += 1;
                                 }
                             }
@@ -360,16 +377,19 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                         }
                     }
                 } else {
-                    let _ = writeln!(out, "Usage: .import_pc <file.csv> <dimension>");
+                    let _ = writeln!(out, "Usage: .import_pc <file.csv> <hierarchy>");
                     ok = false;
                 }
             }
-            ".import_lvl" => {
+                        ".import_lvl" => {
                 // Format: Level1, Level2, Level3 (e.g., Europe, France, Paris)
+                //
+                // The third argument is a HIERARCHY name; a dimension name
+                // resolves to its default hierarchy.
                                 if parts.len() == 3 {
                     match csv::ReaderBuilder::new().has_headers(true).flexible(true).from_path(parts[1]) {
-                        Ok(mut rdr) => {
-                            let dim_arc = catalog.get_or_create_dimension(parts[2]);
+                                                                                                Ok(mut rdr) => {
+                            let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[2]);
                             let mut count = 0;
                             let mut failed = false;
 
@@ -401,9 +421,15 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                                 for pair in non_empty.windows(2) {
                                     let parent = pair[0];
                                     let child = pair[1];
-                                    dim.add_component(parent, child, 1.0);
+                                    if let Err(e) = dim.add_component_in(Some(&hier_name), parent, child, 1.0) {
+                                        let _ = writeln!(out, "Import failed: {}", e);
+                                        ok = false;
+                                        failed = true;
+                                        break;
+                                    }
                                     count += 1;
                                 }
+                                if failed { break; }
                             }
 
                             if !failed {
@@ -417,54 +443,84 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                         }
                     }
                 } else {
-                    let _ = writeln!(out, "Usage: .import_lvl <file.csv> <dimension>");
+                    let _ = writeln!(out, "Usage: .import_lvl <file.csv> <hierarchy>");
                     ok = false;
                 }
             }
 			
-                                                ".rollup" => {
-                if parts.len() == 5 {
-                    if let Ok(weight) = parts[4].parse::<f64>() {
-                        let dim_arc = catalog.get_or_create_dimension(parts[1]);
-                        let moved = dim_arc.write().unwrap().add_component(parts[2], parts[3], weight);
-                        catalog.clear_all_caches();
-                        match moved {
-                            Some(old_parent) => {
-                                // One-parent-per-hierarchy: re-parenting auto-detached it.
-                                let _ = writeln!(
-                                    out,
-                                    "Rollup added. '{}' moved from '{}' to '{}' (one parent per hierarchy).",
-                                    parts[3], old_parent, parts[2]
-                                );
-                            }
-                            None => { let _ = writeln!(out, "Rollup added."); }
+                                                                                                ".rollup" => {
+                                                                                                    // Syntax: .rollup <hierarchy|dimension> <parent> <child> <weight>
+                                                                                                    //
+                                                                                                    // The first argument is a HIERARCHY name (globally unique). A
+                                                                                                    // dimENSION name is a dynamic ALIAS for that dimension's default
+                                                                                                    // hierarchy, so single-hierarchy scripts are unchanged.
+                                                                                                    if parts.len() == 5 {
+                                                                                                        if let Ok(weight) = parts[4].parse::<f64>() {
+                                                                                                            let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[1]);
+                                                                                                            let moved = dim_arc.write().unwrap()
+                                                                                                                .add_component_in(Some(&hier_name), parts[2], parts[3], weight);
+                                                                                                            catalog.clear_all_caches();
+                                                                                                            match moved {
+                                                                                                                Ok(Some(old_parent)) => {
+                                                                                                                    // One-parent-per-hierarchy: re-parenting auto-detached it.
+                                                                                                                    let _ = writeln!(
+                                                                                                                        out,
+                                                                                                                        "Rollup added. '{}' moved from '{}' to '{}' (one parent per hierarchy).",
+                                                                                                                        parts[3], old_parent, parts[2]
+                                                                                                                    );
+                                                                                                                }
+                                                                                                                Ok(None) => { let _ = writeln!(out, "Rollup added."); }
+                                                                                                                Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                                                                                                            }
+                                                                                                        } else {
+                                                                                                            let _ = writeln!(out, "Error: weight '{}' is not a number.", parts[4]);
+                                                                                                            ok = false;
+                                                                                                        }
+                                                                                                                    } else {
+                                                                                                        let _ = writeln!(out, "Usage: .rollup <hierarchy|dimension> <parent> <child> <weight>");
+                                                                                                        let _ = writeln!(out, "       (quote names that contain spaces)");
+                                                                                                        ok = false;
+                                                                                                    }
+                                                                                                }
+
+            // Create a hierarchy inside a dimension. Hierarchy names are unique
+            // per database; the default hierarchy (named after the dimension)
+            // already exists for every dimension.
+            ".create_hierarchy" => {
+                if parts.len() == 3 {
+                    match catalog.create_hierarchy(parts[1], parts[2]) {
+                        Ok(dim_name) => {
+                            let _ = writeln!(
+                                out,
+                                "Hierarchy '{}' created in dimension '{}'.",
+                                parts[2], dim_name
+                            );
                         }
-                    } else {
-                        let _ = writeln!(out, "Error: weight '{}' is not a number.", parts[4]);
-                        ok = false;
+                        Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
                     }
-                                } else {
-                    let _ = writeln!(out, "Usage: .rollup <dimension> <parent> <child> <weight>");
-                    let _ = writeln!(out, "       (quote names that contain spaces)");
+                } else {
+                    let _ = writeln!(out, "Usage: .create_hierarchy <dimension> <hierarchy>");
                     ok = false;
                 }
             }
 
-            // Inverse of .rollup: detach a child from its parent. The child
-            // stays in the dimension; only the relationship is removed.
-            ".detach" => {
-                if parts.len() == 4 {
-                    let dim_arc = catalog.get_or_create_dimension(parts[1]);
-                    let res = dim_arc.write().unwrap().remove_component(parts[2], parts[3]);
-                    match res {
-                        Ok(()) => { catalog.clear_all_caches(); let _ = writeln!(out, "Detached '{}' from '{}'.", parts[3], parts[2]); }
-                        Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
-                    }
-                } else {
-                    let _ = writeln!(out, "Usage: .detach <dimension> <parent> <child>");
-                    ok = false;
-                }
-            }
+                        // Inverse of .rollup: detach a child from its parent. The child
+                        // stays in the dimension; only the relationship is removed.
+                        // Syntax: .detach <hierarchy|dimension> <parent> <child>
+                        ".detach" => {
+                            if parts.len() == 4 {
+                                let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[1]);
+                                let res = dim_arc.write().unwrap()
+                                    .remove_component_in(Some(&hier_name), parts[2], parts[3]);
+                                match res {
+                                    Ok(()) => { catalog.clear_all_caches(); let _ = writeln!(out, "Detached '{}' from '{}'.", parts[3], parts[2]); }
+                                    Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                                }
+                            } else {
+                                let _ = writeln!(out, "Usage: .detach <hierarchy|dimension> <parent> <child>");
+                                ok = false;
+                            }
+                        }
 
             // Delete a member ENTIRELY (a big operation): removed from the
             // dimension and all referencing data purged from every cube.
@@ -570,77 +626,78 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
 
 			            // Design-time member ordering. The dimension's display order is
             // persisted and used to order rows in run-time query results.
-            ".order" => {
-                // .order <dimension>                        -> show current order
-                // .order <dimension> <member> front         -> move member to front
-                // .order <dimension> <member> before <ref>  -> move member before <ref>
-                if parts.len() < 2 {
-                    let _ = writeln!(out, "Usage: .order <dimension> [<member> front | <member> before <ref>]");
+                        ".order" => {
+                // .order <hierarchy>                        -> show current order
+                // .order <hierarchy> <member> front         -> move member to front
+                // .order <hierarchy> <member> before <ref>  -> move member before <ref>
+                //
+                // The first argument is a HIERARCHY name (globally unique); a
+                // dimension name resolves to its default hierarchy.
+                                if parts.len() < 2 {
+                    let _ = writeln!(out, "Usage: .order <hierarchy|dimension> [<member> front | <member> before <ref>]");
                     ok = false;
                 } else {
-                    let dim_name = parts[1];
-                    let dim_arc = catalog.dimensions.get(dim_name).cloned();
-                    match dim_arc {
-                        None => {
-                            let _ = writeln!(out, "Error: Dimension '{}' not found.", dim_name);
-                            ok = false;
+                    let (arc, canonical, _created) = catalog.resolve_reference(parts[1]);
+                    if parts.len() == 2 {
+                        let mut dim = arc.write().unwrap();
+                        let names = dim.member_order_names_in(Some(&canonical));
+                        let _ = writeln!(out, "Display order for '{}':", canonical);
+                        for (i, name) in names.iter().enumerate() {
+                            let _ = writeln!(out, "  {}. {}", i + 1, name);
                         }
-                                                Some(arc) => {
-                            if parts.len() == 2 {
-                                let mut dim = arc.write().unwrap();
-                                dim.ensure_display_order();
-                                let _ = writeln!(out, "Display order for '{}':", dim.name);
-                                for (i, name) in dim.member_order_names().iter().enumerate() {
-                                    let _ = writeln!(out, "  {}. {}", i + 1, name);
-                                }
-                            } else if parts.len() == 4 && parts[3] == "front" {
-                                let mut dim = arc.write().unwrap();
-                                match dim.move_member_to_front(parts[2]) {
-                                    Ok(()) => { let _ = writeln!(out, "Moved '{}' to front in '{}'.", parts[2], dim.name); }
-                                    Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
-                                }
-                                catalog.clear_all_caches();
-                            } else if parts.len() == 5 && parts[3] == "before" {
-                                let mut dim = arc.write().unwrap();
-                                match dim.move_member_before(parts[2], parts[4]) {
-                                    Ok(()) => { let _ = writeln!(out, "Moved '{}' before '{}' in '{}'.", parts[2], parts[4], dim.name); }
-                                    Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
-                                }
-                                catalog.clear_all_caches();
-                            } else {
-                                let _ = writeln!(out, "Usage: .order <dimension> [<member> front | <member> before <ref>]");
-                                ok = false;
-                            }
+                    } else if parts.len() == 4 && parts[3] == "front" {
+                        let mut dim = arc.write().unwrap();
+                        match dim.move_member_to_front_in(Some(&canonical), parts[2]) {
+                            Ok(()) => { let _ = writeln!(out, "Moved '{}' to front in '{}'.", parts[2], canonical); }
+                            Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
                         }
+                        catalog.clear_all_caches();
+                    } else if parts.len() == 5 && parts[3] == "before" {
+                        let mut dim = arc.write().unwrap();
+                        match dim.move_member_before_in(Some(&canonical), parts[2], parts[4]) {
+                            Ok(()) => { let _ = writeln!(out, "Moved '{}' before '{}' in '{}'.", parts[2], parts[4], canonical); }
+                            Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
+                        }
+                        catalog.clear_all_caches();
+                    } else {
+                        let _ = writeln!(out, "Usage: .order <hierarchy|dimension> [<member> front | <member> before <ref>]");
+                        ok = false;
                     }
                 }
             }
 
-			".dimensions" => {
+												".dimensions" => {
                 let _ = writeln!(out, "Dimensions in Catalog:");
-                for (name, dim_arc) in &catalog.dimensions {
-                    let dim = dim_arc.read().unwrap();
-                    let _ = writeln!(out, "  - {} ({} members)", name, dim.len());
+                // Deterministic order: `dimensions` is a HashMap, so sort keys
+                // to keep output stable across runs (important for golden tests).
+                let mut names: Vec<&String> = catalog.dimensions.keys().collect();
+                names.sort();
+                for name in names {
+                    let dim = catalog.dimensions[name].read().unwrap();
+                    let _ = writeln!(out, "  - {} ({} members, {} leaves)", name, dim.len(), dim.leaf_count());
+                    for hname in dim.hierarchy_names() {
+                        let marker = if hname.eq_ignore_ascii_case(dim.default_hierarchy_name()) {
+                            " (default)"
+                        } else {
+                            ""
+                        };
+                        let _ = writeln!(out, "      hierarchy: {}{}", hname, marker);
+                    }
                 }
             }
 			
-            ".tree" => {
-                // Usage: .tree Geography Global
-                if parts.len() == 3 {
-                    let dim_name = parts[1];
-                    let member = parts[2];
-
-                    if let Some(dim_arc) = catalog.dimensions.get(dim_name) {
-                        let _ = writeln!(out, "Hierarchy for '{}' in {}:", member, dim_name);
-                        dim_arc.read().unwrap().print_tree(member, 0, 1.0, out);
-                    } else {
-                        let _ = writeln!(out, "Error: Dimension '{}' not found.", dim_name);
-                    }
-                } else {
-                    let _ = writeln!(out, "Usage: .tree <dimension> <root_member>");
-                    let _ = writeln!(out, "Example: .tree Geography Global");
-                }
-            }
+                        ".tree" => {
+                            // Usage: .tree <hierarchy|dimension> <root_member>
+                            if parts.len() == 3 {
+                                let member = parts[2];
+                                let (dim_arc, canonical, _created) = catalog.resolve_reference(parts[1]);
+                                let _ = writeln!(out, "Hierarchy for '{}' in {}:", member, canonical);
+                                dim_arc.read().unwrap().print_tree_in(Some(&canonical), member, 0, 1.0, out);
+                            } else {
+                                let _ = writeln!(out, "Usage: .tree <hierarchy|dimension> <root_member>");
+                                let _ = writeln!(out, "Example: .tree Geography Global");
+                            }
+                        }
 			
 									".run" => {
                 if parts.len() == 2 {

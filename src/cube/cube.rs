@@ -7,6 +7,29 @@ use crate::dimension::dimension::{Dimension, MemberType};
 use crate::storage::sparse_store::SparseStore;
 use crate::cube::node::CellValue;
 
+/// Splits a coordinate into an optional hierarchy qualifier and a member name.
+///
+/// Multi-hierarchy dimensions let several hierarchies define a member with the
+/// same name (e.g. `All`). A coordinate may be written `Hierarchy:Member` to
+/// pick a specific hierarchy. When no colon is present the member is resolved
+/// in the dimension's DEFAULT hierarchy (named after the dimension), which is
+/// the only hierarchy a first-time user ever sees.
+///
+///   "ByMarket:All"  -> (Some("ByMarket"), "All")
+///   "All"           -> (None, "All")
+///   "France"        -> (None, "France")
+///
+/// Note: a member name that itself contains a colon is not supported; the last
+/// colon is treated as the separator when one exists.
+fn split_qualified(coord: &str) -> (Option<&str>, &str) {
+    match coord.split_once(':') {
+        Some((hier, member)) if !hier.is_empty() && !member.is_empty() => {
+            (Some(hier), member)
+        }
+        _ => (None, coord),
+    }
+}
+
 /// How `write_splashed` treats existing leaf data when distributing a value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SplashMode {
@@ -42,11 +65,20 @@ fn build_leaf_product(
     }
 }
 
+#[derive(Default)]
 pub struct SliceQuery {
     pub output_columns: Vec<String>,      		// The exact order requested in SELECT
     pub axes: Vec<String>,                		// The dimensions to group by
     pub requested_measures: Vec<String>,  		// The specific measures to pivot (if any)
     pub filters: HashMap<String, Vec<String>>, // The WHERE clause
+    // For each DIMENSION name in `axes`, the HIERARCHY to aggregate/resolve it
+    // through. Absent => the dimension's default hierarchy. This is what makes a
+    // hierarchy name usable as a query axis (e.g. `SELECT Ops, value`).
+    pub axis_hierarchies: HashMap<String, String>,
+    // Maps an OUTPUT column name to the index of the dimension whose member it
+    // should display. Lets a hierarchy name (e.g. `Ops`) be used directly as a
+    // SELECT axis while still reading the right dimension's value.
+    pub column_dim_index: HashMap<String, usize>,
 }
 
 pub struct ResultSet {
@@ -124,16 +156,20 @@ impl Cube {
     }
 
             /// True when at least one of the given coordinates names a Consolidated
-    /// (aggregated) member of this cube. Used by INSERT to decide whether a
-    /// numeric write should be splashed down to leaves.
-    pub fn has_consolidated_coordinate(&self, members: &[&str]) -> bool {
-        members.iter().enumerate().any(|(i, m)| {
-            self.dimensions
-                .get(i)
-                .map(|d| d.read().unwrap().is_consolidated(m))
-                .unwrap_or(false)
-        })
-    }
+            /// (aggregated) member of this cube. Used by INSERT to decide whether a
+            /// numeric write should be splashed down to leaves.
+            ///
+            /// A coordinate may be hierarchy-qualified as `Hierarchy:Member`; when it
+            /// is not, the member is resolved in the dimension's DEFAULT hierarchy.
+            pub fn has_consolidated_coordinate(&self, members: &[&str]) -> bool {
+                members.iter().enumerate().any(|(i, m)| {
+                    let (hier, member) = split_qualified(m);
+                    self.dimensions
+                        .get(i)
+                        .map(|d| d.read().unwrap().is_consolidated_in(hier, member))
+                        .unwrap_or(false)
+                })
+            }
 
     /// Writes `value` to a cell, but if any coordinate names a CONSOLIDATED
     /// (aggregated) member, the value is "splashed" down to that member's leaf
@@ -175,20 +211,24 @@ impl Cube {
         let mut per_dim_leaves: Vec<Vec<(u32, f64)>> = Vec::with_capacity(members.len());
         let mut any_consolidated = false;
 
-                for (i, m) in members.iter().enumerate() {
+                                for (i, m) in members.iter().enumerate() {
             let mut dim = self.dimensions[i].write().unwrap();
+
+            // A coordinate may be hierarchy-qualified as `Hierarchy:Member`;
+            // otherwise resolve in the dimension's default hierarchy.
+            let (hier, member) = split_qualified(m);
 
             // Missing members are auto-created as leaves, mirroring `write`.
             // (A brand-new name can never be a consolidated node, since we
             //  cannot guess its children.)
-            let id = match dim.get_id(m) {
+            let id = match dim.get_id_in(hier, member) {
                 Some(id) => id,
-                None => dim.add_leaf(m),
+                None => dim.add_leaf(member),
             };
 
             if dim.member_type(id) == Some(MemberType::Consolidated) {
                 any_consolidated = true;
-                let leaves = dim.get_leaf_descendants(m);
+                let leaves = dim.get_leaf_descendants_in(hier, member);
                 if leaves.is_empty() {
                     return Err(format!(
                         "Consolidated member '{}' has no leaf descendants to allocate to.",
@@ -250,19 +290,28 @@ impl Cube {
         let mut query_signature = Vec::new();
         let mut leaf_resolutions = Vec::new();
 
-        // 1. Resolve strings to IDs and get their leaf descendents
+                // 1. Resolve strings to IDs and get their leaf descendents.
+        //
+        // CACHE KEY SOUNDNESS: `query_signature` is the vector of RESOLVED ids.
+        // Because leaf ids are shared across hierarchies but aggregate ids are
+        // per-hierarchy (distinct ids in the dimension's single id space), a
+        // given signature always maps to exactly one (hierarchy, member) choice
+        // per dimension - so the resolved ids fully determine the answer. Never
+        // "share" an aggregate id between hierarchies; that would silently
+        // corrupt this cache.
         for (i, m) in members.iter().enumerate() {
             let dim = self.dimensions[i].read().unwrap();
-            
+            let (hier, member) = split_qualified(m);
+
             // Get the ID for the cache key
-            let id = match dim.get_id(m) {
+            let id = match dim.get_id_in(hier, member).or_else(|| dim.get_id(member)) {
                 Some(id) => id,
                 None => return 0.0, // Element doesn't exist at all
             };
             query_signature.push(id);
 
             // Get all leaves under this member (e.g., Europe -> [France, Germany])
-            leaf_resolutions.push(dim.get_leaf_descendants(m));
+            leaf_resolutions.push(dim.get_leaf_descendants_in(hier, member));
         }
 
         // 2. Check the Cache FIRST to avoid database explosion
@@ -284,11 +333,12 @@ impl Cube {
     pub fn read_cell(&self, members: &[&str]) -> Option<CellValue> {
         if members.len() != self.dimensions.len() { return None; }
         
-        let mut coords = Vec::new();
+                let mut coords = Vec::new();
         for (i, m) in members.iter().enumerate() {
             let dim = self.dimensions[i].read().unwrap();
             {
-                let id = dim.get_id(m)?;
+                let (hier, member) = split_qualified(m);
+                let id = dim.get_id_in(hier, member)?;
                 coords.push(id);
             }
         }
@@ -404,17 +454,20 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                 axis_indices.push(i);
             }
 
-			if let Some(filter_vals) = query.filters.get(dim_name) {
+						if let Some(filter_vals) = query.filters.get(dim_name) {
                 let mut combined_leaf_ids = HashSet::new();
                 
                 for filter_val in filter_vals {
+                    // A filter value may be hierarchy-qualified `Hierarchy:Member`;
+                    // otherwise it resolves in the dimension's default hierarchy.
+                    let (hier, member) = split_qualified(filter_val);
                     if self.is_aggregating {
-                        let leaves = dim.get_leaf_descendants(filter_val);
+                        let leaves = dim.get_leaf_descendants_in(hier, member);
                         if leaves.is_empty() { return Err(format!("Member '{}' not found", filter_val)); }
                         combined_leaf_ids.extend(leaves.keys().cloned());
                         weight_maps[i].extend(leaves);
                     } else {
-                        if let Some(id) = dim.get_id(filter_val) {
+                        if let Some(id) = dim.get_id_in(hier, member) {
                             combined_leaf_ids.insert(id);
                             weight_maps[i].insert(id, 1.0); // Attribute
                         } else {
@@ -502,13 +555,17 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         // not by its dimension index `i`. Using the dimension index would read
         // past the end of short keys and silently collapse every comparison to
         // Equal, leaving the (randomized) HashMap order intact.
-        let mut ordered: Vec<(Vec<u32>, HashMap<String, CellValue>)> =
+                let mut ordered: Vec<(Vec<u32>, HashMap<String, CellValue>)> =
             grouped_results.into_iter().collect();
         ordered.sort_by(|(a, _), (b, _)| {
             for (slot, &i) in display_axis_indices.iter().enumerate() {
                 let dim = self.dimensions[i].read().unwrap();
-                let ra = a.get(slot).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
-                let rb = b.get(slot).map(|&id| dim.display_order_rank(id)).unwrap_or(usize::MAX);
+                // Honour the axis's hierarchy for ordering when one was named.
+                let hier = query.axis_hierarchies
+                    .get(&self.dimension_names[i])
+                    .map(|h| h.as_str());
+                let ra = a.get(slot).map(|&id| dim.display_order_rank_in(hier, id)).unwrap_or(usize::MAX);
+                let rb = b.get(slot).map(|&id| dim.display_order_rank_in(hier, id)).unwrap_or(usize::MAX);
                 match ra.cmp(&rb) {
                     std::cmp::Ordering::Equal => continue,
                     other => return other,
@@ -521,11 +578,26 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             let mut final_row = Vec::new();
             let mut row_dim_strings = HashMap::new();
             
-            // 1. Safely map any available axis IDs to their String names
+                        // 1. Safely map any available axis IDs to their String names, keyed
+            //    BOTH by dimension name and by output-column name (so a hierarchy
+            //    used as a SELECT axis displays correctly).
             for (idx, &id) in display_axis_indices.iter().zip(axis_ids.iter()) {
                 let dim_name = &self.dimension_names[*idx];
                 let dim_val = self.dimensions[*idx].read().unwrap().get_name(id);
                 row_dim_strings.insert(dim_name.clone(), dim_val);
+            }
+            // Resolve any output column that points at a displayed axis dimension.
+            for col in &query.output_columns {
+                if row_dim_strings.contains_key(col) {
+                    continue;
+                }
+                if let Some(&idx) = query.column_dim_index.get(col)
+                    && let Some(slot) = display_axis_indices.iter().position(|&i| i == idx)
+                    && let Some(&id) = axis_ids.get(slot)
+                {
+                    let dim_val = self.dimensions[idx].read().unwrap().get_name(id);
+                    row_dim_strings.insert(col.clone(), dim_val);
+                }
             }
 
                         // 2. Build the output row exactly matching the requested SELECT order
