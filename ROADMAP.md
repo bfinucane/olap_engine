@@ -268,20 +268,30 @@ This is a multi-phase project of its own, not "a next step."
 
 ## Immediate next step
 
-**Phase 1a — durable persistence.** It is small, self-contained, and correct
-regardless of how the rest of Phase 1 evolves:
+**Phase 1b — the versioned (MVCC) storage engine.** Phase 1a (durable
+persistence) has landed: saves are atomic and non-destructive, the on-disk
+format is versioned and self-identifying, errors are typed, and a save → load
+round-trip is covered by a permanent integration test. Those guarantees are
+correct regardless of what 1b becomes, so no 1a work is thrown away.
 
-* It is the prerequisite for a multi-user server: a full `bincode` rewrite
-  guarded by `expect()` will not survive load.
-* It has no dependencies and is independently testable.
-* It converts the single most dangerous operation (`.save`) from "can destroy
-  your data" to "safe under crash."
-* The consistent-snapshot concept it introduces is the foundation Phase 1b's
-  version store builds on.
+1b is the larger architectural commitment and the true source of concurrent
+isolation. It is scoped as its own phase, with an explicit
+**measure-before-committing** gate on memory churn. Before implementation
+begins, one design choice must be settled:
 
-**Phase 1b** (the MVCC/version store) is the larger architectural commitment and
-the true source of concurrent isolation. It is scoped as its own phase, with an
-explicit **measure-before-committing** gate on memory churn.
+* **Version model as the storage engine itself** (MVCC directly over the
+  Patricia trie), versus a **versioned layer on top of an otherwise-mutable
+  store**. The former is the cleaner fit for an immutable trie and matches the
+  Infor model most faithfully; the latter is a smaller, more reversible first
+  slice. See Phase 1b above for the trade-offs.
+
+Two further questions to resolve as part of that decision:
+
+1. **Snapshot granularity** — a single top-level catalog lock vs. per-dimension
+   locking for capturing a version.
+2. **Migration strategy** — hard-fail on an unknown format version for now
+   (simplest, already implemented as `UnsupportedVersion`) vs. building a
+   migration framework immediately.
 
 ---
 
@@ -289,7 +299,7 @@ explicit **measure-before-committing** gate on memory churn.
 
 | Phase | Theme | Depends on | Status |
 |------:|---------------------------------------|------------|-------------|
-| 1a | Durable persistence (atomic save) | — | Not started |
+| 1a | Durable persistence (atomic save) | — | **Done** |
 | 1b | Versioned/MVCC storage engine | 1a | Not started |
 | 1c | Protocol + server/client split | 1a, 1b | Not started |
 | 2 | Users, security, access limits | 1c | Not started |
