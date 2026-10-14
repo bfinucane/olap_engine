@@ -1,0 +1,19 @@
+﻿Independent golden verification: engine binary run directly on each fixture,
+output compared byte-for-byte to tests/scripts/<name>.expected.txt after CRLF normalisation.
+
+MATCH    aggregation.sql            exit=0
+MATCH    basic_query.sql            exit=0
+MATCH    create_duplicate.sql       exit=1
+MATCH    delete_member.sql          exit=1
+MATCH    hierarchies.sql            exit=1
+MATCH    import_csv.sql             exit=0
+MATCH    import_lvl_ragged.sql      exit=0
+MATCH    import_missing_file.sql    exit=1
+MATCH    join.sql                   exit=1
+MATCH    measureless.sql            exit=0
+MATCH    order.sql                  exit=1
+MATCH    select_no_from.sql         exit=1
+MATCH    splash.sql                 exit=0
+
+result: 13/13 goldens reproduce exactly; mismatched: none
+note: 7 fixtures exit 1 by design (their golden transcripts contain 'Error:' / 'failed'); 6 exit 0.

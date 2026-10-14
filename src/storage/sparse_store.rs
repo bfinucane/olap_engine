@@ -147,3 +147,201 @@ impl SparseStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cube::node::CellValue;
+
+    /// One numeric cell, read back through the exact-coordinate path.
+    #[test]
+    fn exact_round_trip_returns_the_stored_cell() {
+        let mut s = SparseStore::new(3);
+        s.write(&[1, 2, 3], CellValue::Numeric(42.5));
+        assert_eq!(s.query_exact(&[1, 2, 3]), Some(CellValue::Numeric(42.5)));
+    }
+
+    /// A second write to the same coordinate replaces the first. This is the
+    /// storage-level half of the intentional upsert contract that `INSERT`
+    /// exposes (re-inserting a coordinate overwrites it), and it currently has
+    /// no other guard.
+    #[test]
+    fn second_write_to_the_same_coordinate_overwrites() {
+        let mut s = SparseStore::new(1);
+        s.write(&[7], CellValue::Numeric(1.0));
+        s.write(&[7], CellValue::Numeric(2.0));
+        assert_eq!(s.query_exact(&[7]), Some(CellValue::Numeric(2.0)));
+    }
+
+    /// A coordinate that was never written is `None`, not a zero or a panic.
+    #[test]
+    fn unwritten_and_partial_coordinates_are_none() {
+        let mut s = SparseStore::new(2);
+        s.write(&[1, 2], CellValue::Numeric(5.0));
+        assert_eq!(s.query_exact(&[9, 9]), None, "unwritten leaf");
+        assert_eq!(s.query_exact(&[1]), None, "a coordinate interior is not a cell");
+        assert_eq!(s.query_exact(&[1, 2, 3]), None, "over-long coordinate");
+    }
+
+    /// The empty coordinate addresses the trie root. Pinned because it is the
+    /// boundary the recursion in `scan_recursive`/`calculate_jit` relies on.
+    #[test]
+    fn empty_coordinate_addresses_the_root() {
+        let mut s = SparseStore::new(0);
+        assert_eq!(s.query_exact(&[]), None, "empty store has no root cell");
+        s.write(&[], CellValue::Numeric(9.0));
+        assert_eq!(s.query_exact(&[]), Some(CellValue::Numeric(9.0)));
+    }
+
+    /// Cells at different depths coexist: a value stored at an interior
+    /// coordinate is not clobbered by storing beneath it, and vice versa. This
+    /// is the behaviour `has_consolidated_coordinate` depends on when it
+    /// decides between `write` and `write_splashed`.
+    #[test]
+    fn interior_and_deeper_cells_coexist() {
+        let mut s = SparseStore::new(1);
+        s.write(&[5], CellValue::Numeric(1.0));
+        s.write(&[5, 6], CellValue::Numeric(2.0));
+        assert_eq!(s.query_exact(&[5]), Some(CellValue::Numeric(1.0)));
+        assert_eq!(s.query_exact(&[5, 6]), Some(CellValue::Numeric(2.0)));
+    }
+
+    /// Non-numeric values survive the store unchanged (they are what the
+    /// attribute cubes are built from).
+    #[test]
+    fn string_cells_survive_alongside_numeric_ones() {
+        let mut s = SparseStore::new(2);
+        s.write(&[1, 1], CellValue::Numeric(1.0));
+        s.write(&[2, 2], CellValue::String("Cash Account".to_string()));
+        assert_eq!(s.query_exact(&[1, 1]), Some(CellValue::Numeric(1.0)));
+        assert_eq!(
+            s.query_exact(&[2, 2]),
+            Some(CellValue::String("Cash Account".to_string()))
+        );
+    }
+
+    /// `remove_cells_with_id_at` drops every cell whose coordinate at the given
+    /// position equals the target, across all of that position's branches, and
+    /// leaves every other cell untouched.
+    #[test]
+    fn prune_removes_only_the_targeted_coordinate() {
+        let mut s = SparseStore::new(2);
+        s.write(&[1, 8], CellValue::Numeric(1.0));
+        s.write(&[1, 9], CellValue::Numeric(2.0));
+        s.write(&[2, 8], CellValue::Numeric(3.0));
+        s.write(&[2, 7], CellValue::Numeric(4.0));
+
+        s.remove_cells_with_id_at(1, 8); // dim 1 == 8
+
+        assert_eq!(s.query_exact(&[1, 8]), None, "targeted cell in branch 1");
+        assert_eq!(s.query_exact(&[2, 8]), None, "targeted cell in branch 2");
+        assert_eq!(s.query_exact(&[1, 9]), Some(CellValue::Numeric(2.0)), "sibling kept");
+        assert_eq!(s.query_exact(&[2, 7]), Some(CellValue::Numeric(4.0)), "sibling kept");
+    }
+
+    /// Pruning at dimension 0 removes whole branches, and the scan afterwards
+    /// reports exactly what is left. This is the mechanism `.delete_member`
+    /// uses to purge a member's data from every cube that shares the dimension.
+    #[test]
+    fn prune_at_dimension_zero_then_scan_reports_the_survivors() {
+        let mut s = SparseStore::new(2);
+        s.write(&[1, 5], CellValue::Numeric(1.0));
+        s.write(&[2, 5], CellValue::Numeric(2.0));
+        s.write(&[3, 5], CellValue::Numeric(3.0));
+
+        s.remove_cells_with_id_at(0, 2);
+
+        let all = s.scan_subcube(&[None, None]);
+        assert_eq!(all.len(), 2, "one branch removed");
+        let coords: HashSet<Vec<u32>> = all.into_iter().map(|(c, _)| c).collect();
+        assert!(coords.contains(&vec![1, 5]));
+        assert!(coords.contains(&vec![3, 5]));
+        assert!(!coords.contains(&vec![2, 5]));
+    }
+
+    /// Pruning every branch empties the trie and leaves no debris behind: a
+    /// subsequent scan finds nothing.
+    #[test]
+    fn pruning_every_cell_empties_the_trie() {
+        let mut s = SparseStore::new(1);
+        s.write(&[4], CellValue::Numeric(1.0));
+        s.write(&[5], CellValue::Numeric(2.0));
+        s.remove_cells_with_id_at(0, 4);
+        s.remove_cells_with_id_at(0, 5);
+        assert!(s.scan_subcube(&[None]).is_empty(), "no cells left after full prune");
+    }
+
+    /// `scan_subcube` with a filter per dimension returns exactly the cells
+    /// that satisfy every filter, and the filter is applied dimension by
+    /// dimension (not as a union).
+    #[test]
+    fn scan_subcube_filters_intersect_across_dimensions() {
+        let mut s = SparseStore::new(2);
+        s.write(&[1, 1], CellValue::Numeric(11.0));
+        s.write(&[1, 2], CellValue::Numeric(12.0));
+        s.write(&[2, 1], CellValue::Numeric(21.0));
+        s.write(&[2, 2], CellValue::Numeric(22.0));
+
+        assert_eq!(s.scan_subcube(&[None, None]).len(), 4, "no filter: everything");
+
+        let dim0: HashSet<u32> = [1u32].into_iter().collect();
+        let only_1 = s.scan_subcube(&[Some(dim0), None]);
+        assert_eq!(only_1.len(), 2);
+        assert!(only_1.iter().all(|(c, _)| c[0] == 1));
+
+        let dim1: HashSet<u32> = [2u32].into_iter().collect();
+        let cross = s.scan_subcube(&[Some([1u32].into_iter().collect()), Some(dim1)]);
+        assert_eq!(cross.len(), 1, "the intersection is a single cell");
+        assert_eq!(cross[0], (vec![1, 2], CellValue::Numeric(12.0)));
+    }
+
+    /// A filter naming an id that no cell uses simply matches nothing; it is
+    /// not an error and must not panic.
+    #[test]
+    fn scan_subcube_with_a_filter_that_matches_nothing_is_empty() {
+        let mut s = SparseStore::new(2);
+        s.write(&[1, 1], CellValue::Numeric(1.0));
+        let missing: HashSet<u32> = [99u32].into_iter().collect();
+        assert!(s.scan_subcube(&[Some(missing), None]).is_empty());
+    }
+
+    /// The store walks a deep path without recursing away the stack. The
+    /// fixtures only ever build three or four levels, so this is the cheap
+    /// guard against a trie-depth limit going unnoticed.
+    #[test]
+    fn deep_coordinate_paths_are_stored_and_read_back() {
+        let depth = 512usize;
+        let mut s = SparseStore::new(depth);
+        let coords: Vec<u32> = (0..depth as u32).collect();
+        s.write(&coords, CellValue::Numeric(123.0));
+        assert_eq!(s.query_exact(&coords), Some(CellValue::Numeric(123.0)));
+        assert_eq!(s.scan_subcube(&vec![None; 512]).len(), 1);
+    }
+
+    /// Pruning a deep path is recursive too: it must not overflow, and it must
+    /// leave the trie empty when the only cell is removed.
+    #[test]
+    fn deep_paths_can_be_pruned() {
+        let depth = 256usize;
+        let mut s = SparseStore::new(depth);
+        let coords: Vec<u32> = (0..depth as u32).collect();
+        s.write(&coords, CellValue::Numeric(1.0));
+        s.remove_cells_with_id_at(0, 0);
+        assert!(s.scan_subcube(&vec![None; 256]).is_empty());
+    }
+
+    /// Printing an empty trie and a populated one both work and write to the
+    /// buffer rather than to stdout (the batch runner depends on that).
+    #[test]
+    fn print_tree_writes_to_the_buffer() {
+        let mut s = SparseStore::new(1);
+        let mut out = String::new();
+        s.print_tree(&mut out);
+        assert!(out.contains("empty"), "empty trie is reported, got: {out:?}");
+
+        s.write(&[3], CellValue::Numeric(1.0));
+        let mut out2 = String::new();
+        s.print_tree(&mut out2);
+        assert!(out2.contains("Coords"), "populated trie lists a coordinate, got: {out2:?}");
+    }
+}

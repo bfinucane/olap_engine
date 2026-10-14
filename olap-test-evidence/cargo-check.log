@@ -1,0 +1,8 @@
+﻿cargo :     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+In Zeile:5 Zeichen:1
++ cargo check --offline *> "$ws\_check2.log"
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `d...get(s) in 0.03s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+

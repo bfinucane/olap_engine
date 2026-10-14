@@ -1,0 +1,87 @@
+﻿cargo :     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+In Zeile:7 Zeichen:1
++ cargo test --offline *> "$ev\cargo-test-with-gap-tests.log"
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `t...get(s) in 0.03s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+     Running unittests src\lib.rs (target\debug\deps\olap_engine-ef8c61d88373ce8a.exe)
+
+running 14 tests
+test storage::sparse_store::tests::prune_removes_only_the_targeted_coordinate ... ok
+test storage::sparse_store::tests::exact_round_trip_returns_the_stored_cell ... ok
+test storage::sparse_store::tests::interior_and_deeper_cells_coexist ... ok
+test storage::sparse_store::tests::print_tree_writes_to_the_buffer ... ok
+test storage::sparse_store::tests::prune_at_dimension_zero_then_scan_reports_the_survivors ... ok
+test storage::sparse_store::tests::deep_paths_can_be_pruned ... ok
+test storage::sparse_store::tests::empty_coordinate_addresses_the_root ... ok
+test storage::sparse_store::tests::pruning_every_cell_empties_the_trie ... ok
+test storage::sparse_store::tests::scan_subcube_filters_intersect_across_dimensions ... ok
+test storage::sparse_store::tests::scan_subcube_with_a_filter_that_matches_nothing_is_empty ... ok
+test storage::sparse_store::tests::second_write_to_the_same_coordinate_overwrites ... ok
+test storage::sparse_store::tests::string_cells_survive_alongside_numeric_ones ... ok
+test storage::sparse_store::tests::unwritten_and_partial_coordinates_are_none ... ok
+test storage::sparse_store::tests::deep_coordinate_paths_are_stored_and_read_back ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\bench_trie.rs (target\debug\deps\bench_trie-3fe4022d4341bc39.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\bench_write.rs (target\debug\deps\bench_write-3dd4a9b6167e846b.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\olap_engine-523225697162726d.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\concurrency_tests.rs (target\debug\deps\concurrency_tests-0ba609671f3944de.exe)
+
+running 3 tests
+test concurrent_mutation_is_not_expressible_today ... ok
+test catalog_moves_to_another_thread ... ok
+test dimension_reads_are_safe_across_threads ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\persistence_tests.rs (target\debug\deps\persistence_tests-b5a62fa77a3e13e9.exe)
+
+running 6 tests
+test write_panics_on_an_over_long_coordinate_while_write_splashed_rejects_it ... ok
+test newer_format_version_is_refused_not_misread ... ok
+test load_of_garbage_file_is_a_clean_typed_error ... ok
+test save_then_load_round_trip_preserves_data_and_hierarchies ... ok
+test save_is_non_destructive_and_leaves_no_temp_debris ... ok
+test interrupt_a_save_leaves_the_previous_database_intact ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests\script_tests.rs (target\debug\deps\script_tests-051f6c2af0e4350b.exe)
+
+running 1 test
+One or more commands failed.
+One or more commands failed.
+One or more commands failed.
+One or more commands failed.
+One or more commands failed.
+One or more commands failed.
+One or more commands failed.
+test script_golden_tests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+   Doc-tests olap_engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
