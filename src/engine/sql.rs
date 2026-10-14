@@ -29,11 +29,14 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
     // itself; this creates an ADDITIONAL one. Hierarchy names are unique per
     // database, so a hierarchy name can stand in for a dimension in queries.
     if upper_sql.starts_with("CREATE HIERARCHY") {
-        let rest = sql_query[16..].trim().trim_end_matches(';').trim();
-        // Accept "Hier IN Dim" (IN is case-insensitive).
+                let rest = sql_query[16..].trim().trim_end_matches(';').trim();
+        // Accept "Hier IN Dim" (IN is case-insensitive). `split_once` on the
+        // uppercased copy finds the keyword; we slice the ORIGINAL string at the
+        // same byte offset (IN is ASCII, so offsets line up). No `.unwrap()`:
+        // the `None` arm is the only thing that can happen when IN is absent.
         let (hier_name, dim_name) = match rest.to_uppercase().split_once(" IN ") {
-            Some(_) => {
-                let idx = rest.to_uppercase().find(" IN ").unwrap();
+            Some((before, _)) => {
+                let idx = before.len();
                 (rest[..idx].trim().to_string(), rest[idx + 4..].trim().to_string())
             }
             None => {
@@ -180,11 +183,18 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                                     primary_cube_name, j_name, col
                                 ));
                             }
-                            // Normalize to the primary cube's exact casing.
+                                                        // Normalize to the primary cube's exact casing. The
+                            // `in_primary` check above guarantees a match, but we
+                            // resolve it without `.unwrap()` so a future change to
+                            // that guard cannot turn this into a panic.
                             primary_cube.dimension_names.iter()
                                 .find(|d| d.eq_ignore_ascii_case(col))
                                 .cloned()
-                                .unwrap()
+                                .ok_or_else(|| format!(
+                                    "Cannot JOIN '{}' with '{}' USING '{}': it must be a conformed \
+                                     dimension (present in both cubes).",
+                                    primary_cube_name, j_name, col
+                                ))?
                         } else {
                             let shared: Vec<String> = primary_cube.dimension_names.iter()
                                 .filter(|d| j_cube.dimension_names.contains(*d))
@@ -233,10 +243,9 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     let mut found = false; // Track if we successfully categorized the column
 
                     // 1. Is it a primary dimension?
-                    if primary_cube.dimension_names.contains(&col_name) {
+                                        if let Some(idx) = primary_cube.dimension_names.iter().position(|n| n == &col_name) {
                         if !axes.contains(&col_name) { axes.push(col_name.clone()); }
                         if Some(&col_name) == p_m_dim.as_ref() { measure_dim_requested = true; }
-                        let idx = primary_cube.dimension_names.iter().position(|n| n == &col_name).unwrap();
                         column_dim_index.insert(col_name.clone(), idx);
                         found = true;
                     }
@@ -261,9 +270,9 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                         found = true;
                     } 
                     // 2. Is it a primary measure?
-                    else if let Some(m_dim) = &p_m_dim {
-                                                let dim_idx = primary_cube.dimension_names.iter().position(|n| n == m_dim).unwrap();
-
+                                        else if let Some(m_dim) = &p_m_dim
+                        && let Some(dim_idx) = primary_cube.dimension_names.iter().position(|n| n == m_dim)
+                    {
                         let target_dim = primary_cube.dimensions[dim_idx].read().unwrap();
 
                         if let Some(id) = target_dim.get_id(&col_name) {
@@ -336,16 +345,22 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 }
                 let mut filters = normalized_filters;
 
-                // Inject Default Members for omitted dimensions
-                for dim_name in &primary_cube.dimension_names {
+                                // Inject Default Members for omitted dimensions.
+                //
+                // Iterating by INDEX (rather than looking the name back up with
+                // `.position(...).unwrap()`) removes a panic site entirely: the
+                // index equals `dim_idx` by construction, so there is nothing
+                // that can fail even if `dimension_names` and `dimensions` were
+                // ever inconsistent.
+                for dim_idx in 0..primary_cube.dimension_names.len() {
+                    let dim_name = &primary_cube.dimension_names[dim_idx];
                     // We skip the Measure Dimension (it has special pivot rules)
                     if Some(dim_name) == p_m_dim.as_ref() { continue; }
-                    
+
                     // If it's not an Axis and not Filtered, we must default it
                     if !axes.contains(dim_name) && !filters.contains_key(dim_name) {
-                        let dim_idx = primary_cube.dimension_names.iter().position(|n| n == dim_name).unwrap();
                         let dim = primary_cube.dimensions[dim_idx].read().unwrap();
-                        
+
                         if let Some(default_name) = dim.get_default_member_name() {
                             // Inject it into the WHERE clause dynamically
                             // We use a vector because we are about to upgrade filters to handle IN (...)
@@ -386,10 +401,15 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                                                                                 // --- 4. ENRICH WITH JOINED ATTRIBUTES (BULK METHOD) ---
                 // `resolved_join` was validated above; here we only actually
                 // stitch attributes in when the query asked for some.
-                if let Some((j_name, shared_dim)) = &resolved_join
+                                if let Some((j_name, shared_dim)) = &resolved_join
                     && !requested_attributes.is_empty()
                 {
-                    let j_cube = catalog.get_cube(j_name).unwrap();
+                    // `resolved_join` was only formed after this lookup succeeded,
+                    // but resolve it with a typed error rather than `.unwrap()`:
+                    // this path is reachable from a client-supplied query, and a
+                    // missing cube must never abort the process.
+                    let j_cube = catalog.get_cube(j_name)
+                        .ok_or_else(|| format!("Joined cube '{}' not found", j_name))?;
 
                         let shared_col_idx = result_set.headers.iter().position(|h| h == shared_dim)
                             .ok_or_else(|| format!(
@@ -436,12 +456,16 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                                     None => "-".to_string(), // Null handling
                                 };
 
-                                // Inject at the requested SELECT column index
-                                let out_idx = result_set.headers.iter().position(|h| h == attr_name).unwrap();
-                                if out_idx < row.len() {
-                                    row[out_idx] = display_val;
-                                } else {
-                                    row.push(display_val);
+                                                                // Inject at the requested SELECT column index.
+                                // The attribute name is in `output_columns`, so a
+                                // position exists; skip rather than panic if that
+                                // invariant is ever broken.
+                                if let Some(out_idx) = result_set.headers.iter().position(|h| h == attr_name) {
+                                    if out_idx < row.len() {
+                                        row[out_idx] = display_val;
+                                    } else {
+                                        row.push(display_val);
+                                    }
                                 }
                             }
                         }
@@ -548,7 +572,13 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                             continue;
                         }
 
-                        cube.write(&member_refs, measure_val);
+                                                // `write` returns a typed error on a coordinate/dimension
+                        // mismatch. (Note: an over-long coordinate list can
+                        // reach here because `has_consolidated_coordinate` uses
+                        // `.get(i)` and reports `false` for the out-of-range
+                        // index rather than the mismatch - so the guard in
+                        // `write` is the one that actually catches it.)
+                        cube.write(&member_refs, measure_val)?;
                         row_count += 1;
                     }
                     if splashed_count > 0 {

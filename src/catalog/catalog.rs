@@ -331,7 +331,7 @@ impl Catalog {
     ///
     /// A reader (or a crash) therefore sees either the complete OLD file or the
     /// complete NEW file - never a partial one.
-    pub fn save_to_disk(&self, filepath: &str) -> Result<(), PersistError> {
+        pub fn save_to_disk(&self, filepath: &str) -> Result<(), PersistError> {
         let snapshot = self.snapshot();
         let envelope = PersistedCatalog {
             magic: CATALOG_MAGIC,
@@ -342,9 +342,13 @@ impl Catalog {
         let target = Path::new(filepath);
         let tmp = temp_sibling_path(target);
 
-        // Scope the writer so its fd is closed before the rename (required on
-        // Windows, where you cannot rename over an open handle).
-        {
+        // Everything that can fail BEFORE the temp is published runs in this
+        // closure, so a single `?` at the call site can clean up the temp file
+        // on ANY failure. (A failed save used to leave a complete, fsynced temp
+        // file behind that the caller had no way to name, let alone remove.)
+        let write_result: Result<(), PersistError> = (|| {
+            // Scope the writer so its fd is closed before the rename (required
+            // on Windows, where you cannot rename over an open handle).
             let file = File::create(&tmp)?;
             let mut writer = BufWriter::new(file);
             bincode::serialize_into(&mut writer, &envelope).map_err(PersistError::Encode)?;
@@ -353,27 +357,43 @@ impl Catalog {
             // the rename lands, so a power loss could leave a renamed-but-empty
             // file.
             writer.into_inner().map_err(|e| PersistError::Io(e.into_error()))?.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            // Best-effort cleanup: the temp never became the live file, so it is
+            // pure debris. Ignore a removal failure - the original error is what
+            // the caller needs to see.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
 
-                // Atomic publish. On Windows `rename` fails if the destination exists,
-                // so we remove it first; the window is tiny and, crucially, the temp
-                // file is already fully durable, so a crash here still leaves a valid
-                // (old) file rather than a truncated one.
-                match std::fs::rename(&tmp, target) {
-                    Ok(()) => {}
-                    Err(_e) => {
-                        #[cfg(windows)]
-                        {
-                            let _ = std::fs::remove_file(target);
-                            std::fs::rename(&tmp, target)?;
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            return Err(PersistError::Io(_e));
-                        }
+        // Atomic publish. On Windows `rename` fails if the destination exists,
+        // so we remove it first; the window is tiny and, crucially, the temp
+        // file is already fully durable, so a crash here still leaves a valid
+        // (old) file rather than a truncated one.
+        match std::fs::rename(&tmp, target) {
+            Ok(()) => {}
+            Err(_e) => {
+                #[cfg(windows)]
+                {
+                    let _ = std::fs::remove_file(target);
+                    if let Err(rename_err) = std::fs::rename(&tmp, target) {
+                        // Even a failed fallback must not leak the temp.
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(PersistError::Io(rename_err));
                     }
                 }
-                Ok(())
+                #[cfg(not(windows))]
+                {
+                    // The temp never became the live file; remove it so a
+                    // refused save leaves nothing behind.
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(PersistError::Io(_e));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Loads a catalog from `filepath`, or returns an error.

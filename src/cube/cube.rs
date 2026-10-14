@@ -141,10 +141,24 @@ impl Cube {
     /// leaf coordinates. A leaf is shared by every hierarchy of its dimension,
     /// so a member name here is resolved against the dimension's DEFAULT
     /// hierarchy and auto-created as a (default-hierarchy) leaf. There is no way
-    /// to write "into" a named hierarchy - and none is needed, because a stored
+        /// to write "into" a named hierarchy - and none is needed, because a stored
     /// leaf value is already visible through all of them. Addressing a specific
     /// hierarchy is a READ-time concern (`Hierarchy:Member`).
-    pub fn write(&mut self, members: &[&str], value: CellValue) {
+    ///
+    /// Returns a typed error when `members` and the cube's dimensions disagree
+    /// in count. This mirrors `write_splashed`, and matters because the write
+    /// path is reachable from caller-supplied input (a script, and soon a query
+    /// plan over the wire): aborting the process instead of returning an error
+    /// is not acceptable for a public API.
+    pub fn write(&mut self, members: &[&str], value: CellValue) -> Result<(), String> {
+        if self.dimensions.len() != members.len() {
+            return Err(format!(
+                "Expected {} coordinate(s), got {}.",
+                self.dimensions.len(),
+                members.len()
+            ));
+        }
+
         let mut coords = Vec::new();
 
         for (i, m) in members.iter().enumerate() {
@@ -161,6 +175,7 @@ impl Cube {
         
         // Point 2: Cache invalidation. Base data changed, so aggregates are invalid.
         self.query_cache.clear(); 
+        Ok(())
     }
 
             /// True when at least one of the given coordinates names a Consolidated
@@ -424,9 +439,19 @@ fn calculate_jit(
                 Err(_) => CellValue::String(val_str.to_string()),
             };
 
-            // 3. Write it to the engine! 
+                        // 3. Write it to the engine! 
             // (This automatically updates the Dictionaries and the Trie)
-            self.write(&members, value);
+            // We build exactly `dim_count` members from a row of at least
+            // `dim_count + 1` fields, so this cannot mismatch; surface it as an
+            // error rather than unwrapping, to keep the public `write` API's
+            // contract honest.
+            self.write(&members, value).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "Row {}: {}",
+                    row_count + 1,
+                    e
+                ))
+            })?;
             row_count += 1;
         }
 
