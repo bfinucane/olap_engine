@@ -9,6 +9,8 @@ Successfully imported 3 rows into cube 'Financials'.
 Imported 8 parent-child relations into 'Geography'.
 
 > .import_lvl tests/scripts/import_lvl_calendar.csv Calendar
+Warning: member 'Q1' in dimension 'Calendar' was a base (leaf) member and has been promoted to an aggregate of hierarchy 'Calendar'; it is no longer a leaf in the other hierarchies. Any data stored against it as a leaf is not deleted but is now unreachable (it remains in the store and in the saved database, but no leaf query can address it).
+Warning: member 'Q2' in dimension 'Calendar' was a base (leaf) member and has been promoted to an aggregate of hierarchy 'Calendar'; it is no longer a leaf in the other hierarchies. Any data stored against it as a leaf is not deleted but is now unreachable (it remains in the store and in the saved database, but no leaf query can address it).
 Imported 12 level relations into 'Calendar'.
 
 > SELECT Sales FROM Financials WHERE Calendar = 'Jan' AND Geography = 'France' AND Scenario = 'Actuals'

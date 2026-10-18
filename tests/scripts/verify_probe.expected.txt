@@ -1,0 +1,4 @@
+Running script 'verify_probe.sql'...
+> SELECT Region, value FROM PersistProbe WHERE Cat = 'Technology'
+Error: Cube 'PersistProbe' not found
+

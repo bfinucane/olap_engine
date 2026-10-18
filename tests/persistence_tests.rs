@@ -28,14 +28,42 @@ use olap_engine::cube::node::CellValue;
 use olap_engine::dimension::dimension::Dimension;
 use std::sync::{Arc, RwLock};
 
-/// A unique temp path per test, in the OS temp dir so we never touch the repo's
-/// `database.bin`.
+/// Where these tests write, so we never touch the repo's `database.bin`.
+///
+/// NOT `std::env::temp_dir()`: under the file sandbox this suite runs in, writes
+/// outside the session workspace are denied, and `save_to_disk` into `%TEMP%` fails
+/// with `PermissionDenied` (os error 5) — which reads as a persistence bug and is
+/// not one. `OLAP_TEST_ARTIFACTS` overrides the location.
+fn artifact_dir() -> std::path::PathBuf {
+    let dir = match std::env::var_os("OLAP_TEST_ARTIFACTS") {
+        Some(v) => std::path::PathBuf::from(v),
+        None => {
+            let home = std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            home.join("Documents")
+                .join("deepseek-harness")
+                .join("default-workspace")
+                .join("olap-test-artifacts")
+        }
+    };
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!(
+            "could not create the artifact directory {}: {e}. \
+             Set OLAP_TEST_ARTIFACTS to a writable path.",
+            dir.display()
+        )
+    });
+    dir
+}
+
+/// A unique path per test, inside the artifact directory.
 fn temp_path(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!("olap_persist_{}_{}_{}.bin", tag, std::process::id(), n));
+    let mut p = artifact_dir();
+    p.push(format!("persist_{}_{}_{}.bin", tag, std::process::id(), n));
     p
 }
 

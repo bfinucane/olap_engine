@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::time::Instant; // Adds precision timing!
 
 use olap_engine::catalog::catalog::Catalog;
+use olap_engine::cube::node::CellValue;
 use olap_engine::engine::sql::execute_sql;
 
 /// Parsed command-line arguments for the batch (headless) mode.
@@ -259,7 +260,8 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                                 let _ = writeln!(out, "  .cubes                       - List all cubes in the catalog");
                 let _ = writeln!(out, "  .dimensions                  - List all dimensions and their hierarchies");
                 let _ = writeln!(out, "  .create_hierarchy <dim> <h>  - Create a hierarchy inside a dimension");
-                let _ = writeln!(out, "  .import <file.csv> <cube>    - Import data from CSV");
+                let _ = writeln!(out, "  .import <file.csv> <cube>    - Import numeric data from CSV");
+                let _ = writeln!(out, "  .import_attr <file.csv> <cube> - Import STRING attributes (key..., attr, value)");
                 let _ = writeln!(out, "  .rollup <hier> <p> <c> <wt>  - Create parent/child hierarchy relation");
                 let _ = writeln!(out, "  .detach <hier> <p> <c>       - Remove a parent/child hierarchy relation");
                 let _ = writeln!(out, "  .delete_member <dim> <member>- Delete a member and purge its data");
@@ -340,8 +342,91 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                         let _ = writeln!(out, "Cube not found.");
                         ok = false;
                     }
-                } else {
+                                } else {
                     let _ = writeln!(out, "Usage: .import <filepath> <cube>");
+                    ok = false;
+                }
+            }
+                                    // IMPORT an ATTRIBUTE file (string-valued).
+            //
+            // `.import` treats EVERY dimension as a coordinate and reads one
+            // trailing NUMERIC value column. A string attribute cube is shaped
+            // differently: its LAST dimension is the attribute's NAME (a member
+            // of the measure dimension) and the cell is the string VALUE beyond
+            // it. So a row is `dims..., value`, and this is the file-driven form
+            // of `INSERT INTO cube VALUES (d1, ..., dN, 'value')`.
+            //
+            // Column contract for a cube with D dimensions:
+            //   cols 0..D-1  -> the D dimension coordinates (the last of which is
+            //                   typically the attribute-name member)
+            //   col  D       -> the STRING value stored at that coordinate
+            // (Same width as `.import`, but the final column is a STRING cell
+            //  rather than a parsed number.)
+            ".import_attr" => {
+                if parts.len() == 3 {
+                    match csv::ReaderBuilder::new().has_headers(true).flexible(true).from_path(parts[1]) {
+                        Ok(mut rdr) => {
+                            match catalog.get_cube_mut(parts[2]) {
+                                Some(cube) => {
+                                    let d = cube.dimension_names.len();
+                                    let mut count = 0;
+                                    let mut failed = false;
+                                    for result in rdr.records() {
+                                        let record = match result {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                let _ = writeln!(out, "Import failed: bad CSV row: {}", e);
+                                                ok = false;
+                                                failed = true;
+                                                break;
+                                            }
+                                        };
+                                        if record.len() < d + 1 {
+                                            let _ = writeln!(
+                                                out,
+                                                "Import failed: row has {} column(s), expected {}.",
+                                                record.len(),
+                                                d + 1
+                                            );
+                                            ok = false;
+                                            failed = true;
+                                            break;
+                                        }
+                                        // Coordinates = the first D columns; the final
+                                        // column is the string CELL value.
+                                        let coords: Vec<String> = record
+                                            .iter()
+                                            .take(d)
+                                            .map(|s| s.trim().to_string())
+                                            .collect();
+                                        let value = record.get(d).unwrap_or("").trim().to_string();
+                                        let refs: Vec<&str> = coords.iter().map(|s| s.as_str()).collect();
+                                        if let Err(e) = cube.write(&refs, CellValue::String(value)) {
+                                            let _ = writeln!(out, "Import failed: {}", e);
+                                            ok = false;
+                                            failed = true;
+                                            break;
+                                        }
+                                        count += 1;
+                                    }
+                                    if !failed {
+                                        cube.clear_cache();
+                                        let _ = writeln!(out, "Imported {} attribute row(s) into '{}'.", count, parts[2]);
+                                    }
+                                }
+                                None => {
+                                    let _ = writeln!(out, "Cube not found.");
+                                    ok = false;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let _ = writeln!(out, "Could not open '{}'.", parts[1]);
+                            ok = false;
+                        }
+                    }
+                } else {
+                    let _ = writeln!(out, "Usage: .import_attr <filepath> <cube>");
                     ok = false;
                 }
             }		
@@ -356,36 +441,40 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                             let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[2]);
                             let mut count = 0;
                             let mut failed = false;
+                            let mut warnings: Vec<String> = Vec::new();
 
                             for result in rdr.records() {
-                                let record = match result {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        let _ = writeln!(out, "Import failed: bad CSV row: {}", e);
-                                        ok = false;
-                                        failed = true;
-                                        break;
-                                    }
-                                };
-                                if record.len() >= 3 {
-                                    let parent = &record[0];
-                                    let child = &record[1];
-                                    let weight: f64 = record[2].parse().unwrap_or(1.0);
-                                    let res = dim_arc.write().unwrap()
-                                        .add_component_in(Some(&hier_name), parent, child, weight);
-                                    if let Err(e) = res {
-                                        let _ = writeln!(out, "Import failed: {}", e);
-                                        ok = false;
-                                        failed = true;
-                                        break;
-                                    }
-                                    count += 1;
-                                }
+                                                                                                let record = match result {
+                                                                                                    Ok(r) => r,
+                                                                                                    Err(e) => {
+                                                                                                        let _ = writeln!(out, "Import failed: bad CSV row: {}", e);
+                                                                                                        ok = false;
+                                                                                                        failed = true;
+                                                                                                        break;
+                                                                                                    }
+                                                                                                };
+                                                                                                if record.len() >= 3 {
+                                                                                                    let parent = &record[0];
+                                                                                                    let child = &record[1];
+                                                                                                    let weight: f64 = record[2].parse().unwrap_or(1.0);
+                                                                                                    let res = dim_arc.write().unwrap()
+                                                                                                        .add_component_in_with_warnings(Some(&hier_name), parent, child, weight, &mut warnings);
+                                                                                                    if let Err(e) = res {
+                                                                                                        let _ = writeln!(out, "Import failed: {}", e);
+                                                                                                        ok = false;
+                                                                                                        failed = true;
+                                                                                                        break;
+                                                                                                    }
+                                                                                                    count += 1;
+                                                                                                }
                             }
 
                             if !failed {
-                                catalog.clear_all_caches();
-                                let _ = writeln!(out, "Imported {} parent-child relations into '{}'.", count, parts[2]);
+                                                                                                catalog.clear_all_caches();
+                                                                                                for w in &warnings {
+                                                                                                    let _ = writeln!(out, "Warning: {}", w);
+                                                                                                }
+                                                                                                let _ = writeln!(out, "Imported {} parent-child relations into '{}'.", count, parts[2]);
                             }
                         }
                                                 Err(_) => {
@@ -409,49 +498,53 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                             let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[2]);
                             let mut count = 0;
                             let mut failed = false;
+                            let mut warnings: Vec<String> = Vec::new();
 
                             for result in rdr.records() {
-                                let record = match result {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        let _ = writeln!(out, "Import failed: bad CSV row: {}", e);
-                                        ok = false;
-                                        failed = true;
-                                        break;
-                                    }
-                                };
-                                let mut dim = dim_arc.write().unwrap();
+                                                                                                let record = match result {
+                                                                                                    Ok(r) => r,
+                                                                                                    Err(e) => {
+                                                                                                        let _ = writeln!(out, "Import failed: bad CSV row: {}", e);
+                                                                                                        ok = false;
+                                                                                                        failed = true;
+                                                                                                        break;
+                                                                                                    }
+                                                                                                };
+                                                                                                let mut dim = dim_arc.write().unwrap();
 
-                                // Link each non-empty level to the NEXT non-empty level
-                                // to its right, ignoring blanks. This supports ragged
-                                // hierarchies where shorter paths simply stop early, and
-                                // messy account structures where a value may appear at a
-                                // "shallower" column because an intermediate level was blank.
-                                //   All,Europe,France,Paris -> All>Europe>France>Paris
-                                //   All,,France,Paris       -> All>France>Paris
-                                //   Europe,France,,         -> Europe>France (France is a leaf)
-                                let non_empty: Vec<&str> = record.iter()
-                                    .map(|s| s.trim())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
+                                                                                                // Link each non-empty level to the NEXT non-empty level
+                                                                                                // to its right, ignoring blanks. This supports ragged
+                                                                                                // hierarchies where shorter paths simply stop early, and
+                                                                                                // messy account structures where a value may appear at a
+                                                                                                // "shallower" column because an intermediate level was blank.
+                                                                                                //   All,Europe,France,Paris -> All>Europe>France>Paris
+                                                                                                //   All,,France,Paris       -> All>France>Paris
+                                                                                                //   Europe,France,,         -> Europe>France (France is a leaf)
+                                                                                                let non_empty: Vec<&str> = record.iter()
+                                                                                                    .map(|s| s.trim())
+                                                                                                    .filter(|s| !s.is_empty())
+                                                                                                    .collect();
 
-                                for pair in non_empty.windows(2) {
-                                    let parent = pair[0];
-                                    let child = pair[1];
-                                    if let Err(e) = dim.add_component_in(Some(&hier_name), parent, child, 1.0) {
-                                        let _ = writeln!(out, "Import failed: {}", e);
-                                        ok = false;
-                                        failed = true;
-                                        break;
-                                    }
-                                    count += 1;
-                                }
-                                if failed { break; }
+                                                                                                for pair in non_empty.windows(2) {
+                                                                                                    let parent = pair[0];
+                                                                                                    let child = pair[1];
+                                                                                                    if let Err(e) = dim.add_component_in_with_warnings(Some(&hier_name), parent, child, 1.0, &mut warnings) {
+                                                                                                        let _ = writeln!(out, "Import failed: {}", e);
+                                                                                                        ok = false;
+                                                                                                        failed = true;
+                                                                                                        break;
+                                                                                                    }
+                                                                                                    count += 1;
+                                                                                                }
+                                                                                                if failed { break; }
                             }
 
                             if !failed {
-                                catalog.clear_all_caches();
-                                let _ = writeln!(out, "Imported {} level relations into '{}'.", count, parts[2]);
+                                                                                                catalog.clear_all_caches();
+                                                                                                for w in &warnings {
+                                                                                                    let _ = writeln!(out, "Warning: {}", w);
+                                                                                                }
+                                                                                                let _ = writeln!(out, "Imported {} level relations into '{}'.", count, parts[2]);
                             }
                         }
                                                 Err(_) => {
@@ -471,12 +564,16 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                                                                                                     // The first argument is a HIERARCHY name (globally unique). A
                                                                                                     // dimENSION name is a dynamic ALIAS for that dimension's default
                                                                                                     // hierarchy, so single-hierarchy scripts are unchanged.
-                                                                                                    if parts.len() == 5 {
+                                                                                                                                                                                                        if parts.len() == 5 {
                                                                                                         if let Ok(weight) = parts[4].parse::<f64>() {
                                                                                                             let (dim_arc, hier_name, _created) = catalog.resolve_reference(parts[1]);
+                                                                                                            let mut warnings: Vec<String> = Vec::new();
                                                                                                             let moved = dim_arc.write().unwrap()
-                                                                                                                .add_component_in(Some(&hier_name), parts[2], parts[3], weight);
+                                                                                                                .add_component_in_with_warnings(Some(&hier_name), parts[2], parts[3], weight, &mut warnings);
                                                                                                             catalog.clear_all_caches();
+                                                                                                            for w in &warnings {
+                                                                                                                let _ = writeln!(out, "Warning: {}", w);
+                                                                                                            }
                                                                                                             match moved {
                                                                                                                 Ok(Some(old_parent)) => {
                                                                                                                     // One-parent-per-hierarchy: re-parenting auto-detached it.

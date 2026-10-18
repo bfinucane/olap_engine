@@ -230,6 +230,27 @@ impl Dimension {
     /// A name therefore maps to exactly one id, and is never simultaneously a
     /// leaf and an aggregate.
     pub fn add_consolidated_in(&mut self, hier: Option<&str>, name: &str) -> Result<u32, String> {
+        let mut sink = Vec::new();
+        self.add_consolidated_in_with_warnings(hier, name, &mut sink)
+    }
+
+    /// Like `add_consolidated_in`, but reports a WARNING when the call *promotes*
+    /// an existing base (leaf) member into an aggregate.
+    ///
+    /// A name may not be simultaneously a base member and an aggregate (see the
+    /// type docs), so promotion EVICTS the member from the shared leaf bank:
+    /// it stops being a leaf in every hierarchy and becomes an aggregate of just
+    /// this one. Because the dimension cannot see whether any cube holds data
+    /// against that leaf, it cannot tell a harmless reclassification from one
+    /// that silently orphans stored facts. It therefore always WARNS and lets
+    /// the caller (and ultimately the user) judge - mirroring Infor OLAP, which
+    /// surfaces this as a warning/error rather than auto-repairing.
+    pub fn add_consolidated_in_with_warnings(
+        &mut self,
+        hier: Option<&str>,
+        name: &str,
+        warnings: &mut Vec<String>,
+    ) -> Result<u32, String> {
         let hier_key = match hier {
             None => self.default_hierarchy.clone(),
             Some(h) => h.to_string(),
@@ -261,6 +282,20 @@ impl Dimension {
             self.member_types.insert(leaf_id, MemberType::Consolidated);
             self.hierarchies.get_mut(&hier_lc).unwrap()
                 .register_aggregate(&original, leaf_id);
+
+            // WARN: this base member just became an aggregate. Any fact stored
+            // against it as a leaf is NOT deleted - it stays in the store keyed
+            // by this id - but it is no longer addressable as a leaf, so it
+            // silently drops out of every correct answer and persists in the
+            // saved database. This is the hazard the warning exists to surface.
+            warnings.push(format!(
+                "member '{}' in dimension '{}' was a base (leaf) member and has been \
+                 promoted to an aggregate of hierarchy '{}'; it is no longer a leaf in \
+                 the other hierarchies. Any data stored against it as a leaf is not \
+                 deleted but is now unreachable (it remains in the store and in the \
+                 saved database, but no leaf query can address it).",
+                original, self.name, hier_key
+            ));
             return Ok(leaf_id);
         }
 
@@ -301,6 +336,20 @@ impl Dimension {
         child: &str,
         weight: f64,
     ) -> Result<Option<String>, String> {
+        let mut sink = Vec::new();
+        self.add_component_in_with_warnings(hier, parent, child, weight, &mut sink)
+    }
+
+    /// Like `add_component_in`, but forwards any promotion WARNINGS emitted while
+    /// registering the parent (and, if newly created, the child) as aggregates.
+    pub fn add_component_in_with_warnings(
+        &mut self,
+        hier: Option<&str>,
+        parent: &str,
+        child: &str,
+        weight: f64,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<String>, String> {
         let hier_key = match hier {
             None => self.default_hierarchy.clone(),
             Some(h) => h.to_string(),
@@ -312,8 +361,9 @@ impl Dimension {
             ));
         }
 
-        // Parent is always an aggregate of this hierarchy.
-        let parent_id = self.add_consolidated_in(Some(&hier_key), parent)?;
+        // Parent is always an aggregate of this hierarchy. Promoting it may
+        // evict a base leaf (and warn); forward that.
+        let parent_id = self.add_consolidated_in_with_warnings(Some(&hier_key), parent, warnings)?;
 
         // Child: an aggregate already registered in this hierarchy, otherwise a
         // shared leaf.

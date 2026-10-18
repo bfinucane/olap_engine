@@ -81,6 +81,12 @@ pub struct SliceQuery {
     pub column_dim_index: HashMap<String, usize>,
 }
 
+/// A materialised result: column headers plus stringified rows.
+///
+/// `Debug` and `Clone` are derived so a result set can be embedded in a larger
+/// response value (e.g. the plan layer's `PlanResult`) without every such type
+/// hand-rolling its own wrapper.
+#[derive(Debug, Clone)]
 pub struct ResultSet {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>, // All cells converted to string for easy printing

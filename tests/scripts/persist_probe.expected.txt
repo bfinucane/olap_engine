@@ -1,0 +1,10 @@
+Running script 'persist_probe.sql'...
+> CREATE TABLE PersistProbe (Region STRING, Cat STRING, V MEASURE)
+Cube 'PersistProbe' created. Measure dimension: V
+
+> .import examples/Plateau/cube-region-segment-category.csv PersistProbe
+Successfully imported 36 rows into cube 'PersistProbe'.
+
+> .save
+Database saved.
+
