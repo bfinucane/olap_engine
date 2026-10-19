@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 
@@ -18,10 +19,19 @@ impl fmt::Display for CellValue {
     }
 }
 
+/// One coordinate step in the Patricia trie.
+///
+/// Children are `Arc<Node>` rather than owned `Node`: the trie is a PERSISTENT data
+/// structure, so a write copies only the nodes on the path to the coordinate and
+/// shares every untouched subtree with the version it grew from. That is what makes
+/// a snapshot O(1) instead of O(cells) — see `PHASE-1B-DESIGN.md` §2.
+///
+/// `Arc` rather than a manual version table also makes reclamation automatic: a
+/// retired version's nodes are freed when the last reader drops its snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
-    // UZse a HashMap for sparse children storage.
-    pub children: HashMap<u32, Node>, 
+    // A HashMap keeps sparse children cheap; the values are shared, not copied.
+    pub children: HashMap<u32, Arc<Node>>, 
     pub value: Option<CellValue>,
 }
 

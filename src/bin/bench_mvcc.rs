@@ -178,7 +178,7 @@ fn main() {
             let _snapshot = store.clone();
         });
         println!(
-            "  {:<22} {:>9} B  {:>4} allocs  {:>8.1} µs   (Option-B snapshot = clone)",
+            "  {:<22} {:>9} B  {:>4} allocs  {:>8.1} µs   (snapshot() = Arc clone, O(1))",
             label,
             bytes,
             calls,

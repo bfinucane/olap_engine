@@ -1,11 +1,21 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use crate::cube::node::{Node, CellValue};
 
+/// Sparse Patricia trie: one cell per leaf coordinate.
+///
+/// PERSISTENT (Phase 1b, M1): `root` is an `Arc<Node>` and every node's children are
+/// `Arc`s, so a write copies only the nodes on the path to the coordinate and shares
+/// every untouched subtree. `snapshot()` is therefore O(1), and a snapshot stays
+/// valid no matter what is written afterwards.
+///
+/// The public API is unchanged: `write` still takes `&mut self`. What changed is the
+/// cost model — an overwrite now allocates a path instead of mutating in place.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SparseStore {
-    root: Node,
+    root: Arc<Node>,
     // We might track depth or other metadata here later
     #[allow(dead_code)] 
     dim_count: usize, 
@@ -14,9 +24,18 @@ pub struct SparseStore {
 impl SparseStore {
     pub fn new(dim_count: usize) -> Self {
         SparseStore {
-            root: Node::new(),
+            root: Arc::new(Node::new()),
             dim_count,
         }
+    }
+
+    /// A point-in-time snapshot, O(1).
+    ///
+    /// Cloning is an `Arc` bump: the root and every shared subtree are referenced,
+    /// not copied. Later writes to `self` publish new nodes along their own paths, so
+    /// this snapshot keeps reading exactly the state it was taken at.
+    pub fn snapshot(&self) -> SparseStore {
+        self.clone()
     }
 
 // A quick debug printer for the Trie.
@@ -41,18 +60,32 @@ impl SparseStore {
     }
 
     // --- WRITE LOGIC ---
+    //
+    // Copy-on-write: the root is replaced by a copy whose path to the coordinate is
+    // new and whose other subtrees are the SAME `Arc`s as before. Cost is O(depth),
+    // not O(cells).
     pub fn write(&mut self, coords: &[u32], value: CellValue) {
-        let mut current_node = &mut self.root;
-        
-        for &id in coords {
-            // "entry().or_insert()" is the standard Rust way to 
-            // get a value or create it if missing.
-            current_node = current_node.children
-                .entry(id)
-                .or_default();
+        self.root = Self::write_path(&self.root, coords, 0, value);
+    }
+
+    fn write_path(node: &Arc<Node>, coords: &[u32], depth: usize, value: CellValue) -> Arc<Node> {
+        // Shallow copy: `children` clones its `Arc`s and `value` clones its payload.
+        let mut copied = (**node).clone();
+
+        if depth == coords.len() {
+            copied.value = Some(value);
+        } else {
+            let id = coords[depth];
+            let child = node
+                .children
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Node::new()));
+            let updated = Self::write_path(&child, coords, depth + 1, value);
+            copied.children.insert(id, updated);
         }
-        
-        current_node.value = Some(value);
+
+        Arc::new(copied)
     }
 
 
@@ -79,26 +112,43 @@ impl SparseStore {
     /// `target_id`. Used when a member is deleted from a dimension: all data
     /// referencing that member must disappear from every cube.
     /// Empty branches left behind by the deletion are pruned.
+    ///
+    /// Copy-on-write like `write`: existing snapshots keep the cells they were taken
+    /// with. A prune walks the whole trie, so it copies every node — acceptable
+    /// because deleting a member is an admin operation, not a hot path.
     pub fn remove_cells_with_id_at(&mut self, dim_index: usize, target_id: u32) {
-        Self::prune_recursive(&mut self.root, dim_index, target_id, 0);
+        self.root = Self::prune_path(&self.root, dim_index, target_id, 0);
     }
 
-    fn prune_recursive(node: &mut Node, dim_index: usize, target_id: u32, depth: usize) -> bool {
+    fn prune_path(
+        node: &Arc<Node>,
+        dim_index: usize,
+        target_id: u32,
+        depth: usize,
+    ) -> Arc<Node> {
+        let mut copied = (**node).clone();
+
         if depth == dim_index {
             // At the member's dimension, drop the entire subtree under target_id.
-            node.children.remove(&target_id);
+            copied.children.remove(&target_id);
         } else {
-            // Recurse into existing children.
-            for child in node.children.values_mut() {
-                Self::prune_recursive(child, dim_index, target_id, depth + 1);
+            // Recurse into the existing children and replace those that changed.
+            let updates: Vec<(u32, Arc<Node>)> = node
+                .children
+                .iter()
+                .map(|(&id, child)| (id, Self::prune_path(child, dim_index, target_id, depth + 1)))
+                .collect();
+            for (id, child) in updates {
+                copied.children.insert(id, child);
             }
         }
 
         // Prune children that became empty (no value and no descendants).
-        node.children.retain(|_, child| child.value.is_some() || !child.children.is_empty());
+        copied
+            .children
+            .retain(|_, child| child.value.is_some() || !child.children.is_empty());
 
-        // Return whether this node is now empty (used by the parent's retain).
-        node.value.is_none() && node.children.is_empty()
+        Arc::new(copied)
     }
 
     // --- SUB-CUBE SCANNER ---
@@ -343,5 +393,120 @@ mod tests {
         let mut out2 = String::new();
         s.print_tree(&mut out2);
         assert!(out2.contains("Coords"), "populated trie lists a coordinate, got: {out2:?}");
+    }
+
+    // --- Persistence (Phase 1b M1): snapshots and structural sharing -------------
+
+    /// A snapshot is a point in time: later writes must not be visible through it.
+    /// This is the whole reason the trie became persistent.
+    #[test]
+    fn snapshot_is_unaffected_by_later_writes() {
+        let mut store = SparseStore::new(2);
+        store.write(&[1, 2], CellValue::Numeric(1.0));
+
+        let snapshot = store.snapshot();
+
+        store.write(&[1, 2], CellValue::Numeric(2.0)); // overwrite an existing cell
+        store.write(&[3, 4], CellValue::Numeric(3.0)); // add a new branch
+
+        assert_eq!(
+            snapshot.query_exact(&[1, 2]),
+            Some(CellValue::Numeric(1.0)),
+            "the snapshot must still see the value it was taken with"
+        );
+        assert_eq!(
+            snapshot.query_exact(&[3, 4]),
+            None,
+            "a branch added later must not appear in an older snapshot"
+        );
+
+        // The live store sees both writes.
+        assert_eq!(store.query_exact(&[1, 2]), Some(CellValue::Numeric(2.0)));
+        assert_eq!(store.query_exact(&[3, 4]), Some(CellValue::Numeric(3.0)));
+
+        // And the snapshot's scan is the old set, not the new one.
+        assert_eq!(snapshot.scan_subcube(&[None, None]).len(), 1);
+        assert_eq!(store.scan_subcube(&[None, None]).len(), 2);
+    }
+
+    /// A write copies only the nodes on its own path: sibling subtrees are shared by
+    /// pointer, not copied. This is what makes the cost O(depth) instead of O(cells),
+    /// and it is invisible to any behavioural test — hence the explicit `ptr_eq`.
+    #[test]
+    fn writes_share_untouched_subtrees_by_pointer() {
+        let mut store = SparseStore::new(2);
+        store.write(&[1, 1], CellValue::Numeric(1.0));
+        store.write(&[2, 2], CellValue::Numeric(2.0));
+
+        let snapshot = store.snapshot();
+
+        // Touch ONLY branch 1.
+        store.write(&[1, 1], CellValue::Numeric(9.0));
+
+        let branch_2_before = snapshot
+            .root
+            .children
+            .get(&2)
+            .expect("branch 2 exists in the snapshot")
+            .clone();
+        let branch_2_after = store
+            .root
+            .children
+            .get(&2)
+            .expect("branch 2 exists in the live store")
+            .clone();
+        assert!(
+            Arc::ptr_eq(&branch_2_before, &branch_2_after),
+            "the untouched branch must be the SAME allocation in both versions"
+        );
+
+        // The branch that was written is new, and the snapshot kept the old one.
+        let branch_1_before = snapshot.root.children.get(&1).expect("branch 1").clone();
+        let branch_1_after = store.root.children.get(&1).expect("branch 1").clone();
+        assert!(
+            !Arc::ptr_eq(&branch_1_before, &branch_1_after),
+            "the written branch must be a fresh node"
+        );
+        assert_eq!(branch_1_before.value, None);
+        assert_eq!(branch_1_after.value, None);
+    }
+
+    /// Pruning is copy-on-write too: deleting a member's cells must not erase them
+    /// from a snapshot taken beforehand.
+    #[test]
+    fn prune_does_not_affect_an_existing_snapshot() {
+        let mut store = SparseStore::new(2);
+        store.write(&[1, 8], CellValue::Numeric(1.0));
+        store.write(&[2, 8], CellValue::Numeric(2.0));
+
+        let snapshot = store.snapshot();
+        store.remove_cells_with_id_at(1, 8);
+
+        assert_eq!(
+            snapshot.query_exact(&[1, 8]),
+            Some(CellValue::Numeric(1.0)),
+            "the snapshot keeps the pruned cell"
+        );
+        assert_eq!(store.query_exact(&[1, 8]), None, "the live store dropped it");
+        assert_eq!(store.query_exact(&[2, 8]), None);
+        assert_eq!(snapshot.scan_subcube(&[None, None]).len(), 2);
+        assert!(store.scan_subcube(&[None, None]).is_empty());
+    }
+
+    /// `snapshot()` must be O(1) — an `Arc` bump, not a walk. Guarded structurally:
+    /// taking a snapshot of a deep trie and then dropping the original must leave the
+    /// snapshot fully usable.
+    #[test]
+    fn snapshot_outlives_the_store_it_came_from() {
+        let snapshot = {
+            let mut store = SparseStore::new(3);
+            store.write(&[1, 2, 3], CellValue::Numeric(42.0));
+            store.snapshot()
+        };
+        assert_eq!(
+            snapshot.query_exact(&[1, 2, 3]),
+            Some(CellValue::Numeric(42.0)),
+            "the snapshot owns its own Arcs; dropping the store must not matter"
+        );
     }
 }
