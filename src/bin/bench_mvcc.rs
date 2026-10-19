@@ -156,20 +156,28 @@ fn main() {
             ns as f64 / 1000.0 / n as f64
         );
 
-        // 3) Scan throughput: the number a pinned reader must not lose to a writer.
-        let cells = store.scan_subcube(&vec![None; dims]).len();
-        let (_, _, ns) = measure(|| {
-            for _ in 0..10 {
-                let hit = store.scan_subcube(&vec![None; dims]).len();
-                assert_eq!(hit, cells);
-            }
-        });
+        // 3) Scan throughput. Timing one scan is noisy because every scan allocates its
+        //    result Vec. Run several trials of several scans and report the MIN and the
+        //    MEDIAN per-cell cost, so a regression has to clear the noise before anyone
+        //    claims one.
+        let all: Vec<Option<std::collections::HashSet<u32>>> = vec![None; dims];
+        let cells = store.scan_subcube(&all).len();
+        let mut samples: Vec<f64> = Vec::with_capacity(7);
+        for _ in 0..7 {
+            let (_, _, ns) = measure(|| {
+                for _ in 0..20 {
+                    let hit = store.scan_subcube(&all).len();
+                    assert_eq!(hit, cells);
+                }
+            });
+            samples.push(ns as f64 / (cells as f64 * 20.0));
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
         println!(
-            "  {:<22} {:>9}       {:>4}          {:>8.2} ns/cell  ({} cells, 10 scans)",
+            "  {:<22} min {:>6.2}  median {:>6.2} ns/cell   ({} cells, 7x20 scans)",
             label,
-            "",
-            "",
-            ns as f64 / (cells as f64 * 10.0),
+            samples[0],
+            samples[samples.len() / 2],
             cells
         );
 

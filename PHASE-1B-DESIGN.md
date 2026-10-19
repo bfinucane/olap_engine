@@ -158,20 +158,61 @@ Scan throughput (the number a pinned reader must not lose): **50.3 ns/cell** at 
 3. **Deep paths cost walking, not allocation.** A 512-deep rewrite is 16 µs with zero
    allocation today; path copying adds 512 node copies, so that is where CoW can really hurt.
 
-### The gate (derived from the baseline, not guessed)
+### The gate, revised after M1 (accepted)
 
-| Metric | Threshold | Rationale |
-|---|---|---|
-| CoW overwrite, bytes/write | ≤ 2 × today's new-leaf: **≤ 816 B** @3 dims, **≤ 1,674 B** @4 dims | a CoW overwrite does the allocation work of a new-leaf write |
-| CoW overwrite, time | ≤ 2 × new-leaf: **≤ 0.54 µs** @3 dims, **≤ 1.00 µs** @4 dims | same |
-| `snapshot()` | **O(1)**: ≤ 64 B and ≤ 100 ns | an `Arc` clone; anything near the clone column fails the phase |
-| Pinned scan while writers commit | **≤ 10% slower**: ≤ 55.3 ns/cell @3 dims, ≤ 85.4 @4 dims | the actual promise of 1b |
-| 512-deep path rewrite | ≤ 5 × baseline ≈ **≤ 80 µs** | worst case for path copying; report, do not silently accept |
-| Retention | **< 2 KB per additional pinned version** on the 4-dim set | sharing is the whole point; O(cells) per version means it is not MVCC |
+The first version of this gate — "≤ 2 × a new-leaf write" — assumed a copy-on-write
+overwrite costs what a new-leaf write costs. **It does not**, and M1 made that measurable:
+`(**node).clone()` clones the **children map at every node on the path**, so a write costs
+O(fan-out) rather than O(1).
 
-If the overwrite numbers fail, fall back to Option B for the data path and keep the
-versioned API. If only the deep-path case fails, add a depth threshold above which a
-subtree is cloned wholesale.
+Measured on the persistent store (deterministic across runs):
+
+| Case | M0 baseline | M1 persistent | first gate | verdict |
+|---|---:|---:|---:|---|
+| 3 dims overwrite | 0 B / 0.08 µs | 2,744 B / 3.2 µs | ≤ 816 B | **3.4× over** |
+| 4 dims overwrite | 0 B / 0.21 µs | 2,207 B / 2.9 µs | ≤ 1,674 B | **1.3× over** |
+| `snapshot()` | 1.2 MB / 692 µs | **0 B / 0.15 µs** | ≤ 64 B | passes |
+| 512-deep rewrite | 0 B / 16 µs | 84 KB / 73 µs | ≤ 80 µs | borderline |
+
+**Accepted by decision (user), because the cost is bounded by fan-out and not by cell
+count** — which is the property 1b exists to obtain — and ~300k writes/s is acceptable for
+this application (a 5,560-row import is ~18 ms; a 1,000-leaf splash ~3 ms).
+
+The gate that now applies:
+
+| Metric | Threshold (accepted) |
+|---|---|
+| Write (≤ 4 dims) | **≤ 4 KB and ≤ 5 µs per write** (measured 2.7 KB / 2.8 µs) |
+| `snapshot()` | ≤ 64 B and ≤ 1 µs (measured 0 B / 0.1 µs) |
+| 512-deep path rewrite | ≤ 150 µs (measured 67–73 µs; scales with depth) |
+| Retention | **< 2 KB per additional pinned version** on the 4-dim set |
+| Pinned scan | **≤ +35%** vs the M0 baseline; measured **+33% @3 dims, +20% @4 dims** — accepted, see below |
+
+**The property being protected, stated explicitly:** per-write cost must be independent of
+cube size. That — not a multiple of a baseline — is what 1b buys, and it is what any future
+change must not break.
+
+The scan numbers (63–188 ns/cell across runs) were not usable: the bench allocated a
+7.5k-entry `Vec` per scan. The harness now runs 7 trials of 20 scans with the sub-cube filter
+precomputed and reports the **minimum and median**. With that, the regression is real:
+
+| Scan | M0 baseline | M1 persistent | change |
+|---|---:|---:|---:|
+| 3 dims (7,538 cells) | 50.3 ns/cell | 66.9 min / 69.4 median | **+33%** |
+| 4 dims (19,486 cells) | 77.6 ns/cell | 93.2 min / 95.4 median | **+20%** |
+
+Cause: children used to live inline in the parent's `HashMap` (nodes adjacent in the map's
+buffer). They are now separate heap allocations reached through an `Arc`, so a scan pays a
+pointer chase and worse cache locality per node. It is inherent to `Arc`-per-node and does
+not go away by tuning.
+
+**Accepted together with the write cost** (user decision: acceptable for this application —
+a full 19k-cell scan is ~1.9 ms, and the analytics are small-result aggregations over cubes
+of that size). Recorded rather than hidden, because "readers do not get slower" was one of
+1b's stated promises and it now has a price. If the read path ever matters more than the
+write path, the fix is arena-allocated nodes (which would also reduce the allocator calls
+Infor cared about), not micro-tuning.
+
 
 
 ## 8. Milestones
