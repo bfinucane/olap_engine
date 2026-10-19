@@ -206,8 +206,15 @@ pub struct DatasetsResponse {
 }
 
 /// Builds the dataset list from the catalog's cube names.
+///
+/// The catalog stores cubes under a LOWERCASED key (`Catalog::add_cube` ->
+/// `cubes.insert(name.to_lowercase(), cube)`) while the exact casing lives in
+/// `Cube::name`. Reading `.keys()` therefore returned `["sales"]`, contradicting
+/// the casing guarantee above and making a client's round-trip
+/// `GET /v1/sales` -> `describe` echo a name it never advertised. Take the name
+/// from the VALUE, not the key.
 pub fn datasets(catalog: &Catalog) -> DatasetsResponse {
-    let mut names: Vec<String> = catalog.cubes.keys().cloned().collect();
+    let mut names: Vec<String> = catalog.cubes.values().map(|c| c.name.clone()).collect();
     names.sort();
     DatasetsResponse { datasets: names }
 }
