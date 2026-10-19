@@ -383,26 +383,90 @@ pub fn describe(catalog: &Catalog, dataset: &str) -> Result<CatalogResponse, Wir
         message: format!("Dataset '{}' not found.", dataset),
     })?;
 
+    let dim_count = cube.dimensions.len();
+    let measure_idx = cube
+        .measure_dimension
+        .as_ref()
+        .and_then(|m| cube.dimension_names.iter().position(|n| n == m));
+
+    // One pass over the stored cells answers three questions at once: the row
+    // count, and — for the measure dimension — whether its cells are numeric or
+    // textual, and their bounds. `leaf_row_count` used to scan the same data just
+    // to count it, so this costs nothing extra.
+    let cells = cube.store.scan_subcube(&vec![None; dim_count]);
+    let row_count = cells.len();
+
+    let (mut has_number, mut has_string) = (false, false);
+    let (mut num_min, mut num_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    if measure_idx.is_some() {
+        for (_, value) in &cells {
+            match value {
+                CellValue::Numeric(n) => {
+                    has_number = true;
+                    num_min = num_min.min(*n);
+                    num_max = num_max.max(*n);
+                }
+                CellValue::String(_) => has_string = true,
+            }
+        }
+    }
+
+    // What the measure column ACTUALLY holds. Text wins over numbers: a mixed
+    // column must not be advertised as summable. With no cells stored yet there is
+    // nothing to inspect, so fall back to the cube's declared kind — an attribute
+    // table holds text, a transactional cube holds numbers.
+    let measure_is_numeric = if has_string {
+        false
+    } else if has_number {
+        true
+    } else {
+        cube.is_aggregating
+    };
+
     let mut columns: Vec<CatalogColumn> = Vec::new();
 
     for (i, dim_name) in cube.dimension_names.iter().enumerate() {
         let dim = cube.dimensions[i].read().unwrap();
-        let is_measure = cube.measure_dimension.as_deref() == Some(dim_name.as_str());
-        columns.push(CatalogColumn {
-            name: dim_name.clone(),
-            data_type: if is_measure { "number" } else { "string" }.to_string(),
-            logical_type: if is_measure { "real" } else { "string" }.to_string(),
-            nullable: true,
-            cardinality: dim.len(),
-            not_null: true,
-            min: Value::Null,
-            max: Value::Null,
-            // A HINT only; Plateau decides dimension vs measure itself.
-            suggested_kind: if is_measure { "measure" } else { "dimension" }.to_string(),
-        });
-    }
+        let is_measure = Some(i) == measure_idx;
 
-    let row_count = leaf_row_count(cube);
+        if is_measure && measure_is_numeric {
+            columns.push(CatalogColumn {
+                name: dim_name.clone(),
+                data_type: "number".to_string(),
+                logical_type: "real".to_string(),
+                // Sparse storage: a coordinate may simply have no cell, so a
+                // measure value can be absent although every MEMBER exists.
+                nullable: true,
+                cardinality: dim.len(),
+                not_null: false,
+                min: if has_number { json!(bounded_precision(num_min)) } else { Value::Null },
+                max: if has_number { json!(bounded_precision(num_max)) } else { Value::Null },
+                // A HINT only; Plateau decides dimension vs measure itself.
+                suggested_kind: "measure".to_string(),
+            });
+        } else {
+            columns.push(CatalogColumn {
+                name: dim_name.clone(),
+                // A dimension coordinate is always a string — INCLUDING an
+                // attribute measure dimension. `RegionAttr.Attribute` holds
+                // "Ava Thompson", not a number; reporting it as `measure`/`number`
+                // made a client type a text column as numeric and fail to render
+                // it. This used to decide the type from the dimension's ROLE
+                // (`is_measure`) rather than from its contents.
+                data_type: "string".to_string(),
+                logical_type: "string".to_string(),
+                // Every row that exists has a member here, so a dimension column is
+                // never null. (This used to claim `nullable` AND `notNull` at once
+                // for every column, which cannot both be true.)
+                nullable: false,
+                cardinality: dim.len(),
+                not_null: true,
+                min: Value::Null,
+                max: Value::Null,
+                suggested_kind: "dimension".to_string(),
+            });
+        }
+    }
 
     Ok(CatalogResponse {
         dataset: dataset.to_string(),
@@ -495,12 +559,6 @@ pub fn sample(
         rows,
         row_count: total,
     })
-}
-
-/// Counts the leaf cells in a cube (one cell per stored fact row).
-fn leaf_row_count(cube: &crate::cube::cube::Cube) -> usize {
-    let dim_count = cube.dimensions.len();
-    cube.store.scan_subcube(&vec![None; dim_count]).len()
 }
 
 // ---------------------------------------------------------------------------

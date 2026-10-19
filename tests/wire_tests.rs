@@ -261,8 +261,12 @@ fn describe_section1_shape_and_measure_hint() {
     assert_eq!(region.data_type, "string");
     assert_eq!(region.logical_type, "string");
     assert_eq!(region.cardinality, 2, "East and West");
-    assert_eq!(region.nullable, true);
+    // A dimension coordinate is always present for a returned row, and never null.
+    // (The old code claimed `nullable` AND `notNull` at once, which cannot be true.)
+    assert_eq!(region.nullable, false, "a dimension member is never null");
     assert_eq!(region.not_null, true);
+    assert_eq!(region.min, Value::Null, "bounds are not known for a text column");
+    assert_eq!(region.max, Value::Null);
     assert_eq!(
         keys(&wire(region)),
         vec![
@@ -290,14 +294,89 @@ fn describe_section1_shape_and_measure_hint() {
     assert_eq!(meas.data_type, "number");
     assert_eq!(meas.logical_type, "real");
     assert_eq!(meas.cardinality, 2, "Sales and Cost members");
+    // Sparse cells: a coordinate can have no value, so a measure may be absent.
+    assert_eq!(meas.nullable, true);
+    assert_eq!(meas.not_null, false);
+    // Bounds come from the stored cells: 15 is West/Gadget/Cost, 200 is
+    // West/Widget/Sales.
+    assert_eq!(meas.min, json!(15.0));
+    assert_eq!(meas.max, json!(200.0));
 
     for c in &resp.columns {
         if c.suggested_kind == "measure" {
             assert_eq!(c.data_type, "number", "a measure hint must be numeric");
+            assert_eq!(c.not_null, false, "sparse values may be absent");
         } else {
             assert_eq!(c.data_type, "string", "a dimension hint must be a string");
+            assert_eq!(c.not_null, true, "a dimension member is always present");
+            assert_eq!(c.nullable, false);
         }
     }
+}
+
+/// §1: the measure column's TYPE comes from what it holds, not from the fact that
+/// it is the measure dimension.
+///
+/// An attribute cube (`CREATE ATTRIBUTE TABLE`) has a measure dimension whose cells
+/// are STRINGS — `RegionAttr.Attribute` holds `"Ava Thompson"`. The old code
+/// reported every measure dimension as `number`/`real`/`measure`, so a client
+/// typed a text column as numeric and failed to render it.
+#[test]
+fn describe_types_an_attribute_measure_dimension_as_text() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("RegionAttr", &["Region", "Attribute"], Some("Attribute"), false);
+    {
+        let cube = catalog.get_cube_mut("RegionAttr").expect("cube");
+        cube.write(&["Central", "Manager"], CellValue::String("Ava Thompson".into()))
+            .expect("write");
+        cube.write(&["West", "Manager"], CellValue::String("Dan Ellis".into()))
+            .expect("write");
+    }
+
+    let resp = wire::describe(&catalog, "RegionAttr").expect("describe RegionAttr");
+    assert_eq!(resp.row_count, 2, "one cell per attribute row");
+
+    let attr = resp
+        .columns
+        .iter()
+        .find(|c| c.name == "Attribute")
+        .expect("Attribute column");
+    assert_eq!(attr.data_type, "string", "the cells are text");
+    assert_eq!(attr.logical_type, "string");
+    assert_eq!(
+        attr.suggested_kind, "dimension",
+        "text is not summable, so it must not be hinted as a measure"
+    );
+    assert_eq!(attr.min, Value::Null, "no numeric bounds for text");
+    assert_eq!(attr.max, Value::Null);
+    assert_eq!(attr.cardinality, 1, "the single attribute member 'Manager'");
+
+    // The plain dimension is unchanged.
+    let region = &resp.columns[0];
+    assert_eq!(region.data_type, "string");
+    assert_eq!(region.suggested_kind, "dimension");
+}
+
+/// With no stored cells there is nothing to inspect, so the type falls back to the
+/// cube's declared kind: a transactional cube's measure is numeric, an attribute
+/// table's is text. Better than guessing `number` for everything.
+#[test]
+fn describe_types_an_empty_measure_dimension_from_the_declared_kind() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("EmptyNum", &["Region", "Amount"], Some("Amount"), true);
+    catalog.add_cube("EmptyAttr", &["Region", "Prop"], Some("Prop"), false);
+
+    let num = wire::describe(&catalog, "EmptyNum").expect("describe");
+    let amount = num.columns.iter().find(|c| c.name == "Amount").expect("Amount");
+    assert_eq!(amount.data_type, "number", "a transactional measure defaults numeric");
+    assert_eq!(amount.suggested_kind, "measure");
+    assert_eq!(amount.min, Value::Null, "no cells, so no bounds");
+    assert_eq!(num.row_count, 0);
+
+    let attrs = wire::describe(&catalog, "EmptyAttr").expect("describe");
+    let prop = attrs.columns.iter().find(|c| c.name == "Prop").expect("Prop");
+    assert_eq!(prop.data_type, "string", "an attribute measure defaults textual");
+    assert_eq!(prop.suggested_kind, "dimension");
 }
 
 #[test]
@@ -709,7 +788,7 @@ fn query_a_measureless_cube_auto_adds_a_value_measure() {
     assert!(resp.rows[0][1].is_f64(), "a measure cell is a JSON number");
 
     // And a grand total is the same shape with no groupBy.
-    let mut total = request("Markets");
+    let total = request("Markets");
     let resp = wire::query(&mut catalog, &total).expect("grand total");
     assert_eq!(resp.columns, vec!["value"]);
     assert_eq!(resp.rows, vec![vec![json!(30.0)]]);
