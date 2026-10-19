@@ -2,3 +2,4 @@
 database.json
 database.bin
 *.csv
+database.dev.bin
