@@ -211,3 +211,46 @@ already holds the numerator (`weighted` for SUM).
 
 Until those are settled it stays unadvertised, and `AVG` keeps the meaning pinned by
 `tests/scripts/aggregation_functions.sql`.
+### 8b. The denominator is a product of PER-DIMENSION count rules (user's refinement)
+
+Follow-up from the user: the numerator is one sum, but the denominator may need a
+*different count method per dimension*. So:
+
+    dense_average = SUM / PRODUCT over dimensions d of count(d)
+
+where each dimension picks how it counts, and the choices compose:
+
+| count rule | meaning | cost |
+|---|---|---|
+| `all` (dense) | every leaf member under the group's member, data or not | **free** — `get_leaf_descendants_in(...).len()` |
+| `present` (sparse) | distinct leaf members that actually hold a cell | a set per (group, dimension) → memory O(cells in the group) |
+| `domain` | a declared count (e.g. 12, from a calendar attribute) | depends on where the number comes from |
+
+Worked example — "average monthly sales per active region" over `Calendar x Region`:
+
+    denominator = all(Calendar) x present(Region) = 12 x (regions with data)
+
+That is a defensible metric, and notably one that neither plain `AVG` (divides by non-empty
+cells) nor a single-flag dense average can express.
+
+**Two consequences worth deciding before building it:**
+
+1. **The cost asymmetry is real.** `all` is arithmetic on metadata; `present` needs a
+   distinct-member set per group per dimension, i.e. memory proportional to the cells in
+   that group. The rule that makes the metric interesting is the one that is not free, so
+   this belongs in the same measured-gate discipline as Phase 1b rather than being assumed
+   cheap.
+2. **Presence must stay binary.** Under a fractional weight (`.rollup Half England 0.5`),
+   does England count as present once, or 0.5 times? `AVG` already ignores weights for the
+   base values, so presence should be binary too — a cell either exists or it does not.
+   Consistent, and it avoids a denominator that is itself a weighted sum.
+
+**Protocol shape (not yet decided).** The aggregation vocabulary in ENGINE-PROTOCOL.md §3 is
+a flat list of names, and none of these is in it. Either a new name plus a per-dimension
+spec, e.g.
+
+    "measures": [{ "name": "Sales", "aggregation": "AVG",
+                   "denominator": { "Calendar": "all", "Region": "present" } }]
+
+or a `dense: true` flag (which cannot express the per-dimension part). This is a
+Plateau-facing decision before it is an engine implementation.
