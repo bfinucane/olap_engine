@@ -345,12 +345,22 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            // Only what is actually implemented. No MEDIAN/STDEV/VAR/ATTR yet.
-            aggregations: ["SUM", "AVG", "MIN", "MAX", "COUNT", "COUNTD"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            // COUNTD is exact: the engine counts distinct stored values.
+            // ADDITIVE AGGREGATION ONLY, deliberately.
+            //
+            // The storage model is Infor-OLAP: a measure is stored per leaf
+            // coordinate and a consolidation is a weighted sum, so SUM is the
+            // aggregation the engine actually implements. `execute_plan` refuses
+            // anything else with `unsupported_aggregation` rather than silently
+            // returning a sum under a different label — advertising AVG here while
+            // computing SUM produced a confident `AVG(Sales)` pill over a sum.
+            //
+            // Non-additive aggregations (AVG/MIN/MAX/COUNT/COUNTD) are wanted but
+            // need decisions first: whether empty cells count, and how to count
+            // non-empty cells without a full scan per group. Advertise and accept
+            // them when those are settled, in this list AND in the refusal below.
+            aggregations: ["SUM"].into_iter().map(str::to_string).collect(),
+            // COUNTD is exact *if* it is ever implemented: the engine can count
+            // distinct stored values. Moot while COUNTD is not advertised.
             count_distinct_exact: true,
             // What the engine actually honours today (dimension scope only).
             filter_operators: ["in", "equals", "notEquals"]
@@ -482,6 +492,20 @@ pub fn execute_plan(catalog: &mut Catalog, plan: &QueryRequest) -> Result<PlanRe
             return Err(PlanError::UnsupportedExpression(format!(
                 "calculated field '{}' (evaluator not implemented yet)",
                 m.name
+            )));
+        }
+
+        // ONLY additive SUM is implemented (see Capabilities::default). Refuse
+        // anything else BEFORE any work is done: the engine's storage is a
+        // weighted sum, so AVG/MIN/MAX/COUNT/COUNTD would come back as a SUM
+        // wearing the requested label — a plausible wrong number, which is the
+        // failure mode ENGINE-PROTOCOL.md exists to prevent. An absent
+        // `aggregation` means SUM, matching the client's default.
+        let aggregation = m.aggregation.as_deref().unwrap_or("SUM");
+        if !aggregation.eq_ignore_ascii_case("SUM") {
+            return Err(PlanError::UnsupportedAggregation(format!(
+                "'{}' on '{}' (only additive SUM is implemented; see capabilities.aggregations)",
+                aggregation, m.name
             )));
         }
     }
