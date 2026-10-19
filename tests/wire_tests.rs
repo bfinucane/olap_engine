@@ -440,18 +440,14 @@ fn sample_unknown_dataset_is_404() {
 }
 
 /// §2 shows `rows: [["East", 100], ["West", 40]]` — a dimension and a MEASURE
-/// VALUE. The engine returns the measure dimension's member NAME instead, so a
-/// client profiling the sample sees a categorical column where the data is
-/// numeric.
+/// VALUE. A measure dimension's coordinate is a member NAME; the value is the
+/// stored cell, so the measure column must carry the cell.
 ///
-/// **CHARACTERISATION OF A DEFECT.** `sample` projects `dim.get_name(id)` for
-/// every dimension including the measure dimension (`wire.rs`, the `selected`
-/// projection). For Plateau — whose whole reason for calling `sample` is type
-/// inference and profiling — this reports `Measure` as a string of member names.
-/// Correct behaviour: a measure dimension's column should carry the stored
-/// numeric value, as the §2 example shows. Invert this test when fixed.
+/// This matters beyond tidiness: Plateau's reason for calling `sample` is type
+/// inference and profiling, so a measure column full of member names is inferred
+/// as categorical and the numeric data disappears from its view.
 #[test]
-fn sample_returns_member_names_where_the_spec_shows_measure_values_today() {
+fn sample_measure_column_carries_values_not_member_names() {
     let catalog = build_catalog();
     let resp = wire::sample(
         &catalog,
@@ -462,37 +458,90 @@ fn sample_returns_member_names_where_the_spec_shows_measure_values_today() {
 
     let measure_col = resp.columns.iter().position(|c| c == "Measure").expect("Measure column");
 
-    // What the engine does today: every cell of the measure column is a member
-    // name, and no cell is a number.
+    // Every measure cell is a JSON number, and each is one of the eight stored
+    // values — never the strings "Sales" / "Cost".
+    let mut values = Vec::new();
     for row in &resp.rows {
         let cell = &row[measure_col];
+        let n = cell
+            .as_f64()
+            .unwrap_or_else(|| panic!("measure cells must be numeric, got {cell:?}"));
         assert!(
-            cell.is_string(),
-            "today the measure column carries member names, not values: {cell:?}"
+            cell != &json!("Sales") && cell != &json!("Cost"),
+            "member names must not appear in a measure column: {cell:?}"
         );
-        assert!(
-            cell == &json!("Sales") || cell == &json!("Cost"),
-            "unexpected measure cell {cell:?}"
-        );
+        values.push(n);
     }
-    assert!(
-        resp.rows.iter().all(|r| r[measure_col].as_f64().is_none()),
-        "no numeric measure VALUE appears anywhere in the sample"
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        values,
+        vec![15.0, 25.0, 30.0, 40.0, 50.0, 80.0, 100.0, 200.0],
+        "the eight stored values, in order"
     );
 
-    // The contrast that makes the defect concrete: the data IS numeric, as the
-    // query path proves for the same cells.
+    // The real dimensions still carry member names.
+    let region_col = resp.columns.iter().position(|c| c == "Region").expect("Region column");
+    for row in &resp.rows {
+        assert!(row[region_col].is_string(), "a dimension stays a name");
+    }
+
+    // And it agrees with the query path for the same cells.
     let mut catalog2 = build_catalog();
     let mut p = request("Sales");
     by_region(&mut p);
     measure(&mut p, "Sales", "SUM");
     let q = wire::query(&mut catalog2, &p).expect("query");
-    assert_eq!(q.rows[0][1], json!(150.0), "query sees numbers where sample shows names");
+    assert_eq!(q.rows[0][1], json!(150.0), "query and sample now agree these are numbers");
 }
 
 // ---------------------------------------------------------------------------
 // §3 query
 // ---------------------------------------------------------------------------
+
+/// Measure values are reported at bounded precision (15 significant digits).
+///
+/// f64 summation accumulates noise in the last digits — the seeded catalogue's
+/// grand total came out as `26763427.430000003` — and that is what the client
+/// would render. Rounding to 15 significant digits removes the noise while keeping
+/// every digit a double can meaningfully carry.
+#[test]
+fn query_measure_values_are_reported_at_bounded_precision() {
+    // The motivating case, in miniature: 0.1 + 0.2 != 0.3 in binary floating point.
+    assert_ne!(0.1_f64 + 0.2_f64, 0.3_f64, "the noise this guards against is real");
+
+    let mut catalog = Catalog::new();
+    catalog.add_cube("N", &["K", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog.get_cube_mut("N").expect("cube");
+        cube.write(&["a", "V"], CellValue::Numeric(0.1)).expect("write");
+        cube.write(&["b", "V"], CellValue::Numeric(0.2)).expect("write");
+    }
+
+    let mut p = request("N");
+    measure(&mut p, "V", "SUM");
+    let resp = wire::query(&mut catalog, &p).expect("query");
+    assert_eq!(
+        resp.rows[0][0],
+        json!(0.3),
+        "0.1 + 0.2 must serialize as 0.3, not 0.30000000000000004"
+    );
+
+    // A large magnitude, where the artifact appeared in the seeded data.
+    let mut catalog2 = Catalog::new();
+    catalog2.add_cube("Big", &["K", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog2.get_cube_mut("Big").expect("cube");
+        cube.write(&["a", "V"], CellValue::Numeric(26_763_427.43)).expect("write");
+    }
+    let mut p2 = request("Big");
+    measure(&mut p2, "V", "SUM");
+    let resp2 = wire::query(&mut catalog2, &p2).expect("query");
+    assert_eq!(
+        resp2.rows[0][0],
+        json!(26_763_427.43),
+        "the seeded grand total must not surface f64 noise"
+    );
+}
 
 /// **THE invariant the protocol singles out** (§3: "measureLabels is the one to
 /// get right ... indexed by measure position, not column position. Getting this
@@ -612,8 +661,8 @@ fn query_grand_total_without_group_by_is_exactly_one_row() {
     assert_eq!(resp.measure_labels, vec!["SUM(Sales)"]);
 }
 
-/// A non-pivoting cube (no measure dimension) must still answer, and the label
-/// list stays consistent with the measure list.
+/// A non-pivoting cube (no measure dimension) still answers, and now answers with
+/// its one implicit measure rather than a bare list of member names.
 #[test]
 fn query_on_a_cube_with_no_measure_dimension() {
     let mut catalog = build_catalog();
@@ -621,58 +670,53 @@ fn query_on_a_cube_with_no_measure_dimension() {
     by_region(&mut p);
 
     let resp = wire::query(&mut catalog, &p).expect("Markets query");
-    assert_eq!(resp.columns, vec!["Region"]);
-    assert!(resp.measure_labels.is_empty(), "no measures requested, so no labels");
+    assert_eq!(resp.columns, vec!["Region", "value"], "the implicit value measure");
     assert_eq!(resp.column_meta[0].kind, "dimension");
+    assert_eq!(resp.column_meta[1].kind, "measure", "value is typed as a measure");
+    assert_eq!(resp.measure_labels, vec!["SUM(value)"]);
 }
 
-/// A measure-less cube queried with NO measure named in the plan.
+/// A measure-less cube queried with NO measure named in the plan gets the implicit
+/// `value` measure automatically.
 ///
 /// This is the shape `examples/Plateau/seed.sql` builds for
-/// `Sales(Region, Segment, Category)` and then queries with
-/// `SELECT Region, value FROM Sales`. Measured behaviour, which is NOT the obvious
-/// guess:
-///
-///   * `groupBy: ["Region"]` with no measures returns a SINGLE `value` column whose
-///     one row is the grand total as a STRING (`"30"`), not one row per region. The
-///     `groupBy` is ignored because the planner only falls back to `value` when
-///     `outputColumns` is empty, and "Region" already fills it.
-///   * Naming `value` as an explicit measure gives the useful answer: one row per
-///     region with NUMERIC cells.
-///
-/// So for a measure-less cube, the name `value` is a pseudo-measure and Plateau
-/// must ask for it explicitly. Pinned in both directions so the difference cannot
-/// drift silently.
+/// `Sales(Region, Segment, Category)`, and the case that used to return
+/// `[["East"],["West"]]` — member names with no numbers, which a client can only
+/// read as an empty dataset. `sql.rs` already answered `SELECT Region, value ...`
+/// with a `value` column; the plan layer did not, so the two front doors disagreed.
+/// Now both produce a numeric `value` measure.
 #[test]
-fn query_a_measureless_cube_without_naming_value_returns_only_the_grand_total() {
+fn query_a_measureless_cube_auto_adds_a_value_measure() {
     let mut catalog = build_catalog();
     let mut p = request("Markets"); // Markets(Region) — no measure dimension
     by_region(&mut p); // group by Region, name no measures
 
     let resp = wire::query(&mut catalog, &p).expect("measure-less query");
 
-    assert_eq!(
-        resp.columns,
-        vec!["Region"],
-        "the groupBy is projected and there is NO `value` fallback in the plan layer"
-    );
+    assert_eq!(resp.columns, vec!["Region", "value"], "the implicit measure appears");
     assert_eq!(
         resp.rows,
-        vec![vec![json!("East")], vec![json!("West")]],
-        "one row per region, projected as a bare list of member names — the stored \
-         numbers are simply not present in the response"
+        vec![
+            vec![json!("East"), json!(10.0)],
+            vec![json!("West"), json!(20.0)],
+        ],
+        "one row per region with NUMERIC cells"
     );
-    assert!(
-        resp.measure_names.is_empty() && resp.measure_labels.is_empty(),
-        "no measure was named, so no labels exist"
-    );
-    assert_eq!(resp.column_meta[0].kind, "dimension", "untyped, so a dimension");
+    assert_eq!(resp.measure_names, vec!["value"], "so the client knows it is a measure");
+    assert_eq!(resp.measure_labels, vec!["SUM(value)"]);
+    assert_eq!(resp.column_meta[1].kind, "measure");
+    assert_eq!(resp.column_meta[1].data_type, "number");
+    assert!(resp.rows[0][1].is_f64(), "a measure cell is a JSON number");
+
+    // And a grand total is the same shape with no groupBy.
+    let mut total = request("Markets");
+    let resp = wire::query(&mut catalog, &total).expect("grand total");
+    assert_eq!(resp.columns, vec!["value"]);
+    assert_eq!(resp.rows, vec![vec![json!(30.0)]]);
 }
 
-/// The useful form for a measure-less cube: name `value` as a measure.
-///
-/// Needs no special support — `value` resolves like any other member of the
-/// (absent) measure dimension, and the cells come back as JSON numbers.
+/// The same cube addressed the other way round: naming `value` explicitly is
+/// unchanged, so the two spellings cannot drift apart.
 #[test]
 fn query_a_measureless_cube_naming_value_as_a_measure_returns_per_group_numbers() {
     let mut catalog = build_catalog();
@@ -750,39 +794,53 @@ fn query_unknown_dataset_is_404_and_version_mismatch_is_400() {
     assert!(err.message.contains("v1"), "message states what we speak: {}", err.message);
 }
 
-/// §3 `truncated` is "true when `limit` cut the result". A result that is
-/// *exactly* as long as the limit was NOT cut if the data happens to end there.
+/// §3 `truncated` is "true when `limit` cut the result". A result exactly as long
+/// as the limit was NOT cut if the data happens to end there — otherwise a pager
+/// is told there is another page that does not exist.
 ///
-/// **CHARACTERISATION OF A DEFECT.** `build_query_response` derives
-/// `truncated = rows.len() == limit`, because `execute_plan` applies the limit
-/// before the wire layer sees the result and the pre-limit count is gone. So a
-/// client paging a 2-row result with `limit: 2` is told there is more to fetch.
-/// Correct behaviour needs the pre-limit row count threaded through from
-/// `apply_order_and_limit`. Invert this test when fixed.
+/// The pre-limit row count is threaded out of `apply_order_and_limit` via
+/// `ResultSet::truncated`, because that is the only place that knows it.
 #[test]
-fn query_truncated_is_true_when_the_result_exactly_fills_the_limit_today() {
+fn query_truncated_is_true_only_when_rows_were_actually_cut() {
     let mut catalog = build_catalog();
+
+    // Exactly two groups (East, West), limit 2: nothing was cut.
     let mut p = request("Sales");
-    by_region(&mut p); // exactly two groups: East, West
+    by_region(&mut p);
     measure(&mut p, "Sales", "SUM");
     p.limit = Some(2);
-
     let resp = wire::query(&mut catalog, &p).expect("query");
     assert_eq!(resp.rows.len(), 2, "both groups fit");
     assert!(
-        resp.truncated,
-        "today an exactly-filled limit reports truncated = true even though \
-         nothing was cut (the pre-limit count is not available here)"
+        !resp.truncated,
+        "the result ended exactly at the limit; nothing was cut"
     );
 
-    // The control: a limit larger than the result proves it can report false.
-    let mut p2 = request("Sales");
-    by_region(&mut p2);
-    measure(&mut p2, "Sales", "SUM");
-    p2.limit = Some(3);
-    let resp2 = wire::query(&mut catalog, &p2).expect("query");
-    assert_eq!(resp2.rows.len(), 2);
-    assert!(!resp2.truncated, "a limit that plainly did not bind reports false");
+    // limit 1: one row really was removed.
+    let mut p1 = request("Sales");
+    by_region(&mut p1);
+    measure(&mut p1, "Sales", "SUM");
+    p1.limit = Some(1);
+    let resp1 = wire::query(&mut catalog, &p1).expect("query");
+    assert_eq!(resp1.rows.len(), 1);
+    assert!(resp1.truncated, "one row was dropped, so this IS truncated");
+
+    // limit 3: plainly did not bind.
+    let mut p3 = request("Sales");
+    by_region(&mut p3);
+    measure(&mut p3, "Sales", "SUM");
+    p3.limit = Some(3);
+    let resp3 = wire::query(&mut catalog, &p3).expect("query");
+    assert_eq!(resp3.rows.len(), 2);
+    assert!(!resp3.truncated);
+
+    // No limit at all: false, regardless of row count.
+    let mut p0 = request("Sales");
+    by_region(&mut p0);
+    measure(&mut p0, "Sales", "SUM");
+    let resp0 = wire::query(&mut catalog, &p0).expect("query");
+    assert_eq!(resp0.rows.len(), 2);
+    assert!(!resp0.truncated);
 }
 
 /// §3 lists `SUM | AVG | MEDIAN | MIN | MAX | COUNT | COUNTD | STDEV | VAR | ATTR`

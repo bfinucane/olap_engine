@@ -261,12 +261,13 @@ fn build_query_response(
     plan: &QueryRequest,
     elapsed_ms: u64,
 ) -> QueryResponse {
+    let truncated = rs.truncated;
     let headers = rs.headers;
 
     // Which output columns are dimensions vs measures, decided by the plan
     // (groupBy) rather than by guessing from the header text.
     let group_names: Vec<String> = plan.group_by.iter().map(|g| g.name.clone()).collect();
-    let measure_names: Vec<String> = plan
+    let mut measure_names: Vec<String> = plan
         .measures
         .iter()
         .map(|m| m.name.clone())
@@ -276,7 +277,7 @@ fn build_query_response(
     let dimension_names: Vec<String> = group_names.clone();
 
     // `measureLabels`: pill labels for each MEASURE (not each column).
-    let measure_labels: Vec<String> = plan
+    let mut measure_labels: Vec<String> = plan
         .measures
         .iter()
         .map(|m| {
@@ -285,10 +286,22 @@ fn build_query_response(
         })
         .collect();
 
+    // A MEASURE-LESS cube answered with no measures gets an implicit `value`
+    // column from the plan layer (see `build_slice_query`). Treat it as the one
+    // measure it is — typed numeric, cells parsed as numbers, label `SUM(value)` —
+    // so the client does not render real values as a categorical dimension. This
+    // matches what it already got when it named `value` explicitly.
+    if plan.measures.is_empty() && headers.iter().any(|h| h == "value") {
+        measure_names = vec!["value".to_string()];
+        measure_labels = vec!["SUM(value)".to_string()];
+    }
+
+    let is_measure = |header: &str| measure_names.iter().any(|m| m == header);
+
     let column_meta: Vec<ColumnMeta> = headers
         .iter()
         .map(|h| {
-            if measure_names.contains(h) {
+            if is_measure(h) {
                 ColumnMeta {
                     name: h.clone(),
                     kind: "measure".to_string(),
@@ -320,9 +333,9 @@ fn build_query_response(
             row.into_iter()
                 .zip(headers.iter())
                 .map(|(cell, header)| {
-                    if measure_names.contains(header) {
+                    if is_measure(header) {
                         match cell.parse::<f64>() {
-                            Ok(n) => json!(n),
+                            Ok(n) => json!(bounded_precision(n)),
                             Err(_) => json!(cell),
                         }
                     } else {
@@ -332,14 +345,6 @@ fn build_query_response(
                 .collect()
         })
         .collect();
-
-    // `truncated`: true when a limit was requested AND the result filled it
-    // exactly. That is the only case an already-truncated result can report
-    // without the pre-limit row count, which `execute_plan` has already
-    // discarded. A result with FEWER rows than the limit provably was not cut;
-    // a result that equals the limit may have been (and, for a client sizing a
-    // pager, assuming it may have been is the safe reading).
-    let truncated = matches!(plan.limit, Some(l) if rows.len() == l);
 
     QueryResponse {
         columns: headers,
@@ -352,6 +357,22 @@ fn build_query_response(
         elapsed_ms,
         truncated,
     }
+}
+
+/// Significant digits kept on the wire.
+///
+/// f64 carries ~15-17 significant decimals; summing many leaves accumulates noise
+/// in the last ones, which surfaced as a grand total of `26763427.430000003`.
+/// Rounding to 15 significant digits removes that noise while keeping every digit
+/// a double can meaningfully carry. `"{:.14e}"` is one digit before the point plus
+/// fourteen after: fifteen in total.
+fn bounded_precision(n: f64) -> f64 {
+    if !n.is_finite() || n == 0.0 {
+        return n;
+    }
+    format!("{n:.14e}")
+        .parse::<f64>()
+        .unwrap_or(n)
 }
 
 /// §1 `describe`. Column facts are derived from the cube's dimensions; the
@@ -431,6 +452,17 @@ pub fn sample(
 
     // Walk every leaf cell and project the selected columns.
     let dim_count = cube.dimensions.len();
+
+    // A measure dimension's coordinate is a member NAME ('Sales'), not a value; the
+    // value is the stored cell. §2's example is `rows: [["East", 100]]` — a
+    // dimension and a measure VALUE — so the measure column must carry the cell,
+    // otherwise Plateau's profiling sees a categorical column of member names where
+    // the data is numeric.
+    let measure_idx = cube
+        .measure_dimension
+        .as_ref()
+        .and_then(|m| all_names.iter().position(|n| n == m));
+
     let cells = cube.store.scan_subcube(&vec![None; dim_count]);
     let total = cells.len();
 
@@ -438,14 +470,21 @@ pub fn sample(
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|(coords, _value)| {
+        .map(|(coords, value)| {
             selected
                 .iter()
                 .map(|col| {
                     let idx = all_names.iter().position(|n| n == col).unwrap();
-                    let id = coords[idx];
-                    let dim = cube.dimensions[idx].read().unwrap();
-                    json!(dim.get_name(id))
+                    if Some(idx) == measure_idx {
+                        match &value {
+                            CellValue::Numeric(n) => json!(bounded_precision(*n)),
+                            CellValue::String(s) => json!(s),
+                        }
+                    } else {
+                        let id = coords[idx];
+                        let dim = cube.dimensions[idx].read().unwrap();
+                        json!(dim.get_name(id))
+                    }
                 })
                 .collect()
         })

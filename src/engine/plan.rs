@@ -619,6 +619,24 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
             output_columns.push(m.name.clone());
         }
     }
+
+    // A MEASURE-LESS CUBE has exactly one implicit measure: its stored cell
+    // value, addressed as `value`. `sql.rs` already answers
+    // `SELECT Region, value FROM ...` that way (`output_columns.push("value")`),
+    // but the plan layer only did it when the list was completely empty — so
+    // `groupBy: ["Region"]` returned rows of bare member names with no numbers at
+    // all, which a client can only read as an empty dataset. Naming `value`
+    // explicitly already worked; this makes the two spellings agree.
+    //
+    // Only for cubes WITHOUT a measure dimension: when one exists, its members are
+    // the measures and the client must name them (pivoting needs the choice).
+    if plan.measures.is_empty()
+        && cube.measure_dimension.is_none()
+        && !output_columns.contains(&"value".to_string())
+    {
+        output_columns.push("value".to_string());
+    }
+
     if output_columns.is_empty() {
         output_columns.push("value".to_string());
     }
@@ -743,7 +761,14 @@ fn apply_order_and_limit(
     }
 
     if let Some(limit) = plan.limit {
-        result.rows.truncate(limit);
+        // `truncated` means "the limit CUT the result", so it is only true when
+        // there were rows to remove. Deriving it later from `rows.len() == limit`
+        // reported a cut whenever the data happened to end exactly at the limit,
+        // telling a pager there was another page that does not exist.
+        if result.rows.len() > limit {
+            result.rows.truncate(limit);
+            result.truncated = true;
+        }
     }
 
     Ok(result)

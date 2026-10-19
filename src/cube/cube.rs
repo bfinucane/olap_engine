@@ -90,6 +90,12 @@ pub struct SliceQuery {
 pub struct ResultSet {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>, // All cells converted to string for easy printing
+    /// Set by whoever applies a row limit: true only when the limit actually
+    /// REMOVED rows. The SQL path never limits a result set, so it leaves this
+    /// false. The plan layer sets it because `apply_order_and_limit` is the only
+    /// place that knows the row count before truncation — deriving it afterwards
+    /// (`rows.len() == limit`) reports "more to fetch" when the data simply ended.
+    pub truncated: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -572,6 +578,9 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         let mut result_set = ResultSet {
             headers: query.output_columns.clone(),
             rows: Vec::new(),
+            // The SQL/batch path applies no row limit; a limiter that truncates
+            // sets this flag itself.
+            truncated: false,
         };
 
                         // Dimensions that produce a row axis AND end up as a column in the
