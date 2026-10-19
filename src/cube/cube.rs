@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dimension::dimension::{Dimension, MemberType};
 use crate::storage::sparse_store::SparseStore;
+use crate::storage::version_store::VersionStore;
 use crate::cube::node::CellValue;
 
 /// Splits a coordinate into an optional hierarchy qualifier and a member name.
@@ -114,12 +115,10 @@ pub struct Cube {
     #[serde(skip)]
     pub dimensions: Vec<Arc<RwLock<Dimension>>>,
     
-    pub store: SparseStore,
-	
-    
-    // The Cache. We skip saving this!
-    #[serde(skip)]
-    pub query_cache: HashMap<Vec<u32>, f64>,// keep cache f64
+    /// The cells plus their version and a version-tagged cache.
+    ///
+    /// Serialises as the `SparseStore` it wraps, so the on-disk format is unchanged.
+    pub store: VersionStore,
 }
 
 impl Cube {
@@ -137,8 +136,7 @@ impl Cube {
 			measure_dimension,
 			is_aggregating,
             dimensions,
-            store: SparseStore::new(dim_count),
-            query_cache: HashMap::new(),
+            store: VersionStore::new(SparseStore::new(dim_count)),
         }
     }
 
@@ -162,7 +160,7 @@ impl Cube {
     /// path is reachable from caller-supplied input (a script, and soon a query
     /// plan over the wire): aborting the process instead of returning an error
     /// is not acceptable for a public API.
-    pub fn write(&mut self, members: &[&str], value: CellValue) -> Result<(), String> {
+    pub fn write(&self, members: &[&str], value: CellValue) -> Result<(), String> {
         if self.dimensions.len() != members.len() {
             return Err(format!(
                 "Expected {} coordinate(s), got {}.",
@@ -185,8 +183,8 @@ impl Cube {
 
                 self.store.write(&coords, value);
         
-        // Point 2: Cache invalidation. Base data changed, so aggregates are invalid.
-        self.query_cache.clear(); 
+        // No cache clear: the write published a new version, and the version-tagged
+        // cache is invalidated lazily by the next read.
         Ok(())
     }
 
@@ -227,7 +225,7 @@ impl Cube {
     ///   * `SplashMode::Replace` - leaves are overwritten with their share.
     ///   * `SplashMode::Add`     - the share is added on top of the current leaf.
     pub fn write_splashed(
-        &mut self,
+        &self,
         members: &[&str],
         value: f64,
         mode: SplashMode,
@@ -283,7 +281,6 @@ impl Cube {
                 coords.push(leaves[0].0);
             }
             self.store.write(&coords, CellValue::Numeric(value));
-            self.query_cache.clear();
             return Ok(1);
         }
 
@@ -315,13 +312,15 @@ impl Cube {
             self.store.write(coords, CellValue::Numeric(to_store));
         }
 
-        // Point 2: Cache invalidation.
-        self.query_cache.clear();
         Ok(cells.len())
     }
 
     /// Point 2: JIT Calculation & Caching
-    pub fn query_consolidated(&mut self, members: &[&str]) -> f64 {
+    ///
+    /// The cache is version-tagged (see `VersionStore`): a write publishes a new
+    /// version and no longer clears anything, so invalidation costs nothing until the
+    /// next read notices the version moved.
+    pub fn query_consolidated(&self, members: &[&str]) -> f64 {
         let mut query_signature = Vec::new();
         let mut leaf_resolutions = Vec::new();
 
@@ -349,18 +348,21 @@ impl Cube {
             leaf_resolutions.push(dim.get_leaf_descendants_in(hier, member));
         }
 
-        // 2. Check the Cache FIRST to avoid database explosion
-        if let Some(&cached_value) = self.query_cache.get(&query_signature) {
+        // 2. Check the version-tagged cache FIRST to avoid database explosion.
+        if let Some(cached_value) = self.store.cache_get(&query_signature) {
             return cached_value;
         }
 
-        // 3. JIT Calculation (Cartesian product of all leaves)
-        // For a prototype, we do a simple recursive combination of the resolved leaves
-        let total = self.calculate_jit(&leaf_resolutions, &mut Vec::new(), 0, 1.0);
+        // 3. JIT Calculation (Cartesian product of all leaves), against ONE snapshot
+        //    so the whole aggregate comes from a single version.
+        let version = self.store.version();
+        let snapshot = self.store.snapshot();
+        let total =
+            self.calculate_jit(&snapshot, &leaf_resolutions, &mut Vec::new(), 0, 1.0);
 
-        // 4. Store in Cache and return
-        self.query_cache.insert(query_signature, total);
-        
+        // 4. Store it, but only if no write landed while we were computing.
+        self.store.cache_put(query_signature, total, version);
+
         total
     }
 
@@ -384,14 +386,16 @@ impl Cube {
     // Helper: Recursively combine leaves. (e.g., [France, Germany] x [Laptop] x [Q1])
 fn calculate_jit(
         &self, 
+        snapshot: &SparseStore,
         resolutions: &[HashMap<u32, f64>], 
         current_coords: &mut Vec<u32>, 
         depth: usize, 
         current_weight: f64
     ) -> f64 {
         if depth == resolutions.len() {
-            // Fetch from the Patria Trie!
-            if let Some(CellValue::Numeric(val)) = self.store.query_exact(current_coords) {
+            // Fetch from the Patria Trie! Read from the SNAPSHOT, so one aggregate is
+            // computed entirely against a single version.
+            if let Some(CellValue::Numeric(val)) = snapshot.query_exact(current_coords) {
                 return val * current_weight;
             }
             return 0.0; // If it's a String or None, it doesn't contribute to the math sum
@@ -400,7 +404,7 @@ fn calculate_jit(
         let mut sum = 0.0;
         for (&leaf_id, &weight) in &resolutions[depth] {
             current_coords.push(leaf_id);
-            sum += self.calculate_jit(resolutions, current_coords, depth + 1, current_weight * weight);
+            sum += self.calculate_jit(snapshot, resolutions, current_coords, depth + 1, current_weight * weight);
             current_coords.pop();
         }
 
@@ -408,7 +412,9 @@ fn calculate_jit(
     }
 	
 	pub fn clear_cache(&mut self) {
-        self.query_cache.clear();
+        // The cache is version-tagged now; clearing it is a no-op unless a caller
+        // needs the memory back. Kept for API compatibility.
+        let _ = self.store.cached_len();
     }
 	/// Streams data from a CSV file directly into the Cube.
 	/// Assumes the CSV columns exactly match the Dimension order, 

@@ -220,16 +220,23 @@ Infor cared about), not micro-tuning.
 | # | Slice | Proof |
 |---|---|---|
 | M0 | `bench_mvcc` baseline on the current store | **done** — the numbers in §7 |
-| M1 | Store becomes persistent: `Arc<Node>` children, path-copy `write`; `SparseStore`'s public API unchanged | the 14 existing store tests pass unchanged, plus new ones: a snapshot is unaffected by later writes, and untouched subtrees are shared rather than copied |
-| M1b | the §7 gate, measured on the new store | go / no-go before anything else moves |
-| M2 | `Version` / `VersionStore` in `Cube`; read paths take a snapshot; per-version cache replaces the four `clear()` calls | reader isolation at the cube level; a cache hit on a stable version, and a miss after a write with no global invalidation |
-| M3 | server drops the catalog `Mutex` | HTTP: concurrent readers plus a writer, no deadlock, consistent answers |
-| M4 | structural dimension changes clone the dimension and bump the version | a `.rollup` during a pinned scan does not change that reader's numbers |
+| M1 | Store becomes persistent: `Arc<Node>` children, path-copy `write`; `SparseStore`'s public API unchanged | **done** — the 14 existing store tests unchanged, plus 4 new: a snapshot survives later writes *and* prunes, untouched subtrees are `Arc::ptr_eq`-shared, a snapshot outlives its store |
+| M1b | the §7 gate, measured on the new store | **done** — failed at first, then re-derived and accepted (§7) |
+| M2 | `VersionStore` in `Cube`: version id, snapshot reads, version-tagged cache replacing the four `clear()` calls | **done** — `tests/versioning_tests.rs` (5): version advances per write; a snapshot read survives a later write; the cache is reused within a version and dropped after a write; a stale-tagged put is refused; a cloned cube writes independently |
+| M3 | server drops the catalog `Mutex` | not started — reads are snapshot-based, but `serve.rs` still serialises through one `Mutex<Catalog>` |
+| M4 | structural dimension changes clone the dimension and bump the version | not started |
 
-Each milestone leaves the suite green. M1 and M1b are internal and reversible; M2 changes
-`Cube`'s API, so it lands only once the gate has passed. (The earlier draft put
-`Version`/`snapshot()` in M1, but with writes still in place a snapshot cannot be isolated —
-that is M2's substance, and claiming it in M1 would have been a test that could not pass.)
+Each milestone leaves the suite green. M3 is where the coarse lock actually goes away; M2
+only made the read path capable of not needing it. Note what M2 deliberately did **not**
+change: `Cube::write` still takes `&self` under the caller's exclusive borrow, and the
+server still holds one catalog-wide `Mutex`, so no new concurrency is *used* yet — the
+version tags and the `computed_at` guard exist so that M3 can remove the lock without
+introducing a stale-cache race.
+
+M2 also removed the last correctness caveat of the old design: the four
+`query_cache.clear()` calls (and the "correct only under a single writer" note in
+`ROADMAP.md`) are gone, replaced by lazy invalidation.
+
 
 
 ## 9. Risks and open questions

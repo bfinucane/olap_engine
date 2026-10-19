@@ -155,7 +155,7 @@ fn save_then_load_round_trip_preserves_data_and_hierarchies() {
 
     // A read THROUGH the hierarchy still aggregates correctly.
     drop(d);
-    let mut cube = reloaded.get_cube("Sales").cloned().expect("cube");
+    let cube = reloaded.get_cube("Sales").cloned().expect("cube");
     let emea_total = cube.query_consolidated(&["Ops:EMEA", "Revenue"]);
     assert_eq!(emea_total, 300.0, "Ops:EMEA = 100 + 200");
 
@@ -379,7 +379,7 @@ fn write_rejects_a_coordinate_dimension_mismatch_instead_of_panicking() {
     // A one-dimensional cube, built directly so no SQL layer normalises the
     // coordinate count for us.
     let dim = Arc::new(RwLock::new(Dimension::new("Region")));
-    let mut cube = Cube::new("Sales", vec!["Region".to_string()], vec![dim], None, true);
+    let cube = Cube::new("Sales", vec!["Region".to_string()], vec![dim], None, true);
 
     // Two coordinates into a one-dimension cube: must be a typed error, not a
     // panic. (No `catch_unwind`: a panic here would fail the test outright,
