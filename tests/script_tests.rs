@@ -165,6 +165,17 @@ fn run_script(script: &Path) -> (String, bool) {
     ));
 
     let status = Command::new(env!("CARGO_BIN_EXE_olap_engine"))
+        // Pin the working directory to the crate root.
+        //
+        // Fixtures reference their CSVs relatively (`tests/scripts/import_data.csv`,
+        // `examples/Plateau/...`), and the engine resolves those against its OWN
+        // working directory. Cargo makes no promise about the cwd it gives an
+        // integration test - it is usually the crate root, but NOT reliably so once
+        // the crate sits at a different depth. Moving this repo one level deeper was
+        // enough to break every CSV import with "Could not open ...", which reads
+        // like an import regression and is not one. Pinning it here fixes the class
+        // of failure once instead of rewriting 13 fixtures.
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg(script)
         .arg("--out")
         .arg(&out_file)
