@@ -379,6 +379,70 @@ fn describe_types_an_empty_measure_dimension_from_the_declared_kind() {
     assert_eq!(prop.suggested_kind, "dimension");
 }
 
+/// A MEASURE-LESS cube advertises the implicit `value` measure.
+///
+/// This is `Sales` in `examples/Plateau/seed.sql`:
+/// `CREATE TABLE Sales (Region STRING, Segment STRING, Category STRING)` — the
+/// CSV's last column is the cell value, so there is no measure dimension. The query
+/// layer already answered such a cube with a `value` measure; `describe` did not
+/// advertise it, so the data pane showed only dimensions and there was nothing to
+/// chart.
+#[test]
+fn describe_a_measureless_cube_advertises_the_implicit_value_measure() {
+    let catalog = build_catalog();
+    let resp = wire::describe(&catalog, "Markets").expect("describe Markets");
+
+    assert_eq!(resp.row_count, 2);
+    assert_eq!(resp.columns.len(), 2, "Region plus the implicit value column");
+    assert_eq!(resp.columns[0].name, "Region");
+    assert_eq!(resp.columns[0].suggested_kind, "dimension");
+
+    let value = &resp.columns[1];
+    assert_eq!(value.name, "value", "the name the query layer addresses");
+    assert_eq!(value.suggested_kind, "measure", "numeric cells, so a measure");
+    assert_eq!(value.data_type, "number");
+    assert_eq!(value.logical_type, "real");
+    assert_eq!(value.min, json!(10.0), "East");
+    assert_eq!(value.max, json!(20.0), "West");
+    assert_eq!(value.cardinality, 2, "two distinct stored values");
+    assert_eq!(value.nullable, true);
+    assert_eq!(value.not_null, false);
+
+    // And the query layer agrees the name is `value`.
+    let mut catalog2 = build_catalog();
+    let mut p = request("Markets");
+    by_region(&mut p);
+    let q = wire::query(&mut catalog2, &p).expect("query");
+    assert_eq!(q.measure_names, vec!["value"]);
+    assert_eq!(q.rows[0][1], json!(10.0));
+}
+
+/// A measure-less cube whose cells are TEXT advertises `value` as a string
+/// dimension, not a measure — the same honesty rule as an attribute measure
+/// dimension: text is not summable.
+#[test]
+fn describe_a_measureless_text_cube_advertises_value_as_a_dimension() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Notes", &["Region"], None, false);
+    {
+        let cube = catalog.get_cube_mut("Notes").expect("cube");
+        cube.write(&["East"], CellValue::String("hello".into())).expect("write");
+        cube.write(&["West"], CellValue::String("world".into())).expect("write");
+    }
+
+    let resp = wire::describe(&catalog, "Notes").expect("describe Notes");
+    let value = resp
+        .columns
+        .iter()
+        .find(|c| c.name == "value")
+        .expect("implicit value column");
+    assert_eq!(value.data_type, "string");
+    assert_eq!(value.logical_type, "string");
+    assert_eq!(value.suggested_kind, "dimension", "text is not a measure");
+    assert_eq!(value.min, Value::Null);
+    assert_eq!(value.cardinality, 2);
+}
+
 #[test]
 fn describe_unknown_dataset_is_404() {
     let catalog = build_catalog();

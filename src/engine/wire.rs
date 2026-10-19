@@ -390,24 +390,23 @@ pub fn describe(catalog: &Catalog, dataset: &str) -> Result<CatalogResponse, Wir
         .and_then(|m| cube.dimension_names.iter().position(|n| n == m));
 
     // One pass over the stored cells answers three questions at once: the row
-    // count, and — for the measure dimension — whether its cells are numeric or
-    // textual, and their bounds. `leaf_row_count` used to scan the same data just
-    // to count it, so this costs nothing extra.
+    // count, whether the value cells are numeric or textual, and their bounds.
+    // `leaf_row_count` used to scan the same data just to count it, so this costs
+    // nothing extra. The scan runs for EVERY cube, because a measure-less cube's
+    // cells are the values too (see the implicit `value` column below).
     let cells = cube.store.scan_subcube(&vec![None; dim_count]);
     let row_count = cells.len();
 
     let (mut has_number, mut has_string) = (false, false);
     let (mut num_min, mut num_max) = (f64::INFINITY, f64::NEG_INFINITY);
-    if measure_idx.is_some() {
-        for (_, value) in &cells {
-            match value {
-                CellValue::Numeric(n) => {
-                    has_number = true;
-                    num_min = num_min.min(*n);
-                    num_max = num_max.max(*n);
-                }
-                CellValue::String(_) => has_string = true,
+    for (_, value) in &cells {
+        match value {
+            CellValue::Numeric(n) => {
+                has_number = true;
+                num_min = num_min.min(*n);
+                num_max = num_max.max(*n);
             }
+            CellValue::String(_) => has_string = true,
         }
     }
 
@@ -466,6 +465,47 @@ pub fn describe(catalog: &Catalog, dataset: &str) -> Result<CatalogResponse, Wir
                 suggested_kind: "dimension".to_string(),
             });
         }
+    }
+
+    // A MEASURE-LESS cube stores one bare value per coordinate — the shape
+    // `.import` produces when the CSV's last column is the value. The query layer
+    // addresses that value as the implicit `value` measure (see
+    // `build_slice_query`), so the data pane must advertise it too; otherwise a
+    // client sees ONLY dimensions and has nothing to chart, which reads as "this
+    // dataset has no measures" when in fact its numbers are just unnamed.
+    //
+    // Type it from the cells, exactly as for a real measure dimension: numbers ->
+    // measure, text -> dimension (an attribute table's values are text).
+    if measure_idx.is_none() {
+        let numeric = if has_string {
+            false
+        } else if has_number {
+            true
+        } else {
+            cube.is_aggregating
+        };
+
+        // Distinct value count for the data pane. The scan has already paid for the
+        // cells; this only adds the set.
+        let mut distinct: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, value) in &cells {
+            distinct.insert(match value {
+                CellValue::Numeric(n) => format!("{n}"),
+                CellValue::String(s) => s.clone(),
+            });
+        }
+
+        columns.push(CatalogColumn {
+            name: "value".to_string(),
+            data_type: if numeric { "number" } else { "string" }.to_string(),
+            logical_type: if numeric { "real" } else { "string" }.to_string(),
+            nullable: true,
+            cardinality: distinct.len(),
+            not_null: false,
+            min: if numeric && has_number { json!(bounded_precision(num_min)) } else { Value::Null },
+            max: if numeric && has_number { json!(bounded_precision(num_max)) } else { Value::Null },
+            suggested_kind: if numeric { "measure" } else { "dimension" }.to_string(),
+        });
     }
 
     Ok(CatalogResponse {
