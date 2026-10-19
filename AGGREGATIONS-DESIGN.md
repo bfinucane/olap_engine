@@ -173,3 +173,41 @@ string, and a non-numeric one goes to the client as a JSON string.
 `MEDIAN`, `STDEV`, `VAR` (need all values per group, or a second pass), `COUNT(*)`
 (needs a name), and `COUNTD` (decision 3). All four stay unadvertised, which keeps the
 capability list honest rather than aspirational.
+
+## 8. Deferred: averages that COUNT THE EMPTY CELLS (dense / period average)
+
+Raised by the user while accepting decision 1: *"some values, like monthly average, will
+always count the empty cells"*. That is correct, and it is a DIFFERENT FUNCTION — not a
+change to `AVG`.
+
+- `AVG` answers "what is the mean of the values that exist?". Denominator = non-empty
+  cells. A year with data in 9 of 12 months divides by 9.
+- A monthly average asks "what is the mean across the periods?". Denominator = the
+  periods, so those same 9 months divide by 12, and an empty month contributes 0.
+
+Do not "fix" `AVG` to be the second one: for a sparse cube the first is what a user means
+by "average sales per order", and silently switching denominators would turn a measured
+number into a fabricated one. They need separate names.
+
+**Cost: none.** The denominator is arithmetic on metadata the engine already has — the
+product of `get_leaf_descendants_in(hier, member).len()` over the group's members, per the
+dimensions designated as "period" axes. No scan, no per-cell memory. The accumulator
+already holds the numerator (`weighted` for SUM).
+
+**Open questions before implementing:**
+
+1. **Name.** `AVG_DENSE`, `AVG_INCLUDE_EMPTY`, `PERIOD_AVG`? The protocol's aggregation
+   vocabulary is fixed by ENGINE-PROTOCOL.md §3 (`SUM | AVG | MEDIAN | ...`), and this is
+   not in it — so it needs either a protocol addition or a `dense: true` flag on the
+   measure.
+2. **Which dimensions supply the denominator.** With one period axis (Year -> 12 months)
+   the answer is clear. With several dimensions the cross-product counts cells, not
+   periods: is a monthly average over `Year x Product` divided by 12, or by
+   12 x number-of-products? Almost certainly the former, which means the denominator is
+   per-dimension and the flag has to say which dimension is the period.
+3. **Empty vs absent.** A period with no cells at all contributes 0 to the sum and 1 to the
+   count. A period that does not EXIST (not a member of the dimension) surely does not
+   count. That distinction is the whole reason this needs its own name.
+
+Until those are settled it stays unadvertised, and `AVG` keeps the meaning pinned by
+`tests/scripts/aggregation_functions.sql`.
