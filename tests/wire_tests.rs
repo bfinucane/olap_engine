@@ -16,7 +16,7 @@
 
 use olap_engine::catalog::catalog::Catalog;
 use olap_engine::cube::node::CellValue;
-use olap_engine::engine::plan::{QueryRequest, PROTOCOL_VERSION};
+use olap_engine::engine::plan::{JoinRequest, QueryRequest, PROTOCOL_VERSION};
 use olap_engine::engine::wire::{self, SampleQuery, WireError};
 use serde_json::{json, Value};
 
@@ -98,6 +98,7 @@ fn request(dataset: &str) -> QueryRequest {
         limit: None,
         expressions: Default::default(),
         domain_for: Vec::new(),
+        join: None,
     }
 }
 
@@ -1078,6 +1079,246 @@ fn query_order_by_uses_output_column_names_and_rejects_unknown_ones() {
     );
     let err = wire::query(&mut catalog, &p2).expect_err("unknown output column");
     assert_eq!(err.code, "invalid_argument");
+}
+
+// ---------------------------------------------------------------------------
+// §3 query + join (conformed dimension)
+// ---------------------------------------------------------------------------
+
+/// A cube to join onto: `RegionAttr(Region, Attribute)`, an attribute cube whose
+/// measure dimension names the attributes. `Region` is conformed with `Sales`.
+/// `MultiAttr` shares TWO dimensions with `Sales`, so inference is ambiguous.
+fn build_join_catalog() -> Catalog {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Sales", &["Region", "Product", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog.get_cube_mut("Sales").expect("Sales");
+        for (r, p, m, v) in [
+            ("East", "Widget", "Sales", 100.0),
+            ("East", "Widget", "Cost", 40.0),
+            ("West", "Widget", "Sales", 200.0),
+            ("West", "Widget", "Cost", 80.0),
+        ] {
+            cube.write(&[r, p, m], CellValue::Numeric(v)).expect("write");
+        }
+    }
+
+    catalog.add_cube("RegionAttr", &["Region", "Attribute"], Some("Attribute"), false);
+    {
+        let cube = catalog.get_cube_mut("RegionAttr").expect("RegionAttr");
+        cube.write(&["East", "Manager"], CellValue::String("Ben Carter".into())).expect("write");
+        cube.write(&["West", "Manager"], CellValue::String("Dan Ellis".into())).expect("write");
+        // Only West has a region code: East must come back null.
+        cube.write(&["West", "Code"], CellValue::String("W-1".into())).expect("write");
+        // An attribute whose name collides with an output column of the query.
+        cube.write(&["East", "Sales"], CellValue::String("collide".into())).expect("write");
+    }
+
+    catalog.add_cube(
+        "MultiAttr",
+        &["Region", "Product", "Attribute"],
+        Some("Attribute"),
+        false,
+    );
+    catalog
+}
+
+fn join(p: &mut QueryRequest, cube: &str, using: Option<&str>, attributes: &[&str]) {
+    p.join = Some(JoinRequest {
+        cube: cube.to_string(),
+        using: using.map(str::to_string),
+        attributes: attributes.iter().map(|a| a.to_string()).collect(),
+    });
+}
+
+#[test]
+fn query_join_attaches_attributes_on_a_conformed_dimension() {
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Manager"]);
+
+    let resp = wire::query(&mut catalog, &p).expect("join query");
+
+    assert_eq!(
+        resp.columns,
+        vec!["Region", "Sales", "Manager"],
+        "attribute columns are APPENDED after the queried columns"
+    );
+    assert_eq!(
+        resp.rows,
+        vec![
+            vec![json!("East"), json!(100.0), json!("Ben Carter")],
+            vec![json!("West"), json!(200.0), json!("Dan Ellis")],
+        ]
+    );
+    // An attribute is a dimension of the result, not a measure.
+    assert_eq!(resp.column_meta[2].name, "Manager");
+    assert_eq!(resp.column_meta[2].kind, "dimension");
+    assert_eq!(resp.column_meta[2].data_type, "string");
+    assert_eq!(resp.measure_names, vec!["Sales"], "attributes are not measures");
+    assert_eq!(resp.measure_labels, vec!["SUM(Sales)"]);
+}
+
+/// `using` may be omitted when exactly one dimension conforms.
+#[test]
+fn query_join_infers_the_single_conformed_dimension() {
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", None, &["Manager"]);
+
+    let resp = wire::query(&mut catalog, &p).expect("inferred join");
+    assert_eq!(resp.columns, vec!["Region", "Sales", "Manager"]);
+    assert_eq!(resp.rows[0][2], json!("Ben Carter"));
+}
+
+/// The key column is found by NAME, wherever it sits in the projection.
+///
+/// Regression for a shadowed index: the attribute cube's key position is 0
+/// (`RegionAttr` starts with `Region`), and reading the primary row at that index
+/// only looks correct when the primary also projects the key first. Here `Product`
+/// comes first, so a positional mix-up yields no match at all.
+#[test]
+fn query_join_finds_the_key_column_wherever_it_is_projected() {
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    p.group_by
+        .push(serde_json::from_value(json!({"name": "Product"})).expect("GroupBy"));
+    p.group_by
+        .push(serde_json::from_value(json!({"name": "Region"})).expect("GroupBy"));
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Manager"]);
+
+    let resp = wire::query(&mut catalog, &p).expect("join query");
+    assert_eq!(resp.columns, vec!["Product", "Region", "Sales", "Manager"]);
+    for row in &resp.rows {
+        let region = row[1].as_str().expect("Region is column 1");
+        let manager = row[3].as_str().expect("Manager is column 3");
+        let expected = if region == "East" { "Ben Carter" } else { "Dan Ellis" };
+        assert_eq!(
+            manager, expected,
+            "the attribute must follow the REGION column, not column 0 (row {row:?})"
+        );
+    }
+}
+
+/// A key with no attribute row yields JSON `null`, and attributes keep the order
+/// they were requested in.
+#[test]
+fn query_join_emits_null_for_a_missing_attribute_and_keeps_requested_order() {
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Code", "Manager"]);
+
+    let resp = wire::query(&mut catalog, &p).expect("join query");
+    assert_eq!(
+        resp.columns,
+        vec!["Region", "Sales", "Code", "Manager"],
+        "appended in requested order"
+    );
+    assert_eq!(
+        resp.rows[0],
+        vec![json!("East"), json!(100.0), Value::Null, json!("Ben Carter")],
+        "East has no Code, so null rather than an empty string or \"-\""
+    );
+    assert_eq!(
+        resp.rows[1],
+        vec![json!("West"), json!(200.0), json!("W-1"), json!("Dan Ellis")]
+    );
+    // And the null survives serialisation as JSON null.
+    assert_eq!(wire(&resp)["rows"][0][2], Value::Null);
+}
+
+#[test]
+fn query_join_errors_are_typed() {
+    // Unknown joined cube: a dataset problem.
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "Nope", Some("Region"), &["Manager"]);
+    let err = wire::query(&mut catalog, &p).expect_err("unknown joined cube");
+    assert_eq!(err.code, "unknown_dataset");
+    assert_eq!(err.status(), 404);
+
+    // USING a dimension that is not in both cubes.
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Product"), &["Manager"]);
+    let err = wire::query(&mut catalog, &p).expect_err("non-conformed key");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(err.message.contains("conformed"), "message: {}", err.message);
+
+    // The key must be projected, or there is nothing to join against.
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    p.group_by
+        .push(serde_json::from_value(json!({"name": "Product"})).expect("GroupBy"));
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Manager"]);
+    let err = wire::query(&mut catalog, &p).expect_err("key not projected");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(err.message.contains("not projected"), "message: {}", err.message);
+
+    // An attribute that does not exist in the joined cube.
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Nope"]);
+    let err = wire::query(&mut catalog, &p).expect_err("unknown attribute");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(err.message.contains("is not an attribute"), "message: {}", err.message);
+
+    // An attribute whose name collides with a real output column would overwrite it.
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Sales"]);
+    let err = wire::query(&mut catalog, &p).expect_err("colliding attribute");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(err.message.contains("collides"), "message: {}", err.message);
+
+    // Two conformed dimensions and no USING: ambiguous, so refused.
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "MultiAttr", None, &["Attribute"]);
+    let err = wire::query(&mut catalog, &p).expect_err("ambiguous join");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("Cannot infer"),
+        "the message must say the join could not be inferred: {}",
+        err.message
+    );
+}
+
+#[test]
+fn query_join_can_be_ordered_by_an_attribute_column() {
+    let mut catalog = build_join_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    join(&mut p, "RegionAttr", Some("Region"), &["Manager"]);
+    // Descending by the attribute's text: "Dan Ellis" > "Ben Carter", so West
+    // (Dan) comes first. This proves enrichment happens BEFORE ordering.
+    p.order_by = Some(
+        serde_json::from_value(json!({"output": "Manager", "direction": "desc"}))
+            .expect("OrderBy"),
+    );
+
+    let resp = wire::query(&mut catalog, &p).expect("ordered join");
+    assert_eq!(resp.rows[0][0], json!("West"), "ordered by the joined attribute");
+    assert_eq!(resp.rows[1][0], json!("East"));
 }
 
 // ---------------------------------------------------------------------------

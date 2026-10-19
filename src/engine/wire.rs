@@ -298,6 +298,16 @@ fn build_query_response(
 
     let is_measure = |header: &str| measure_names.iter().any(|m| m == header);
 
+    // Attribute columns joined in from another cube. The plan layer writes "" for a
+    // key with no attribute row; on the wire that is `null` — the protocol's "no
+    // value" — not an empty string, so a client can tell "absent" from "empty".
+    let join_attributes: Vec<String> = plan
+        .join
+        .as_ref()
+        .map(|j| j.attributes.clone())
+        .unwrap_or_default();
+    let is_join_attribute = |header: &str| join_attributes.iter().any(|a| a == header);
+
     let column_meta: Vec<ColumnMeta> = headers
         .iter()
         .map(|h| {
@@ -338,6 +348,8 @@ fn build_query_response(
                             Ok(n) => json!(bounded_precision(n)),
                             Err(_) => json!(cell),
                         }
+                    } else if is_join_attribute(header) && cell.is_empty() {
+                        Value::Null
                     } else {
                         json!(cell)
                     }

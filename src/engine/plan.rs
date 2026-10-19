@@ -84,6 +84,31 @@ pub struct QueryRequest {
     /// response's `domain` map alongside the rows (see ENGINE-PROTOCOL.md §3).
     #[serde(rename = "domainFor", default)]
     pub domain_for: Vec<String>,
+    /// Optional attribute join on a conformed (shared) dimension. Uses the same
+    /// routine as the SQL `JOIN ... USING (...)` path — see `engine::attribute_join`.
+    #[serde(default)]
+    pub join: Option<JoinRequest>,
+}
+
+/// A join in the plan: attach attributes from another cube through a CONFORMED
+/// dimension — a dimension with the same name in both cubes.
+///
+/// This is the only kind of join the engine supports: cubes are not relational
+/// tables, so there is no arbitrary predicate to join on. The joined cube is an
+/// attribute cube whose measure dimension names the attributes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// The attribute cube to join onto the queried dataset.
+    pub cube: String,
+    /// The conformed dimension to key on. Absent means "infer it", which succeeds
+    /// only when exactly one dimension is shared; otherwise `invalid_argument`.
+    #[serde(default)]
+    pub using: Option<String>,
+    /// Attribute members to attach, in output order. Each must be a member of the
+    /// joined cube's measure dimension. The columns are APPENDED to the response,
+    /// after the queried columns; a missing attribute value is JSON `null`.
+    #[serde(default)]
+    pub attributes: Vec<String>,
 }
 
 fn default_protocol_version() -> u32 {
@@ -530,10 +555,71 @@ pub fn execute_plan(catalog: &mut Catalog, plan: &QueryRequest) -> Result<PlanRe
         .query_slice(&slice)
         .map_err(PlanError::InvalidArgument)?;
 
+    // --- 3a. Attribute join, BEFORE ordering and limiting: an attribute column is a
+    //         real output column, so `orderBy` may reference it. ---
+    let result = apply_join(catalog, result, plan)?;
+
     // --- 4. Post-processing: orderBy and limit. ---
     let result = apply_order_and_limit(result, plan)?;
 
     Ok(PlanResult::Rows(result))
+}
+
+/// Attaches joined attributes to a materialised result, using the same routine as
+/// the SQL front end (`engine::attribute_join`).
+///
+/// The wire layer supplies [`attribute_join::WIRE_MISSING`] as the placeholder for a
+/// key with no attribute row, and turns that empty cell into JSON `null` — the
+/// protocol's way of saying "no value" (SQL keeps its historical `"-"`).
+fn apply_join(
+    catalog: &Catalog,
+    mut result: ResultSet,
+    plan: &QueryRequest,
+) -> Result<ResultSet, PlanError> {
+    let Some(join) = &plan.join else {
+        return Ok(result);
+    };
+
+    // A missing joined cube is a dataset problem, not a malformed argument.
+    if catalog.get_cube(&join.cube).is_none() {
+        return Err(PlanError::UnknownDataset(join.cube.clone()));
+    }
+    let primary = catalog
+        .get_cube(&plan.dataset)
+        .ok_or_else(|| PlanError::UnknownDataset(plan.dataset.clone()))?;
+
+    // Attribute columns are APPENDED, so a name that already exists would silently
+    // overwrite a real output column. Refuse instead of corrupting the response.
+    for attribute in &join.attributes {
+        if result.headers.iter().any(|h| h == attribute) {
+            return Err(PlanError::InvalidArgument(format!(
+                "join attribute '{}' collides with an output column of the same name",
+                attribute
+            )));
+        }
+    }
+
+    let resolved = crate::engine::attribute_join::resolve(
+        catalog,
+        primary,
+        &plan.dataset,
+        &crate::engine::attribute_join::JoinSpec {
+            cube: join.cube.clone(),
+            using: join.using.clone(),
+        },
+    )
+    .map_err(PlanError::InvalidArgument)?;
+
+    crate::engine::attribute_join::apply(
+        catalog,
+        &mut result,
+        &resolved,
+        &join.attributes,
+        crate::engine::attribute_join::WIRE_MISSING,
+    )
+    .map_err(PlanError::InvalidArgument)?;
+
+    Ok(result)
 }
 
 /// The result of executing a plan.

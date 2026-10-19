@@ -7,6 +7,7 @@ use crate::cube::node::CellValue;
 
 use crate::catalog::catalog::Catalog;
 use crate::cube::cube::{SliceQuery, ResultSet, SplashMode};  
+use crate::engine::attribute_join;
 
 // Changed return type from f64 to String to support textual success messages
 pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, String> {
@@ -106,16 +107,27 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 //   * `ON (...)`, `NATURAL`, `CROSS` -> rejected with guidance.
                 let mut joined_cube_name = None;
                 let mut join_using: Option<Vec<String>> = None;
+                // V1 implements ONE LEFT join. A second join used to be silently
+                // dropped (`relation.joins[0]` only), which returned columns of dashes
+                // with no error — the misleading kind of wrong answer.
+                if relation.joins.len() > 1 {
+                    return Err(format!(
+                        "Only one JOIN is supported (found {}). Join one attribute cube at a \
+                         time, or issue separate queries.",
+                        relation.joins.len()
+                    ));
+                }
                 if !relation.joins.is_empty() {
                     let join = &relation.joins[0];
                     if let sqlparser::ast::TableFactor::Table { name, .. } = &join.relation {
                         joined_cube_name = Some(name.to_string());
                     }
                     match &join.join_operator {
-                        JoinOperator::Inner(c)
-                        | JoinOperator::LeftOuter(c)
-                        | JoinOperator::RightOuter(c)
-                        | JoinOperator::FullOuter(c) => match c {
+                        // A bare `JOIN` parses as `Inner`, so both arms are accepted and
+                        // both behave as a LEFT join — the one join semantic this engine
+                        // implements. (`INNER JOIN` written explicitly therefore does NOT
+                        // drop unmatched rows; it is an alias for the default here.)
+                        JoinOperator::Inner(c) | JoinOperator::LeftOuter(c) => match c {
                             JoinConstraint::Using(cols) => {
                                 join_using = Some(
                                     cols.iter().map(|i| i.value.clone()).collect(),
@@ -133,6 +145,17 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                                 );
                             }
                         },
+                        // Refused rather than approximated: a left-stitch cannot honour
+                        // them, and pretending otherwise is a wrong answer.
+                        JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_) => {
+                            return Err(
+                                "RIGHT and FULL joins are not supported. This engine implements \
+                                 a LEFT join: every row of the primary cube is kept and \
+                                 attributes are attached where the conformed dimension matches. \
+                                 Use a plain JOIN or LEFT JOIN."
+                                    .to_string(),
+                            );
+                        }
                         JoinOperator::CrossJoin => {
                             return Err(
                                 "CROSS JOIN is not supported; these cubes are joined through a \
@@ -142,8 +165,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                         }
                         _ => {
                             return Err(
-                                "Only INNER / LEFT / RIGHT / FULL [USING (...)] joins are \
-                                 supported."
+                                "Only a single LEFT [USING (...)] join is supported."
                                     .to_string(),
                             );
                         }
@@ -158,64 +180,31 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 //   * `USING (Col)`  -> use `Col` (must be conformed).
                 //   * no constraint  -> infer, but only if exactly ONE dimension
                 //                       conforms (otherwise it is ambiguous).
-                let resolved_join: Option<(String, String)> = match &joined_cube_name {
+                // The single validated join, if the query has one. Validation lives in
+                // `engine::attribute_join` so the plan layer cannot drift from SQL: the
+                // KEY must be a CONFORMED DIMENSION (the same name in both cubes), given
+                // by USING (<dimension>) or inferred when exactly one dimension conforms.
+                let resolved_join: Option<attribute_join::ResolvedJoin> = match &joined_cube_name {
                     None => None,
                     Some(j_name) => {
-                        let j_cube = catalog.get_cube(j_name).ok_or_else(|| {
-                            format!("Joined cube '{}' not found", j_name)
-                        })?;
-                        let shared_dim: String = if let Some(using_cols) = &join_using {
-                            if using_cols.len() != 1 {
-                                return Err(format!(
-                                    "USING currently accepts a single conformed dimension, got {}.",
-                                    using_cols.len()
-                                ));
-                            }
-                            let col = &using_cols[0];
-                            let in_primary = primary_cube.dimension_names.iter()
-                                .any(|d| d.eq_ignore_ascii_case(col));
-                            let in_joined = j_cube.dimension_names.iter()
-                                .any(|d| d.eq_ignore_ascii_case(col));
-                            if !in_primary || !in_joined {
-                                return Err(format!(
-                                    "Cannot JOIN '{}' with '{}' USING '{}': it must be a conformed \
-                                     dimension (present in both cubes).",
-                                    primary_cube_name, j_name, col
-                                ));
-                            }
-                                                        // Normalize to the primary cube's exact casing. The
-                            // `in_primary` check above guarantees a match, but we
-                            // resolve it without `.unwrap()` so a future change to
-                            // that guard cannot turn this into a panic.
-                            primary_cube.dimension_names.iter()
-                                .find(|d| d.eq_ignore_ascii_case(col))
-                                .cloned()
-                                .ok_or_else(|| format!(
-                                    "Cannot JOIN '{}' with '{}' USING '{}': it must be a conformed \
-                                     dimension (present in both cubes).",
-                                    primary_cube_name, j_name, col
-                                ))?
-                        } else {
-                            let shared: Vec<String> = primary_cube.dimension_names.iter()
-                                .filter(|d| j_cube.dimension_names.contains(*d))
-                                .cloned()
-                                .collect();
-                            match shared.len() {
-                                0 => return Err(format!(
-                                    "Cannot JOIN '{}' with '{}': they share no conformed dimension. \
-                                     A JOIN keys off a dimension with the same name in both cubes; \
-                                     write JOIN ... USING (<dimension>).",
-                                    primary_cube_name, j_name
-                                )),
-                                1 => shared.into_iter().next().unwrap(),
-                                _ => return Err(format!(
-                                    "Cannot infer how to JOIN '{}' with '{}': they share {} conformed \
-                                     dimensions ({}). Specify one with USING (<dimension>).",
-                                    primary_cube_name, j_name, shared.len(), shared.join(", ")
-                                )),
-                            }
-                        };
-                        Some((j_name.clone(), shared_dim))
+                        // SQL syntax check, kept here: USING names exactly one dimension.
+                        if let Some(cols) = &join_using
+                            && cols.len() != 1
+                        {
+                            return Err(format!(
+                                "USING currently accepts a single conformed dimension, got {}.",
+                                cols.len()
+                            ));
+                        }
+                        Some(attribute_join::resolve(
+                            catalog,
+                            primary_cube,
+                            &primary_cube_name,
+                            &attribute_join::JoinSpec {
+                                cube: j_name.clone(),
+                                using: join_using.as_ref().and_then(|c| c.first().cloned()),
+                            },
+                        )?)
                     }
                 };
 
@@ -398,78 +387,19 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 let mut result_set = primary_cube.query_slice(&slice_query)?;
 
  
-                                                                                // --- 4. ENRICH WITH JOINED ATTRIBUTES (BULK METHOD) ---
-                // `resolved_join` was validated above; here we only actually
-                // stitch attributes in when the query asked for some.
-                                if let Some((j_name, shared_dim)) = &resolved_join
-                    && !requested_attributes.is_empty()
-                {
-                    // `resolved_join` was only formed after this lookup succeeded,
-                    // but resolve it with a typed error rather than `.unwrap()`:
-                    // this path is reachable from a client-supplied query, and a
-                    // missing cube must never abort the process.
-                    let j_cube = catalog.get_cube(j_name)
-                        .ok_or_else(|| format!("Joined cube '{}' not found", j_name))?;
-
-                        let shared_col_idx = result_set.headers.iter().position(|h| h == shared_dim)
-                            .ok_or_else(|| format!(
-                                "Cannot JOIN '{}' with '{}': the conformed dimension '{}' is not \
-                                 projected, so there is no key to join the attributes onto.",
-                                primary_cube_name, j_name, shared_dim
-                            ))?;
-
-                        // Bulk request: query the attribute cube ONCE for all
-                        // requested attributes, keyed by the conformed dimension.
-                        let mut attr_outputs = vec![shared_dim.clone()];
-                        attr_outputs.extend(requested_attributes.clone());
-
-                                                let attr_slice = SliceQuery {
-                            output_columns: attr_outputs, // Include the attributes!
-                            axes: vec![shared_dim.clone()],
-                            requested_measures: requested_attributes.clone(),
-                            filters: HashMap::new(),
-                            ..Default::default()
-                        };
-
-                        let attr_results = j_cube.query_slice(&attr_slice)?;
-
-                        // Build an O(1) Hash Index in memory: Map<SharedKey, Map<AttrName, Value>>
-                        let mut attr_index = HashMap::new();
-                        for row in attr_results.rows {
-                            let key = row[0].clone(); // Shared Dim Value
-                            let mut attrs = HashMap::new();
-                            for (i, attr_name) in requested_attributes.iter().enumerate() {
-                                 // Measures start at index 1
-                                attrs.insert(attr_name.clone(), row[i + 1].clone());
-                            }
-                            attr_index.insert(key, attrs);
-                        }
-
-                        // Stitch the bulk attributes into the primary result set
-                        for row in &mut result_set.rows {
-                            let shared_val = &row[shared_col_idx];
-                            let attrs_for_row = attr_index.get(shared_val);
-
-                            for attr_name in &requested_attributes {
-                                let display_val = match attrs_for_row.and_then(|m| m.get(attr_name)) {
-                                    Some(val) => val.clone(),
-                                    None => "-".to_string(), // Null handling
-                                };
-
-                                                                // Inject at the requested SELECT column index.
-                                // The attribute name is in `output_columns`, so a
-                                // position exists; skip rather than panic if that
-                                // invariant is ever broken.
-                                if let Some(out_idx) = result_set.headers.iter().position(|h| h == attr_name) {
-                                    if out_idx < row.len() {
-                                        row[out_idx] = display_val;
-                                    } else {
-                                        row.push(display_val);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // --- 4. ENRICH WITH JOINED ATTRIBUTES ---
+                // The bulk lookup + stitch lives in `engine::attribute_join`, shared with
+                // the native plan layer so the two front doors cannot disagree. SQL keeps
+                // the "-" placeholder in its transcripts.
+                if let Some(resolved) = &resolved_join {
+                    attribute_join::apply(
+                        catalog,
+                        &mut result_set,
+                        resolved,
+                        &requested_attributes,
+                        attribute_join::SQL_MISSING,
+                    )?;
+                }
 
                 return Ok(format_result_set(result_set));
             }

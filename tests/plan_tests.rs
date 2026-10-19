@@ -62,6 +62,7 @@ fn plan(dataset: &str) -> QueryRequest {
         limit: None,
         expressions: Default::default(),
         domain_for: Vec::new(),
+        join: None,
     }
 }
 
