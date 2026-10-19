@@ -364,6 +364,13 @@ pub struct Capabilities {
     /// The largest row count the engine will return.
     #[serde(rename = "maxRows")]
     pub max_rows: usize,
+    /// Whether `QueryRequest.join` is honoured.
+    ///
+    /// Plateau feature-detects on this before offering attribute joins: an older
+    /// engine ignores an unknown `join` field, so a client that did not check would
+    /// silently get un-joined data rather than an error.
+    #[serde(rename = "supportsJoin")]
+    pub supports_join: bool,
 }
 
 impl Default for Capabilities {
@@ -399,6 +406,9 @@ impl Default for Capabilities {
             // `domainFor` is honoured (folded into the response).
             supports_inline_domain: true,
             max_rows: 100_000,
+            // Attribute joins on a conformed dimension are implemented
+            // (`engine::attribute_join`, shared with SQL).
+            supports_join: true,
         }
     }
 }

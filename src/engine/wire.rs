@@ -89,6 +89,20 @@ pub struct CatalogResponse {
     #[serde(rename = "primaryKey")]
     pub primary_key: Value,
     pub columns: Vec<CatalogColumn>,
+    /// The cube's measure dimension, if it has one (`null` otherwise).
+    ///
+    /// For an ATTRIBUTE cube this names the column whose MEMBERS are the attribute
+    /// names a caller can attach — the discovery step a join UI needs, and one it
+    /// cannot derive from `suggestedKind` (attribute values are text, so the column
+    /// looks like an ordinary string dimension).
+    #[serde(rename = "measureDimension")]
+    pub measure_dimension: Option<String>,
+    /// True when the cube is an attribute table rather than a measure cube.
+    ///
+    /// Plateau uses this to offer a cube as a join SOURCE. It mirrors
+    /// `Cube::is_aggregating`, which is what the engine itself uses to decide.
+    #[serde(rename = "isAttributeTable")]
+    pub is_attribute_table: bool,
 }
 
 /// §1 `CatalogResponse.columns[]`.
@@ -525,6 +539,8 @@ pub fn describe(catalog: &Catalog, dataset: &str) -> Result<CatalogResponse, Wir
         row_count,
         primary_key: Value::Null,
         columns,
+        measure_dimension: cube.measure_dimension.clone(),
+        is_attribute_table: !cube.is_aggregating,
     })
 }
 

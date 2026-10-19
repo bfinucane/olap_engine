@@ -153,6 +153,7 @@ fn capabilities_section4_keys_and_honest_declarations() {
             "maxRows",
             "protocolVersion",
             "supportsInlineDomain",
+            "supportsJoin",
             "supportsLod",
         ],
         "capabilities must use these camelCase keys exactly"
@@ -161,6 +162,7 @@ fn capabilities_section4_keys_and_honest_declarations() {
     assert_eq!(v["protocolVersion"], json!(PROTOCOL_VERSION));
     assert_eq!(v["protocolVersion"], json!(1), "protocol v1");
     assert_eq!(v["supportsLod"], json!(false), "LOD must not be claimed");
+    assert_eq!(v["supportsJoin"], json!(true), "attribute joins are implemented");
     assert_eq!(v["supportsInlineDomain"], json!(true));
     assert_eq!(v["countDistinctExact"], json!(true));
     assert_eq!(v["maxRows"], json!(100_000));
@@ -247,12 +249,25 @@ fn describe_section1_shape_and_measure_hint() {
     // §1 keys, snake -> camel exactly.
     assert_eq!(
         keys(&wire(&resp)),
-        vec!["columns", "dataset", "primaryKey", "rowCount"],
+        vec![
+            "columns",
+            "dataset",
+            "isAttributeTable",
+            "measureDimension",
+            "primaryKey",
+            "rowCount",
+        ],
         "CatalogResponse field names"
     );
     assert_eq!(resp.dataset, "Sales");
     assert_eq!(resp.row_count, 8, "rowCount is the leaf-cell count");
     assert_eq!(resp.primary_key, Value::Null);
+    assert_eq!(
+        resp.measure_dimension,
+        Some("Measure".to_string()),
+        "describe must name the measure dimension so a client can find attribute members"
+    );
+    assert!(!resp.is_attribute_table, "Sales is a measure cube, not an attribute table");
 
     assert_eq!(resp.columns.len(), 3, "one entry per cube dimension");
 
@@ -1319,6 +1334,42 @@ fn query_join_can_be_ordered_by_an_attribute_column() {
     let resp = wire::query(&mut catalog, &p).expect("ordered join");
     assert_eq!(resp.rows[0][0], json!("West"), "ordered by the joined attribute");
     assert_eq!(resp.rows[1][0], json!("East"));
+}
+
+/// The discovery flow Plateau needs BEFORE it can offer a join: find an attribute
+/// table, learn which column holds the attribute names, then list those names.
+///
+/// Without `isAttributeTable` and `measureDimension` a client has to guess: attribute
+/// values are text, so the attribute-name column looks like an ordinary string
+/// dimension in `columns[]`.
+#[test]
+fn describe_and_domain_together_expose_the_joinable_attributes() {
+    let mut catalog = build_join_catalog();
+
+    let attr = wire::describe(&catalog, "RegionAttr").expect("describe RegionAttr");
+    assert!(attr.is_attribute_table, "RegionAttr is an attribute table");
+    assert_eq!(
+        attr.measure_dimension.as_deref(),
+        Some("Attribute"),
+        "the measure dimension names the column whose MEMBERS are the attributes"
+    );
+
+    // Listing the attribute names = a domain query on exactly that column.
+    let mut p = request("RegionAttr");
+    p.domain_for = vec!["Attribute".to_string()];
+    let resp = wire::query(&mut catalog, &p).expect("domain query");
+    let names = resp.domain.get("Attribute").expect("domain map has 'Attribute'");
+    for expected in ["Manager", "Code"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "attribute '{expected}' must be discoverable, got {names:?}"
+        );
+    }
+
+    // The primary cube reports the other role, so the two are distinguishable.
+    let sales = wire::describe(&catalog, "Sales").expect("describe Sales");
+    assert!(!sales.is_attribute_table, "Sales is a measure cube");
+    assert_eq!(sales.measure_dimension.as_deref(), Some("Measure"));
 }
 
 // ---------------------------------------------------------------------------

@@ -174,3 +174,34 @@ repeat it.
 
 Everything else passes: 14 storage unit tests, 3 concurrency, 6 persistence,
 16 plan, 27 wire, 10 HTTP.
+
+---
+
+## Addendum: join discovery on the wire (2026-10-19)
+
+Added with the attribute-join implementation. Three ADDITIVE fields; a v1 client that
+ignores them still works, because unknown JSON keys are ignored.
+
+| Where | Field | Meaning |
+|---|---|---|
+| `capabilities` | `supportsJoin: true` | an older engine ignores a `join` block SILENTLY, so a client must check this before offering the feature |
+| `describe` | `measureDimension: "Attribute" | null` | names the column whose MEMBERS are the attachable attribute names |
+| `describe` | `isAttributeTable: true` | this cube is an attribute source, not a measure cube |
+
+Why `measureDimension` is needed: attribute values are text, so the attribute-name
+column is indistinguishable from an ordinary string dimension in `columns[]`.
+
+The discovery flow a client needs (verified against the seeded catalogue):
+
+1. `GET /v1/datasets` -> candidate names.
+2. `GET /v1/{ds}` -> `columns[]`, `measureDimension`, `isAttributeTable`.
+3. To join A to B the key must be a dimension present in BOTH — a CONFORMED
+   dimension. Intersect `columns[].name` across the two `describe` answers.
+4. The attachable attributes are the MEMBERS of the joined cube's
+   `measureDimension` column: `POST /v1/{attr}/query {"domainFor":["Attribute"]}`
+   -> `domain: {"Attribute":["Manager"]}`.
+5. `POST /v1/{A}/query` with `join: {cube, using?, attributes}`.
+
+One constraint that belongs in a UI: the conformed key MUST be in `groupBy`. The
+engine refuses a join whose key is not projected (`invalid_argument`, "not
+projected"), because there is no hidden-field mechanism.
