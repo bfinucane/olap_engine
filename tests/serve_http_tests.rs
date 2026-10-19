@@ -653,3 +653,46 @@ fn server_serves_the_catalog_persisted_by_save_to_disk() {
     assert_eq!(markets.status, 200, "second dataset also loaded: {}", markets.body);
     assert_eq!(markets.json()["rowCount"], serde_json::json!(2));
 }
+
+/// Phase 1b M3: the server no longer holds a catalog-wide `Mutex`, so requests from
+/// many threads must all be served, with consistent answers, and none may block another
+/// behind a global lock.
+///
+/// This is a concurrency test over the TRANSPORT, not a throughput benchmark: it exists
+/// to prove there is no deadlock and no shared-state corruption once the coarse lock is
+/// gone. (The engine exposes no write endpoint, so the reader/writer race itself is
+/// covered in `concurrency_tests.rs`, against the same `VersionStore`.)
+#[test]
+fn concurrent_requests_are_all_served_consistently() {
+    let srv = server();
+    let describe_url = format!("{}/v1/Sales", srv.base);
+    let query_url = format!("{}/v1/Sales/query", srv.base);
+    let body = r#"{"dataset":"Sales","protocolVersion":1,
+                   "groupBy":[{"name":"Region"}],
+                   "measures":[{"name":"Sales","aggregation":"SUM"}]}"#;
+
+    let clients: Vec<_> = (0..8)
+        .map(|_| {
+            let describe_url = describe_url.clone();
+            let query_url = query_url.clone();
+            std::thread::spawn(move || {
+                for i in 0..10 {
+                    let d = get(&describe_url);
+                    assert_eq!(d.status, 200, "describe failed on iteration {i}: {}", d.body);
+                    assert_eq!(d.json()["dataset"], serde_json::json!("Sales"));
+
+                    let q = post_json(&query_url, body);
+                    assert_eq!(q.status, 200, "query failed on iteration {i}: {}", q.body);
+                    let rows = q.json()["rows"].as_array().expect("rows is an array").clone();
+                    assert_eq!(rows.len(), 2, "East and West, every time");
+                    // East Sales = 100 + 50, independent of any other request's timing.
+                    assert_eq!(rows[0][1], serde_json::json!(150.0));
+                }
+            })
+        })
+        .collect();
+
+    for client in clients {
+        client.join().expect("client thread must not panic");
+    }
+}

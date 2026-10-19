@@ -25,7 +25,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use olap_engine::catalog::catalog::Catalog;
 use olap_engine::engine::plan::QueryRequest;
@@ -37,10 +37,12 @@ fn main() {
     let (bind, db_path, cors) = parse_args();
 
     let catalog = load_catalog(&db_path);
-    // The catalog is mutated by `query` (cache warming, display-order rebuild),
-    // so it lives behind a Mutex shared by every connection thread. This is the
-    // coarse lock the engine's own REPL also effectively holds.
-    let shared = Arc::new(Mutex::new(catalog));
+    // No catalog-wide lock (Phase 1b M3). Reads take an O(1) snapshot of a cube's
+    // `VersionStore` and never need the write path; the engine exposes no write
+    // endpoint over HTTP, so the only writer is the REPL/import that owns the
+    // catalog outright. A `Mutex<Catalog>` here would serialise every request
+    // behind one lock for no correctness benefit.
+    let shared = Arc::new(catalog);
 
     let listener = match TcpListener::bind(&bind) {
         Ok(l) => l,
@@ -154,7 +156,7 @@ impl Request {
 /// after the response keeps the parser trivial (no keep-alive state to maintain).
 fn handle_connection(
     mut stream: TcpStream,
-    shared: Arc<Mutex<Catalog>>,
+    shared: Arc<Catalog>,
     cors: bool,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -227,7 +229,7 @@ fn handle_connection(
 /// success or a typed `WireError` on failure.
 fn route(
     req: &Request,
-    shared: &Arc<Mutex<Catalog>>,
+    shared: &Arc<Catalog>,
 ) -> Result<(u16, serde_json::Value), WireError> {
     // Strip a trailing slash for uniform matching.
     let path = req.path.trim_end_matches('/');
@@ -247,8 +249,7 @@ fn route(
         if req.method != "GET" {
             return Err(method_not_allowed("GET"));
         }
-        let catalog = shared.lock().unwrap();
-        return Ok((200, serde_json::to_value(datasets(&catalog)).unwrap()));
+        return Ok((200, serde_json::to_value(datasets(shared)).unwrap()));
     }
 
     // Everything else is under /v1/{dataset}[/sample|/query].
@@ -271,8 +272,7 @@ fn route(
     match (req.method.as_str(), operation) {
         // GET /v1/{dataset} -> describe
         ("GET", "") => {
-            let catalog = shared.lock().unwrap();
-            let resp = describe(&catalog, dataset)?;
+            let resp = describe(shared, dataset)?;
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         // GET /v1/{dataset}/sample
@@ -288,8 +288,7 @@ fn route(
                 }
             }
             params.columns = columns;
-            let catalog = shared.lock().unwrap();
-            let resp = sample(&catalog, dataset, &params)?;
+            let resp = sample(shared, dataset, &params)?;
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         // POST /v1/{dataset}/query
@@ -313,8 +312,7 @@ fn route(
                     ),
                 });
             }
-            let mut catalog = shared.lock().unwrap();
-            let resp = query(&mut catalog, &plan)?;
+            let resp = query(shared, &plan)?;
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         ("GET", _) | ("POST", _) => Err(WireError {

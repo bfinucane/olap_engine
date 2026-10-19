@@ -223,7 +223,7 @@ pub fn datasets(catalog: &Catalog) -> DatasetsResponse {
 ///
 /// `elapsed_ms` is measured here (the whole engine-side duration); `truncated`
 /// is derived from whether `limit` actually removed rows.
-pub fn query(catalog: &mut Catalog, plan: &QueryRequest) -> Result<QueryResponse, WireError> {
+pub fn query(catalog: &Catalog, plan: &QueryRequest) -> Result<QueryResponse, WireError> {
     let started = std::time::Instant::now();
 
     // How many rows existed BEFORE the limit, so we can report `truncated`

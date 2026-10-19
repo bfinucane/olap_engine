@@ -223,19 +223,23 @@ Infor cared about), not micro-tuning.
 | M1 | Store becomes persistent: `Arc<Node>` children, path-copy `write`; `SparseStore`'s public API unchanged | **done** — the 14 existing store tests unchanged, plus 4 new: a snapshot survives later writes *and* prunes, untouched subtrees are `Arc::ptr_eq`-shared, a snapshot outlives its store |
 | M1b | the §7 gate, measured on the new store | **done** — failed at first, then re-derived and accepted (§7) |
 | M2 | `VersionStore` in `Cube`: version id, snapshot reads, version-tagged cache replacing the four `clear()` calls | **done** — `tests/versioning_tests.rs` (5): version advances per write; a snapshot read survives a later write; the cache is reused within a version and dropped after a write; a stale-tagged put is refused; a cloned cube writes independently |
-| M3 | server drops the catalog `Mutex` | not started — reads are snapshot-based, but `serve.rs` still serialises through one `Mutex<Catalog>` |
+| M3 | server drops the catalog `Mutex` | **done** — `serve.rs` holds `Arc<Catalog>`, the plan/wire read paths take `&Catalog`, and `tests/concurrency_tests.rs` (rewritten: its old "absence" test said to replace it when 1b landed) proves one writer over 400 versions against 4 concurrent readers with no torn read, plus a pinned snapshot surviving a writer; `serve_http_tests::concurrent_requests_are_all_served_consistently` fires 8×10 describe+query requests |
 | M4 | structural dimension changes clone the dimension and bump the version | not started |
 
-Each milestone leaves the suite green. M3 is where the coarse lock actually goes away; M2
-only made the read path capable of not needing it. Note what M2 deliberately did **not**
-change: `Cube::write` still takes `&self` under the caller's exclusive borrow, and the
-server still holds one catalog-wide `Mutex`, so no new concurrency is *used* yet — the
-version tags and the `computed_at` guard exist so that M3 can remove the lock without
-introducing a stale-cache race.
+Each milestone leaves the suite green. M3 is where the coarse lock actually went away; M2
+only made the read path capable of not needing it.
+
+**What M3 did and did not prove.** The engine has no HTTP write endpoint, so the
+reader/writer race is exercised in-process against the same `VersionStore`
+(`concurrency_tests.rs`), and the HTTP test proves the transport serves concurrent requests
+consistently with no deadlock. A concurrent writer over the wire would need a write endpoint,
+which is a protocol decision, not an engine one.
 
 M2 also removed the last correctness caveat of the old design: the four
 `query_cache.clear()` calls (and the "correct only under a single writer" note in
-`ROADMAP.md`) are gone, replaced by lazy invalidation.
+`ROADMAP.md`) are gone, replaced by lazy invalidation. M3 removed the lock that
+`ROADMAP.md`'s baseline section called "coarse and uneven".
+
 
 
 

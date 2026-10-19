@@ -1,26 +1,25 @@
-//! Concurrency tests — what is actually safe today.
+//! Concurrency tests — what is actually safe, after Phase 1b.
 //!
-//! **The point of this file is to document an ABSENCE, and to make it
-//! deliberate.** The roadmap's "Where we are today" section says concurrency is
-//! "coarse and uneven": a `Dimension` is shared behind `Arc<RwLock<Dimension>>`,
-//! but a `Cube` is owned **by value** inside the catalog and every write path
-//! takes `&mut self`. There is no safe concurrent *mutation* of a cube, and
-//! `query_cache` is invalidated globally on every write
-//! (`self.query_cache.clear()`), which is only correct under a single-writer
-//! assumption. Phase 1b (MVCC) exists to replace exactly that.
+//! **This file used to document an ABSENCE.** Before 1b, a `Cube` was owned by value
+//! inside the catalog, every write took `&mut self`, and `query_cache` was cleared
+//! globally on every write — correct only under a single-writer assumption. One test
+//! here (`concurrent_mutation_is_not_expressible_today`) asserted that absence, and its
+//! own comment said it should be rewritten the day 1b landed.
 //!
-//! Why write tests for behaviour that does not exist? Because the next change to
-//! this area is a storage-engine redesign, and a redesign is precisely when an
-//! accidental new guarantee slips in unnoticed (or an existing one is silently
-//! removed). These tests turn "concurrency is uneven" into something executable:
+//! 1b landed (M1 persistent trie, M2 versioned store, M3 the catalog `Mutex` removed),
+//! so the absence is gone and this file now states the POSITIVE guarantee:
 //!
-//!   * `dimension_reads_are_safe_across_threads` — the guarantee that DOES hold.
-//!   * `catalog_moves_to_another_thread` — the auto-trait floor 1b builds on.
-//!   * `concurrent_mutation_is_not_expressible_today` — the absence, stated.
+//!   * `dimension_reads_are_safe_across_threads` — many readers of one dimension.
+//!   * `catalog_moves_to_another_thread` — the auto-trait floor, plus `Cube: Sync`.
+//!   * `readers_and_a_writer_share_one_cube_without_tearing` — the real race test:
+//!     a writer overwrites one cell while readers aggregate it. Every read must land
+//!     on a value that was actually written, never a torn or impossible one.
+//!   * `a_pinned_snapshot_stays_stable_while_a_writer_runs` — a reader that pinned a
+//!     version before the writer started keeps seeing that version.
 //!
-//! Two of the three are assertions about the *type system* rather than about
-//! runtime behaviour, which is deliberate: that is where today's guarantee
-//! actually lives.
+//! What is still NOT promised: durability under a crash, and a write endpoint over
+//! HTTP (there is none — the writer here is in-process, which is the only writer the
+//! engine has today).
 
 use olap_engine::catalog::catalog::Catalog;
 use olap_engine::cube::cube::Cube;
@@ -53,12 +52,8 @@ fn build_sample_catalog() -> Catalog {
     catalog
 }
 
-/// The guarantee that DOES hold today: a `Dimension` is shared behind
-/// `Arc<RwLock<Dimension>>`, so many threads may read it at once, and the data
-/// they see is consistent.
-///
-/// This is the one piece of the concurrency story that is already correct, and
-/// 1b must not regress it while replacing the store underneath.
+/// A `Dimension` is shared behind `Arc<RwLock<Dimension>>`, so many threads may read it
+/// at once, and the data they see is consistent.
 #[test]
 fn dimension_reads_are_safe_across_threads() {
     let catalog = build_sample_catalog();
@@ -86,18 +81,21 @@ fn dimension_reads_are_safe_across_threads() {
     );
 }
 
-/// Ownership can cross a thread boundary: a whole `Catalog` moves into a
-/// spawned thread and is used there.
+/// Ownership can cross a thread boundary, and a shared `Cube` is readable from several
+/// threads at once.
 ///
-/// Stated because it is the floor Phase 1b stands on. If a future change puts
-/// an `Rc`, a `RefCell`, or a thread-affine handle inside the catalog, this
-/// stops compiling — which is exactly the warning worth having.
+/// The `Sync` assertion is the new part: it is only true because the store is
+/// interior-mutable (`RwLock`) and the version is atomic. If a future change puts an
+/// `Rc`, a `RefCell`, or a thread-affine handle back into the store, this stops
+/// compiling — which is the warning worth having.
 #[test]
 fn catalog_moves_to_another_thread() {
     fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
 
     assert_send::<Catalog>();
     assert_send::<Cube>();
+    assert_sync::<Cube>();
     assert_send::<Arc<RwLock<Dimension>>>();
     assert_send::<CellValue>();
 
@@ -111,41 +109,107 @@ fn catalog_moves_to_another_thread() {
     assert!(handle.join().expect("owner thread must not panic"));
 }
 
-/// The ABSENCE, stated as a compile-time fact rather than a comment.
+/// THE RACE TEST: one writer overwrites a cell while several readers aggregate it.
 ///
-/// `query_consolidated`, `write` and `write_splashed` all take `&mut self`, and
-/// the catalog hands out `&mut Cube`, so sharing one cube across threads for
-/// writing is not expressible in safe code — there is nothing to test at
-/// runtime because nothing can be written. The assertions below are therefore
-/// about the *shape of the API*: an exclusive borrow is required, and taking two
-/// at once is rejected before any thread is involved.
-///
-/// When Phase 1b lands, this test SHOULD FAIL TO COMPILE or be rewritten: that
-/// is the signal that a concurrent mutation path now exists and needs a real
-/// race test (two writers committing, one long reader pinned to its version).
+/// A reader must always land on a value that some version actually held — never a
+/// half-written cell, a NaN, or a number the writer never wrote. This is the property
+/// the persistent trie plus snapshot reads exist to provide.
 #[test]
-fn concurrent_mutation_is_not_expressible_today() {
-    let mut catalog = build_sample_catalog();
+fn readers_and_a_writer_share_one_cube_without_tearing() {
+    const WRITES: u32 = 400;
 
-    // A single exclusive borrow is all the API offers.
-    let cube: &mut Cube = catalog.get_cube_mut("Sales").expect("cube");
-    cube.write(&["France", "Revenue"], CellValue::Numeric(150.0))
-        .expect("write France/Revenue");
+    let catalog = Arc::new(build_sample_catalog());
 
-    // Re-reading through the same exclusive borrow sees the upsert (this is the
-    // intentional overwrite contract, confirmed at the storage level too).
+    let writer = {
+        let catalog = Arc::clone(&catalog);
+        std::thread::spawn(move || {
+            let cube = catalog.get_cube("Sales").expect("cube");
+            for i in 0..WRITES {
+                cube.write(&["France", "Revenue"], CellValue::Numeric(f64::from(i)))
+                    .expect("concurrent write");
+            }
+        })
+    };
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let catalog = Arc::clone(&catalog);
+            std::thread::spawn(move || {
+                let cube = catalog.get_cube("Sales").expect("cube");
+                let mut observed = Vec::with_capacity(500);
+                for _ in 0..500 {
+                    let v = cube.query_consolidated(&["France", "Revenue"]);
+                    assert!(v.is_finite(), "torn read: {v} is not finite");
+                    // The initial fixture value is 100; the writer writes 0..WRITES.
+                    assert!(
+                        (0.0..=f64::from(WRITES)).contains(&v),
+                        "read {v} is outside every version the writer ever published \
+                         (0..={WRITES}, plus the fixture's 100)"
+                    );
+                    observed.push(v);
+                }
+                observed
+            })
+        })
+        .collect();
+
+    writer.join().expect("writer thread must not panic");
+    for reader in readers {
+        let observed = reader.join().expect("reader thread must not panic");
+        assert_eq!(observed.len(), 500);
+    }
+
+    // And the final state is the last write, not a lost update or a merge artifact.
+    let cube = catalog.get_cube("Sales").expect("cube");
     assert_eq!(
-        cube.read_cell(&["France", "Revenue"]),
-        Some(CellValue::Numeric(150.0))
+        cube.query_consolidated(&["France", "Revenue"]),
+        f64::from(WRITES - 1),
+        "the last committed write must win"
     );
+}
 
-    // There is deliberately no `Arc<Cube>`, no `RwLock<Cube>`, and no `&self`
-    // write method to exercise here. `query_consolidated` needs `&mut self` only
-    // because it populates `query_cache`, which is itself the global-invalidation
-    // problem Phase 1b replaces with a version-aware cache.
-    assert!(
-        !std::any::type_name::<Cube>().contains("RwLock"),
-        "Cube is owned by value today; if it becomes shared, this test is the place \
-         to add a real concurrent-writer race test"
+/// A reader that pins a snapshot BEFORE the writer starts keeps seeing that version,
+/// no matter what the writer does afterwards.
+#[test]
+fn a_pinned_snapshot_stays_stable_while_a_writer_runs() {
+    let catalog = Arc::new(build_sample_catalog());
+
+    let cube = catalog.get_cube("Sales").expect("cube");
+    // France lives in `Geography`, Revenue in `Measure` — resolve each in its own
+    // dimension (getting this wrong is how the first version of this test failed).
+    let id = {
+        let geo = catalog.get_dimension("Geography").expect("Geography");
+        let measure = catalog.get_dimension("Measure").expect("Measure");
+        let g = geo.read().expect("geo lock");
+        let m = measure.read().expect("measure lock");
+        [
+            g.get_id("France").expect("France"),
+            m.get_id("Revenue").expect("Revenue"),
+        ]
+    };
+    let pinned = cube.store.snapshot();
+    assert_eq!(pinned.query_exact(&id), Some(CellValue::Numeric(100.0)));
+
+    let writer = {
+        let catalog = Arc::clone(&catalog);
+        std::thread::spawn(move || {
+            let cube = catalog.get_cube("Sales").expect("cube");
+            for i in 0..200 {
+                cube.write(&["France", "Revenue"], CellValue::Numeric(f64::from(i)))
+                    .expect("write");
+            }
+        })
+    };
+    writer.join().expect("writer");
+
+    assert_eq!(
+        pinned.query_exact(&id),
+        Some(CellValue::Numeric(100.0)),
+        "the pinned snapshot must still read the value it was taken with"
+    );
+    assert_eq!(
+        cube.store.query_exact(&id),
+        Some(CellValue::Numeric(199.0)),
+        "the live store moved on"
     );
 }

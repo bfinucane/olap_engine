@@ -472,7 +472,7 @@ impl std::error::Error for PlanError {}
 /// Returns a materialised result (see `PlanResult`). Domain requests
 /// (`domainFor`) are returned as their own result variant here; folding them
 /// into a single `QueryResponse` alongside the rows is the transport's job.
-pub fn execute_plan(catalog: &mut Catalog, plan: &QueryRequest) -> Result<PlanResult, PlanError> {
+pub fn execute_plan(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult, PlanError> {
     if plan.protocol_version != PROTOCOL_VERSION {
         return Err(PlanError::VersionMismatch {
             found: plan.protocol_version,
@@ -862,7 +862,7 @@ fn apply_order_and_limit(
 
 /// Answers a pure domain query: the distinct member values of each requested
 /// column, in display order. This is what a filter-picker UI asks for.
-fn domain_query(catalog: &mut Catalog, plan: &QueryRequest) -> Result<PlanResult, PlanError> {
+fn domain_query(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult, PlanError> {
     let cube = catalog
         .get_cube(&plan.dataset)
         .ok_or_else(|| PlanError::UnknownDataset(plan.dataset.clone()))?;
