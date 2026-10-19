@@ -1,0 +1,37 @@
+Region,Segment,Category,Sales
+Central,Consumer,Furniture,431092.09
+Central,Consumer,Office Supplies,104365.38
+Central,Consumer,Technology,1657848.44
+Central,Corporate,Furniture,450773.44
+Central,Corporate,Office Supplies,105102.81
+Central,Corporate,Technology,1524710.56
+Central,Home Office,Furniture,458533.19
+Central,Home Office,Office Supplies,129254.12
+Central,Home Office,Technology,1575261.54
+East,Consumer,Furniture,624211.08
+East,Consumer,Office Supplies,103990.54
+East,Consumer,Technology,1459029.20
+East,Corporate,Furniture,533382.89
+East,Corporate,Office Supplies,58319.65
+East,Corporate,Technology,1571487.82
+East,Home Office,Furniture,601003.36
+East,Home Office,Office Supplies,65953.76
+East,Home Office,Technology,1302332.85
+South,Consumer,Furniture,633739.83
+South,Consumer,Office Supplies,78915.42
+South,Consumer,Technology,1218808.86
+South,Corporate,Furniture,633838.67
+South,Corporate,Office Supplies,111944.71
+South,Corporate,Technology,1801490.62
+South,Home Office,Furniture,415898.03
+South,Home Office,Office Supplies,103962.23
+South,Home Office,Technology,1443344.18
+West,Consumer,Furniture,547133.96
+West,Consumer,Office Supplies,135877.50
+West,Consumer,Technology,1144242.01
+West,Corporate,Furniture,495256.89
+West,Corporate,Office Supplies,59189.64
+West,Corporate,Technology,2693925.52
+West,Home Office,Furniture,622347.70
+West,Home Office,Office Supplies,76728.64
+West,Home Office,Technology,1790130.30

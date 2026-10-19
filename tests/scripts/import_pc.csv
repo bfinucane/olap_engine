@@ -1,0 +1,9 @@
+Parent,Child,Weight
+Europe,England,1.0
+Europe,France,1.0
+Europe,Germany,1.0
+North America,USA,1.0
+North America,Canada,1.0
+North America,Mexico,1.0
+All,Europe,1.0
+All,North America,1.0

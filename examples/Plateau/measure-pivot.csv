@@ -1,0 +1,37 @@
+Region,Category,Measure,Value
+Central,Furniture,Sales,1340398.72
+Central,Furniture,Profit,-620.36
+Central,Furniture,Quantity,1569.00
+Central,Office Supplies,Sales,338722.31
+Central,Office Supplies,Profit,76561.52
+Central,Office Supplies,Quantity,2271.00
+Central,Technology,Sales,4757820.54
+Central,Technology,Profit,280646.77
+Central,Technology,Quantity,1803.00
+East,Furniture,Sales,1758597.33
+East,Furniture,Profit,-15407.76
+East,Furniture,Quantity,2065.00
+East,Office Supplies,Sales,228263.95
+East,Office Supplies,Profit,50852.40
+East,Office Supplies,Quantity,1598.00
+East,Technology,Sales,4332849.87
+East,Technology,Profit,225710.83
+East,Technology,Quantity,1667.00
+South,Furniture,Sales,1683476.53
+South,Furniture,Profit,2793.85
+South,Furniture,Quantity,1920.00
+South,Office Supplies,Sales,294822.36
+South,Office Supplies,Profit,70658.71
+South,Office Supplies,Quantity,1990.00
+South,Technology,Sales,4463643.66
+South,Technology,Profit,261178.40
+South,Technology,Quantity,1821.00
+West,Furniture,Sales,1664738.55
+West,Furniture,Profit,23046.30
+West,Furniture,Quantity,1939.00
+West,Office Supplies,Sales,271795.78
+West,Office Supplies,Profit,62286.42
+West,Office Supplies,Quantity,1768.00
+West,Technology,Sales,5628297.83
+West,Technology,Profit,152446.74
+West,Technology,Quantity,2039.00

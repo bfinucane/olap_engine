@@ -1,0 +1,17 @@
+Parent,Child,Weight
+Total,Region: East,1.0
+Total,Region: West,1.0
+Total,Region: Central,1.0
+Total,Region: South,1.0
+Region: East,Category: Furniture,1.0
+Region: East,Category: Technology,1.0
+Region: East,Category: Office Supplies,1.0
+Region: West,Category: Furniture,1.0
+Region: West,Category: Technology,1.0
+Region: West,Category: Office Supplies,1.0
+Region: Central,Category: Furniture,1.0
+Region: Central,Category: Technology,1.0
+Region: Central,Category: Office Supplies,1.0
+Region: South,Category: Furniture,1.0
+Region: South,Category: Technology,1.0
+Region: South,Category: Office Supplies,1.0
