@@ -1,0 +1,150 @@
+# Non-additive aggregations — design proposal
+
+**Status:** proposal, for decisions. No code written.
+**Today:** `Capabilities::default()` advertises `["SUM"]`, and `execute_plan` refuses
+anything else with `unsupported_aggregation` rather than returning a sum under an `AVG`
+label. That refusal was the right call; this is what it would take to remove it.
+
+---
+
+## 1. What the engine already gives us
+
+`Cube::query_slice` (`src/cube/cube.rs:486`) does the whole job in one pass:
+
+1. resolve each axis/column to leaf id → weight maps (`weight_maps`),
+2. `store.scan_subcube(&scanner_filters)` — **only stored cells are visited**,
+3. per cell, multiply by each dimension's weight,
+4. accumulate into `grouped_results[row_key][measure_name]` with `+=`.
+
+Step 4 is the only place SUM is hardcoded. Everything non-additive needs the same pass with
+a different accumulator, and **no extra scan and no extra memory per cell** — which answers
+the "can nonempties be counted efficiently?" question directly: yes, because the scan is
+already sparse. Counting non-empty cells is a side effect of visiting them. Counting
+*empty* cells would be arithmetic on the cross-product of leaf counts, also free, but is a
+different number (see §3).
+
+## 2. Two facts that shape the design
+
+**Cells are the unit, not rows.** There is no row store: a cell lives at a leaf coordinate.
+"COUNT" therefore counts the non-empty cells contributing to a group — matching
+`COUNT(measure)` in SQL, not `COUNT(*)`. The user's framing was "only base values are
+counted", which is exactly this: base (leaf) cells, never consolidated members.
+
+**Weights are per dimension and fractional.** A ragged hierarchy gives a leaf a weight like
+0.5, and SUM multiplies by it. Non-additive aggregations must decide what a weight means,
+and there is no universally right answer — see decision 2.
+
+## 3. Proposed semantics
+
+| Aggregation | Definition over one group's non-empty leaf cells | Empty group |
+|---|---|---|
+| `SUM` | Σ v (today, weighted) | `0` (today's behaviour, keep) |
+| `COUNT` | number of non-empty leaf cells | `0` |
+| `AVG` | mean of the base leaf values | `null` |
+| `MIN` / `MAX` | smallest / largest base leaf value | `null` |
+| `COUNTD` | **deferred** (see decision 3) | — |
+| `MEDIAN`, `STDEV`, `VAR` | out of scope for now: they need either two passes or all values held per group | — |
+
+"Base leaf value" means the stored `CellValue::Numeric` **before** any weight is applied.
+That is a deliberate difference from SUM on a ragged hierarchy: see decision 2.
+
+## 4. Decisions needed
+
+### Decision 1 — empty cells (the question you raised)
+
+**Recommend:** ignore them.
+- `COUNT` = non-empty cells. An empty cell is not a value; counting it would make
+  `COUNT` a property of the schema (the cross-product size) rather than of the data.
+- `AVG` divides by the non-empty count, so a sparse group is not dragged toward zero —
+  which is what would happen if empties were treated as 0.
+- `MIN`/`MAX` skip them. Treating empty as 0 would make `MIN` return 0 for almost every
+  sparse cube, which is useless.
+- `SUM` keeps today's behaviour (`0`), because that is what makes additive rollups work.
+
+`SUM` and the others therefore disagree about empty groups (`0` vs `null`). That is
+correct and worth stating in the protocol: additive totals have an identity element,
+min/avg do not.
+
+If you would rather have `COUNT(*)` too (all possible leaf combinations), it is cheap —
+the cross-product of `get_leaf_descendants_in` sizes, no scan — but it needs its own name
+(`COUNT_ROWS`?) or an explicit flag, because silently redefining `COUNT` would break the
+SQL meaning.
+
+### Decision 2 — what a fractional weight means for MIN/MAX/AVG
+
+**Recommend: ignore weights; aggregate the base leaf values.**
+
+- Two cells with values 10 and 20 under a parent whose weights are 0.5 and 1.0:
+  `SUM` = 25, `AVG` = 15, not (0.5·10 + 20)/1.5 = 13.3.
+- It is explainable in one sentence ("the non-additive aggregations look at the stored
+  values, not the rollup shares"), and it is what "only base values are counted" implies.
+- Consequence to document: on a ragged hierarchy, `AVG ≠ SUM / COUNT`. That is not a bug;
+  they are answers to different questions.
+
+**The alternative** is a weighted mean, Σ(w·v)/Σw, which keeps `AVG = SUM/COUNT` whenever
+all weights are 1. It breaks down exactly where this engine is most interesting: a
+hierarchy with signed weights (Profit = Revenue − Cost) can make Σw = 0, and the average
+of a subtraction has no obvious meaning. Supporting it would need a rule for the zero
+denominator, which is a smell.
+
+**A third option** is to refuse non-additive aggregations whenever a query touches a
+member with a weight ≠ ±1. Honest, and it keeps the engine exactly additive. It also means
+`AVG` fails on the ragged hierarchies that are the product's distinguishing feature, so I
+do not recommend it.
+
+### Decision 3 — COUNTD
+
+**Recommend: do not do it yet; keep `countDistinctExact` honest.**
+- `COUNTD` of a dimension member is "distinct values of a column", but storage is a cube:
+  it becomes "distinct coordinates of dimension D among the group's non-empty cells",
+  which needs a `HashSet` per group — memory proportional to cardinality × groups, the one
+  aggregation that is not O(1) per group.
+- `capabilities.countDistinctExact` is currently `true`, and since `COUNTD` is not
+  advertised it is never exercised. If COUNTD stays unimplemented, that flag should become
+  `false`, because a client that reads it today is being told something the engine cannot
+  back up.
+
+### Decision 4 — how "no value" travels
+
+`AVG`/`MIN`/`MAX` over an empty group need a representation. Today a measure cell is a
+string, and a non-numeric one goes to the client as a JSON string.
+- **Recommend:** `null` on the wire (the plan layer already appends `null` for a missing
+  joined attribute, so the client can handle it) and `-` in the SQL transcript, matching
+  the engine's existing "no data" convention.
+- This needs a small wire change: the measure branch currently parses `f64` and falls back
+  to `json!(cell)`; it needs an explicit "this cell is absent" marker rather than `""`.
+
+## 5. Implementation sketch
+
+1. **`SliceQuery` gains per-measure aggregation**: `aggregations: HashMap<String, Aggregation>`
+   (keyed by measure name), so one query may ask `SUM(Sales), AVG(Cost)`.
+2. **`Accumulator` per (group, measure)**:
+   ```rust
+   struct Acc { sum: f64, count: u64, min: f64, max: f64 }
+   ```
+   The loop keeps `raw` (before weighting) alongside the weighted value it already computes.
+   Four `f64`s per group per measure is the whole extra cost.
+3. **Finalise per measure** when the row is emitted: `SUM` → `sum`, `COUNT` → `count`,
+   `AVG` → `sum(raw)/count`, `MIN`/`MAX` → the extremes or absent.
+4. **`Capabilities`** advertises exactly the implemented set; the existing
+   "advertised ⇒ accepted, un-advertised ⇒ refused" test keeps it honest.
+5. **Non-additive cubes** (attribute tables) are untouched: no math there today.
+6. **String cells** under an aggregation stay an error rather than being coerced —
+   `MIN` of a text column is a separate feature, not a free one.
+
+## 6. Tests and the honest failure modes
+
+- SQL goldens for `AVG`, `MIN`, `MAX`, `COUNT` on the seeded cube, including a sparse cell
+  set so the empty-cell rule is pinned rather than assumed.
+- A ragged-hierarchy test asserting `AVG ≠ SUM/COUNT` and *saying why*, so the difference
+  cannot later be "fixed" into the weighted version by accident.
+- `MIN` on a group whose cells are all absent → `null`, not `0`.
+- Capabilities/acceptance round trip, both directions.
+- A `SUM` regression test proving the accumulator refactor did not change additive results
+  — every existing golden is that test, if they stay byte-identical.
+
+## 7. What this does not include
+
+`MEDIAN`, `STDEV`, `VAR` (need all values per group, or a second pass), `COUNT(*)`
+(needs a name), and `COUNTD` (decision 3). All four stay unadvertised, which keeps the
+capability list honest rather than aspirational.
