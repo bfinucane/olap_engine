@@ -1,9 +1,34 @@
 # Non-additive aggregations — design proposal
 
-**Status:** proposal, for decisions. No code written.
-**Today:** `Capabilities::default()` advertises `["SUM"]`, and `execute_plan` refuses
-anything else with `unsupported_aggregation` rather than returning a sum under an `AVG`
-label. That refusal was the right call; this is what it would take to remove it.
+**Status:** IMPLEMENTED (M1–M3 below). Decisions 1, 2 and 4 taken; decision 3 taken as the
+honest default (COUNTD stays unimplemented, `countDistinctExact` now `false`).
+**Today:** `Capabilities::default()` advertises `["SUM", "AVG", "COUNT", "MIN", "MAX"]`, and
+`execute_plan` refuses anything else with `unsupported_aggregation` rather than returning a
+sum under an `AVG` label.
+
+---
+
+## 0. What was built, and where it differed from this proposal
+
+1. **"No data" was already `-`.** The proposal guessed the marker would be `""`; the engine
+   had always used `-` (`query_slice` emits it for a measure with no cells in a group). So
+   decision 4 needed no type change — only a wire mapping: `-` → JSON `null`. Found while
+   implementing; the SQL transcript keeps `-`.
+2. **SQL supports aggregate functions too**, since the engine works "based on the same
+   internal routines": `SELECT AVG(Sales) FROM T WHERE ...`. The output column is named
+   after the MEASURE (matching a bare `SELECT Sales`), so two aggregations of the same
+   measure in one statement collide — that needs a column-mapping feature, not a silent one.
+3. **The SQL dialect injects a default member** for every dimension that is neither an axis
+   nor filtered, so `SELECT Region, Sales` means "Product = its first member", not "all
+   products". A multi-cell group in SQL therefore has to come from a hierarchy or a
+   `WHERE` on a consolidated member. This surprised the first fixture written for it.
+4. **`COUNTD` remains unimplemented and `countDistinctExact` is now `false`.** It previously
+   claimed `true` for a capability that never ran, which is the kind of claim this project
+   has been careful not to make.
+
+Tests: `tests/aggregation_tests.rs` (semantics below the SQL/wire layers),
+`tests/scripts/aggregation_functions.sql` (end-to-end golden, including the fractional-weight
+and absent-measure cases), and the updated `capabilities`/`wire` pins.
 
 ---
 

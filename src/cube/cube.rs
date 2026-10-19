@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use crate::dimension::dimension::{Dimension, MemberType};
 use crate::storage::sparse_store::SparseStore;
 use crate::storage::version_store::VersionStore;
+use crate::cube::aggregation::Aggregation;
 use crate::cube::node::CellValue;
 
 /// Splits a coordinate into an optional hierarchy qualifier and a member name.
@@ -66,6 +67,87 @@ fn build_leaf_product(
     }
 }
 
+/// Per-(group, measure) accumulator.
+///
+/// It keeps BOTH the weighted sum and the raw values, because SUM and the non-additive
+/// aggregations answer different questions: a weight says how much a leaf contributes to
+/// a rollup, not how much it should count in a mean (`AGGREGATIONS-DESIGN.md` §4).
+enum Acc {
+    Num {
+        weighted: f64,
+        raw_sum: f64,
+        count: u64,
+        min: f64,
+        max: f64,
+    },
+    Text(String),
+}
+
+impl Default for Acc {
+    fn default() -> Self {
+        Acc::Num {
+            weighted: 0.0,
+            raw_sum: 0.0,
+            count: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl Acc {
+    fn add(&mut self, raw: &CellValue, weighted: &CellValue) {
+        match raw {
+            CellValue::Numeric(r) => {
+                // `weighted` is the value after every dimension's weight was applied.
+                let w = match weighted {
+                    CellValue::Numeric(w) => *w,
+                    _ => *r,
+                };
+                match self {
+                    Acc::Num { weighted, raw_sum, count, min, max } => {
+                        *weighted += w;
+                        *raw_sum += r;
+                        *count += 1;
+                        *min = min.min(*r);
+                        *max = max.max(*r);
+                    }
+                    // A text cell seen earlier loses to numeric data for a measure.
+                    Acc::Text(_) => {
+                        *self = Acc::Num { weighted: w, raw_sum: *r, count: 1, min: *r, max: *r }
+                    }
+                }
+            }
+            // There is no math on text: the last value wins, as before.
+            CellValue::String(s) => *self = Acc::Text(s.clone()),
+        }
+    }
+
+    /// Renders the folded value.
+    ///
+    /// No cells => the engine's `-` marker, which the wire layer turns into JSON
+    /// `null`. Note this applies to SUM too: a measure with no cells in the group has
+    /// always been `-`, not `0`, and that stays true.
+    fn finish(&self, aggregation: Aggregation) -> String {
+        match self {
+            Acc::Text(s) => s.clone(),
+            Acc::Num { weighted, raw_sum, count, min, max } => {
+                if *count == 0 {
+                    return "-".to_string();
+                }
+                let value = match aggregation {
+                    Aggregation::Sum => *weighted,
+                    Aggregation::Count => *count as f64,
+                    Aggregation::Avg => raw_sum / *count as f64,
+                    Aggregation::Min => *min,
+                    Aggregation::Max => *max,
+                };
+                value.to_string()
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SliceQuery {
     pub output_columns: Vec<String>,      		// The exact order requested in SELECT
@@ -80,6 +162,10 @@ pub struct SliceQuery {
     // should display. Lets a hierarchy name (e.g. `Ops`) be used directly as a
     // SELECT axis while still reading the right dimension's value.
     pub column_dim_index: HashMap<String, usize>,
+    // How to fold each requested measure. Keyed by MEASURE name (not output column),
+    // so the same measure can appear under different labels. Absent => SUM, which
+    // keeps every pre-existing caller working unchanged.
+    pub aggregations: HashMap<String, Aggregation>,
 }
 
 /// A materialised result: column headers plus stringified rows.
@@ -532,12 +618,17 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
 
         let raw_data = self.store.scan_subcube(&scanner_filters);
 
-        // 3. Aggregate Results (Now using CellValue!)
-        let mut grouped_results: HashMap<Vec<u32>, HashMap<String, CellValue>> = HashMap::new();
+        // 3. Aggregate Results.
+        //
+        // One accumulator per (group, measure). It keeps the WEIGHTED sum for SUM and
+        // the RAW values for AVG/MIN/MAX, because the two answer different questions
+        // (see AGGREGATIONS-DESIGN.md §4, decision 2).
+        let mut grouped_results: HashMap<Vec<u32>, HashMap<String, Acc>> = HashMap::new();
         let measure_dim_idx = self.measure_dimension.as_ref()
             .and_then(|m| self.dimension_names.iter().position(|d| d == m));
 
                 for (coords, base_val) in raw_data {
+            let raw_val = base_val.clone(); // Before any weighting: what MIN/AVG see.
             let mut final_val = base_val.clone(); // Can be String or Numeric
                         let mut row_key = Vec::new();
             let mut current_measure_name = "value".to_string();
@@ -570,14 +661,12 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                 }
             }
 
-            // Accumulate (Add numbers, or just overwrite strings)
+            // Accumulate: numbers fold, strings overwrite (there is no math on text).
             let measure_map = grouped_results.entry(row_key).or_default();
-            let existing_val = measure_map.entry(current_measure_name).or_insert(CellValue::Numeric(0.0));
-            
-            match (existing_val, final_val) {
-                (CellValue::Numeric(existing), CellValue::Numeric(new)) => *existing += new,
-                (val, new) => *val = new, // If it's a string, just overwrite it (no math)
-            }
+            measure_map
+                .entry(current_measure_name)
+                .or_default()
+                .add(&raw_val, &final_val);
         }
 
         // 4. Format Output (Unchanged from before, because .to_string() handles the Display trait we just made!)
@@ -609,7 +698,7 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
         // not by its dimension index `i`. Using the dimension index would read
         // past the end of short keys and silently collapse every comparison to
         // Equal, leaving the (randomized) HashMap order intact.
-                let mut ordered: Vec<(Vec<u32>, HashMap<String, CellValue>)> =
+                let mut ordered: Vec<(Vec<u32>, HashMap<String, Acc>)> =
             grouped_results.into_iter().collect();
         ordered.sort_by(|(a, _), (b, _)| {
             for (slot, &i) in display_axis_indices.iter().enumerate() {
@@ -664,10 +753,14 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
                     let matched_val = query.requested_measures.iter().find(|m| m.eq_ignore_ascii_case(col));
                     let lookup_key = matched_val.unwrap_or(col);
                     
-                    if let Some(val) = measure_map.get(lookup_key) {
-                        final_row.push(val.to_string());
-                    } else {
-                        final_row.push("-".to_string());
+                    let aggregation = query
+                        .aggregations
+                        .get(lookup_key)
+                        .copied()
+                        .unwrap_or(Aggregation::Sum);
+                    match measure_map.get(lookup_key) {
+                        Some(acc) => final_row.push(acc.finish(aggregation)),
+                        None => final_row.push("-".to_string()),
                     }
                 } else {
                     // It's a Joined Attribute placeholder

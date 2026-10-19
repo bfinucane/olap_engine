@@ -1,0 +1,109 @@
+Running script 'aggregation_functions.sql'...
+> CREATE TABLE Sales (Geography STRING, Measure MEASURE)
+Cube 'Sales' created. Measure dimension: Measure
+
+> INSERT INTO Sales VALUES ('England', 'Sales', 100)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('France', 'Sales', 50)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Germany', 'Sales', 200)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('England', 'Cost', 40)
+Upserted 1 row(s) into 'Sales'.
+
+> .rollup Geography Europe England 1.0
+Rollup added.
+
+> .rollup Geography Europe France 1.0
+Rollup added.
+
+> .create_hierarchy Geography Weighted
+Hierarchy 'Weighted' created in dimension 'Geography'.
+
+> .rollup Weighted Half England 0.5
+Rollup added.
+
+> SELECT SUM(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+150
+
+
+> SELECT AVG(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+75
+
+
+> SELECT COUNT(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+2
+
+
+> SELECT MIN(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+50
+
+
+> SELECT MAX(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+100
+
+
+> SELECT SUM(Sales) FROM Sales WHERE Weighted = 'Half'
+Sales
+----------
+50
+
+
+> SELECT AVG(Sales) FROM Sales WHERE Weighted = 'Half'
+Sales
+----------
+100
+
+
+> SELECT COUNT(Sales) FROM Sales WHERE Weighted = 'Half'
+Sales
+----------
+1
+
+
+> SELECT SUM(Cost) FROM Sales WHERE Geography = 'Europe'
+Cost
+----------
+40
+
+
+> SELECT AVG(Cost) FROM Sales WHERE Geography = 'Europe'
+Cost
+----------
+40
+
+
+> SELECT COUNT(Cost) FROM Sales WHERE Geography = 'Europe'
+Cost
+----------
+1
+
+
+> SELECT AVG(Cost) FROM Sales WHERE Geography = 'Germany'
+Cost
+----------
+-
+
+
+> SELECT COUNT(Cost) FROM Sales WHERE Geography = 'Germany'
+Cost
+----------
+-
+
+
+> SELECT MEDIAN(Sales) FROM Sales WHERE Geography = 'Europe'
+Error: 'MEDIAN' is not a supported aggregation (implemented: SUM, AVG, COUNT, MIN, MAX).
+

@@ -2,5 +2,6 @@
 // the rationale behind this deliberate `module_inception`).
 #[allow(clippy::module_inception)]
 pub mod cube;
+pub mod aggregation;
 pub mod node;
 // query.rs is no longer needed/used in this design

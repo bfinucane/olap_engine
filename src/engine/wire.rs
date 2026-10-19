@@ -358,9 +358,17 @@ fn build_query_response(
                 .zip(headers.iter())
                 .map(|(cell, header)| {
                     if is_measure(header) {
-                        match cell.parse::<f64>() {
-                            Ok(n) => json!(bounded_precision(n)),
-                            Err(_) => json!(cell),
+                        // The engine's "no data" marker is "-" (query_slice emits it for a
+                        // measure with no cells in the group). On the wire that is `null`:
+                        // a missing average is not the string "-", and a client should not
+                        // have to know the engine's internal placeholder.
+                        if cell == "-" {
+                            Value::Null
+                        } else {
+                            match cell.parse::<f64>() {
+                                Ok(n) => json!(bounded_precision(n)),
+                                Err(_) => json!(cell),
+                            }
                         }
                     } else if is_join_attribute(header) && cell.is_empty() {
                         Value::Null

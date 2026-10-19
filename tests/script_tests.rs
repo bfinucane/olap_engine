@@ -46,6 +46,9 @@ const EXPECT_FAILURE: &[&str] = &[
     "delete_member",
     "join",
     "import_missing_file",
+    // Ends on the MEDIAN refusal on purpose: the fixture documents that an
+    // unimplemented aggregation is a clear error, not a silent SUM.
+    "aggregation_functions",
 ];
 
 /// True when the caller asked us to (re)write golden files instead of comparing.

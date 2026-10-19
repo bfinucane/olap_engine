@@ -1,4 +1,4 @@
-use sqlparser::ast::{Expr, SetExpr, Statement, BinaryOperator, JoinConstraint, JoinOperator};
+use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, BinaryOperator, JoinConstraint, JoinOperator};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap; 
@@ -213,6 +213,10 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 let mut axes = Vec::new();
                 let mut requested_measures = Vec::new();
                 let mut requested_attributes = Vec::new(); // NEW: Track attribute columns
+                // How each measure folds. Absent => SUM, so a plain `SELECT Sales`
+                // keeps its existing meaning.
+                let mut aggregations: HashMap<String, crate::cube::aggregation::Aggregation> =
+                    HashMap::new();
                 let mut measure_dim_requested = false;
                 // Output column -> the cube dimension it reads its member from.
                 // Usually the dimension of the same name; a HIERARCHY name maps to
@@ -224,6 +228,84 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                                 let p_m_dim = primary_cube.measure_dimension.clone();
 
                 for proj in &select.projection {
+                    // --- Aggregate function: SUM/AVG/COUNT/MIN/MAX over a measure ---
+                    //
+                    // Handled BEFORE the name-based branches, because
+                    // `proj.to_string()` is "AVG(Sales)" — not a column name — and
+                    // taking it literally would report a confusing "Column
+                    // 'AVG(Sales)' not found".
+                    //
+                    // The output column is named after the MEASURE (so
+                    // `SELECT Region, AVG(Sales)` yields columns Region, Sales),
+                    // matching how a bare `SELECT Sales` already behaves. Two
+                    // aggregations of the same measure in one statement would collide;
+                    // that needs a column-mapping feature, not a silent one.
+                    if let SelectItem::UnnamedExpr(Expr::Function(func)) = proj {
+                        // An unimplemented aggregation is reported AS SUCH, not as a
+                        // missing column: `MEDIAN(Sales)` is a real request the engine
+                        // cannot answer, and "Column 'MEDIAN(Sales)' not found" sends the
+                        // reader looking in the wrong place.
+                        let Some(aggregation) =
+                            crate::cube::aggregation::Aggregation::parse(&func.name.to_string())
+                        else {
+                            return Err(format!(
+                                "'{}' is not a supported aggregation (implemented: {}).",
+                                func.name,
+                                crate::cube::aggregation::Aggregation::implemented().join(", ")
+                            ));
+                        };
+                        // sqlparser 0.43 wraps the argument: FunctionArg::Unnamed(
+                        // FunctionArgExpr::Expr(_)). Accept a bare or qualified column.
+                        let arg = match func.args.first() {
+                            Some(sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
+                            )) => id.value.clone(),
+                            Some(sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts)),
+                            )) => parts.last().map(|p| p.value.clone()).unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        if arg.is_empty() {
+                            return Err(format!(
+                                "{}(...) needs a single column argument, e.g. {}(Sales).",
+                                func.name, func.name
+                            ));
+                        }
+
+                        let official = if let Some(m_dim) = &p_m_dim {
+                            let dim_idx = primary_cube
+                                .dimension_names
+                                .iter()
+                                .position(|n| n == m_dim)
+                                .ok_or_else(|| {
+                                    format!("Measure dimension '{}' is missing from the cube.", m_dim)
+                                })?;
+                            let dim = primary_cube.dimensions[dim_idx].read().unwrap();
+                            let id = dim.get_id(&arg).ok_or_else(|| {
+                                format!(
+                                    "{}: '{}' is not a measure of '{}'.",
+                                    func.name, arg, primary_cube_name
+                                )
+                            })?;
+                            dim.get_name(id)
+                        } else if arg.eq_ignore_ascii_case("value") {
+                            // A measure-less cube's implicit measure.
+                            "value".to_string()
+                        } else {
+                            return Err(format!(
+                                "{}: '{}' has no measure dimension, so only value can be aggregated.",
+                                func.name, primary_cube_name
+                            ));
+                        };
+
+                        if !requested_measures.contains(&official) {
+                            requested_measures.push(official.clone());
+                        }
+                        aggregations.insert(official.clone(), aggregation);
+                        output_columns.push(official);
+                        continue;
+                    }
+
                     let col_raw = proj.to_string();
                     let col_name = col_raw.split('.').next_back().unwrap().trim().to_string();
 
@@ -382,6 +464,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     filters,
                     axis_hierarchies,
                     column_dim_index,
+                    aggregations,
                 };
                 
                 let mut result_set = primary_cube.query_slice(&slice_query)?;

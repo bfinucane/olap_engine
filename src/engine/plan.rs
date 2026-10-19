@@ -383,17 +383,17 @@ impl Default for Capabilities {
             // coordinate and a consolidation is a weighted sum, so SUM is the
             // aggregation the engine actually implements. `execute_plan` refuses
             // anything else with `unsupported_aggregation` rather than silently
-            // returning a sum under a different label — advertising AVG here while
-            // computing SUM produced a confident `AVG(Sales)` pill over a sum.
+            // Advertise exactly what `Aggregation` can compute, in both directions:
+            // `execute_plan` refuses anything outside this list rather than returning
+            // a sum under a different label.
             //
-            // Non-additive aggregations (AVG/MIN/MAX/COUNT/COUNTD) are wanted but
-            // need decisions first: whether empty cells count, and how to count
-            // non-empty cells without a full scan per group. Advertise and accept
-            // them when those are settled, in this list AND in the refusal below.
-            aggregations: ["SUM"].into_iter().map(str::to_string).collect(),
-            // COUNTD is exact *if* it is ever implemented: the engine can count
-            // distinct stored values. Moot while COUNTD is not advertised.
-            count_distinct_exact: true,
+            // Semantics (AGGREGATIONS-DESIGN.md §4): empty cells are never counted;
+            // non-additive aggregations use the BASE leaf value and ignore rollup
+            // weights, so on a ragged hierarchy `AVG != SUM / COUNT` by design.
+            aggregations: crate::cube::aggregation::Aggregation::implemented(),
+            // COUNTD is NOT implemented, so the engine must not claim an exact distinct
+            // count. `false` means "do not label it exact" in the client.
+            count_distinct_exact: false,
             // What the engine actually honours today (dimension scope only).
             filter_operators: ["in", "equals", "notEquals"]
                 .into_iter()
@@ -530,17 +530,17 @@ pub fn execute_plan(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult
             )));
         }
 
-        // ONLY additive SUM is implemented (see Capabilities::default). Refuse
-        // anything else BEFORE any work is done: the engine's storage is a
-        // weighted sum, so AVG/MIN/MAX/COUNT/COUNTD would come back as a SUM
-        // wearing the requested label — a plausible wrong number, which is the
-        // failure mode ENGINE-PROTOCOL.md exists to prevent. An absent
+        // Parse the requested aggregation and REFUSE anything the engine cannot
+        // honestly compute. Never substitute SUM for another label: a plausible wrong
+        // number is the failure mode ENGINE-PROTOCOL.md exists to prevent. An absent
         // `aggregation` means SUM, matching the client's default.
         let aggregation = m.aggregation.as_deref().unwrap_or("SUM");
-        if !aggregation.eq_ignore_ascii_case("SUM") {
+        if crate::cube::aggregation::Aggregation::parse(aggregation).is_none() {
             return Err(PlanError::UnsupportedAggregation(format!(
-                "'{}' on '{}' (only additive SUM is implemented; see capabilities.aggregations)",
-                aggregation, m.name
+                "'{}' on '{}' (implemented: {}; see capabilities.aggregations)",
+                aggregation,
+                m.name,
+                crate::cube::aggregation::Aggregation::implemented().join(", ")
             )));
         }
     }
@@ -737,6 +737,19 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
         output_columns.push("value".to_string());
     }
 
+    // How each measure folds. An absent entry means SUM, so a caller that predates
+    // aggregation support is unaffected.
+    let mut aggregations: HashMap<String, crate::cube::aggregation::Aggregation> = HashMap::new();
+    for m in &plan.measures {
+        if let Some(agg) = m
+            .aggregation
+            .as_deref()
+            .and_then(crate::cube::aggregation::Aggregation::parse)
+        {
+            aggregations.insert(m.name.clone(), agg);
+        }
+    }
+
     Ok(SliceQuery {
         output_columns,
         axes,
@@ -744,6 +757,7 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
         filters,
         axis_hierarchies,
         column_dim_index,
+        aggregations,
     })
 }
 

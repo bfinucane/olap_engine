@@ -164,7 +164,12 @@ fn capabilities_section4_keys_and_honest_declarations() {
     assert_eq!(v["supportsLod"], json!(false), "LOD must not be claimed");
     assert_eq!(v["supportsJoin"], json!(true), "attribute joins are implemented");
     assert_eq!(v["supportsInlineDomain"], json!(true));
-    assert_eq!(v["countDistinctExact"], json!(true));
+    // COUNTD is not implemented, so the engine must not claim an exact distinct count.
+    assert_eq!(
+        v["countDistinctExact"],
+        json!(false),
+        "COUNTD does not exist, so an exact distinct count cannot be claimed"
+    );
     assert_eq!(v["maxRows"], json!(100_000));
     assert!(
         v["expressionFunctions"].as_array().unwrap().is_empty(),
@@ -187,8 +192,15 @@ fn capabilities_aggregations_match_what_actually_runs() {
     let caps = wire::capabilities();
 
     // `Sales` filtered to Widget has one leaf per region: West = 200.
-    // SUM is 200; any correct future non-additive aggregation also has one leaf to
-    // work on here, which is why this fixture is used rather than a multi-leaf group.
+    // Every advertised aggregation must run without error; a single-leaf group makes
+    // each one's expected value unambiguous except COUNT, which counts the leaf.
+    let expected: &[(&str, f64)] = &[
+        ("SUM", 200.0),
+        ("AVG", 200.0),
+        ("COUNT", 1.0),
+        ("MIN", 200.0),
+        ("MAX", 200.0),
+    ];
     for agg in &caps.aggregations {
         let mut p = request("Sales");
         by_region(&mut p);
@@ -207,16 +219,21 @@ fn capabilities_aggregations_match_what_actually_runs() {
             .iter()
             .find(|r| r.first() == Some(&json!("West")))
             .unwrap_or_else(|| panic!("no West row for {agg}: {:?}", resp.rows));
+        let want = expected
+            .iter()
+            .find(|(name, _)| name == agg)
+            .unwrap_or_else(|| panic!("no expectation recorded for advertised {agg}"));
         assert_eq!(
             west[1].as_f64(),
-            Some(200.0),
-            "advertised aggregation {agg} must compute the single-leaf value 200"
+            Some(want.1),
+            "advertised aggregation {agg} must compute {} on a single-leaf group",
+            want.1
         );
     }
 
     // The converse: every aggregation the protocol names but this engine does not
     // advertise must be REFUSED, never silently answered.
-    for agg in ["AVG", "MEDIAN", "MIN", "MAX", "COUNT", "COUNTD", "STDEV", "VAR", "ATTR"] {
+    for agg in ["MEDIAN", "COUNTD", "STDEV", "VAR", "ATTR"] {
         assert!(
             !caps.aggregations.iter().any(|a| a == agg),
             "{agg} is not implemented, so it must not be advertised"
@@ -229,11 +246,12 @@ fn capabilities_aggregations_match_what_actually_runs() {
         assert_eq!(err.code, "unsupported_aggregation");
     }
 
-    // And it is additive-only today, which is a deliberate position:
+    // The advertisement is exact: if this list grows, `execute_plan` must grow with
+    // it, and `Aggregation::implemented()` is the single place both read from.
     assert_eq!(
         caps.aggregations,
-        vec!["SUM".to_string()],
-        "if this list grows, the refusal list in execute_plan must grow with it"
+        vec!["SUM", "AVG", "COUNT", "MIN", "MAX"],
+        "capabilities must advertise exactly what runs"
     );
 }
 
@@ -1005,40 +1023,51 @@ fn query_truncated_is_true_only_when_rows_were_actually_cut() {
 /// §3 lists `SUM | AVG | MEDIAN | MIN | MAX | COUNT | COUNTD | STDEV | VAR | ATTR`
 /// and tells the engine to disable the rest via `capabilities.aggregations`.
 ///
-/// The engine is ADDITIVE-ONLY by design (Infor-OLAP storage: a measure is a
-/// weighted sum at each leaf, and a consolidation is a weighted sum of leaves).
-/// So the contract is:
+/// The engine now computes `SUM`, `AVG`, `COUNT`, `MIN`, `MAX` (see
+/// AGGREGATIONS-DESIGN.md). This test pins what each of them actually returns over
+/// the SAME four cells, which is the only way to catch an aggregation that answers
+/// with a sum under the wrong label:
 ///
-///   * `SUM` (or an absent aggregation, the client default) computes the sum;
-///   * anything else is refused with `unsupported_aggregation` BEFORE any work,
-///     because returning a sum under an `AVG(Sales)` label is a plausible wrong
-///     number the client cannot detect.
+///   Sales cells: East/Widget 100, East/Gadget 50, West/Widget 200, West/Gadget 25
+///   SUM 375, COUNT 4, AVG 93.75, MIN 25, MAX 200
 ///
-/// This test used to characterise the opposite behaviour — every aggregation
-/// computed SUM silently. Non-additive aggregations are wanted; they need a
-/// decision on whether empty cells count, so they are refused until then.
+/// Everything else stays a typed client error, never a silent sum.
 #[test]
-fn query_refuses_non_additive_aggregations() {
+fn query_computes_the_advertised_aggregations_and_refuses_the_rest() {
     let mut catalog = build_catalog();
 
-    // SUM, and the absent-aggregation default, both compute the real total:
-    // East 150 + West 225 = 375.
-    for agg in [Some("SUM"), Some("sum"), None] {
+    // (aggregation, expected value over the four Sales cells above)
+    for (agg, expected) in [
+        ("SUM", 375.0),
+        ("sum", 375.0),
+        ("COUNT", 4.0),
+        ("AVG", 93.75),
+        ("MIN", 25.0),
+        ("MAX", 200.0),
+    ] {
         let mut p = request("Sales");
         p.measures.push(
-            serde_json::from_value(match agg {
-                Some(a) => json!({ "name": "Sales", "aggregation": a }),
-                None => json!({ "name": "Sales" }),
-            })
-            .expect("Measure"),
+            serde_json::from_value(json!({ "name": "Sales", "aggregation": agg }))
+                .expect("Measure"),
         );
         let resp = wire::query(&mut catalog, &p)
-            .unwrap_or_else(|e| panic!("{agg:?}: {e:?}"));
-        assert_eq!(resp.rows[0][0], json!(375.0), "{agg:?} is additive: real sum");
+            .unwrap_or_else(|e| panic!("{agg}: {e:?}"));
+        assert_eq!(
+            resp.rows[0][0],
+            json!(expected),
+            "{agg} over [100, 50, 200, 25] must be {expected}"
+        );
     }
 
-    // Everything else is a typed client error, never a silent sum.
-    for agg in ["AVG", "MIN", "MAX", "COUNT", "COUNTD", "MEDIAN", "STDEV", "VAR", "ATTR"] {
+    // An absent aggregation means SUM (the client's default).
+    let mut p = request("Sales");
+    measure(&mut p, "Sales", "SUM");
+    p.measures[0].aggregation = None;
+    let resp = wire::query(&mut catalog, &p).expect("default aggregation");
+    assert_eq!(resp.rows[0][0], json!(375.0), "absent aggregation means SUM");
+
+    // Everything the engine cannot honestly compute is refused, before any work.
+    for agg in ["COUNTD", "MEDIAN", "STDEV", "VAR", "ATTR", "NOT_A_REAL_AGGREGATION"] {
         let mut p = request("Sales");
         measure(&mut p, "Sales", agg);
         let err = wire::query(&mut catalog, &p)
@@ -1053,16 +1082,65 @@ fn query_refuses_non_additive_aggregations() {
         );
     }
 
-    // An aggregation the protocol does not define is refused identically.
-    let mut p = request("Sales");
-    measure(&mut p, "Sales", "NOT_A_REAL_AGGREGATION");
+    // And the advertisement agrees with that refusal, exactly.
     assert_eq!(
-        wire::query(&mut catalog, &p).err().map(|e| e.code),
-        Some("unsupported_aggregation")
+        wire::capabilities().aggregations,
+        vec!["SUM", "AVG", "COUNT", "MIN", "MAX"],
+        "capabilities must advertise exactly what runs"
+    );
+}
+
+/// A measure with NO cells in a group is absent, and absence travels as `null`.
+///
+/// This is the wire half of the empty-cell decision: the engine marks a missing
+/// measure `-`, which is its internal "no data" convention, and the transport must
+/// not hand that dash to a client as if it were a value.
+#[test]
+fn a_measure_with_no_cells_in_a_group_is_null() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Sparse", &["Region", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog.get_cube_mut("Sparse").expect("Sparse");
+        cube.write(&["East", "Sales"], CellValue::Numeric(100.0)).expect("write");
+        cube.write(&["West", "Cost"], CellValue::Numeric(80.0)).expect("write");
+    }
+
+    // Both measures requested: East has no Cost, West has no Sales.
+    let mut p = request("Sparse");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    measure(&mut p, "Cost", "SUM");
+    let resp = wire::query(&mut catalog, &p).expect("query");
+
+    assert_eq!(resp.columns, vec!["Region", "Sales", "Cost"]);
+    assert_eq!(
+        resp.rows[0],
+        vec![json!("East"), json!(100.0), Value::Null],
+        "East has no Cost cell, so it is null - not \"-\" and not 0"
+    );
+    assert_eq!(
+        resp.rows[1],
+        vec![json!("West"), Value::Null, json!(80.0)],
+        "West has no Sales cell"
     );
 
-    // And the advertisement matches: SUM only.
-    assert_eq!(wire::capabilities().aggregations, vec!["SUM".to_string()]);
+    // The same absence under a non-additive aggregation, where 0 would be a lie:
+    // there is no average of zero cells.
+    let mut p2 = request("Sparse");
+    by_region(&mut p2);
+    measure(&mut p2, "Cost", "AVG");
+    let resp2 = wire::query(&mut catalog, &p2).expect("avg query");
+    assert_eq!(resp2.rows[0][1], Value::Null, "no average exists for East/Cost");
+    assert_eq!(resp2.rows[1][1], json!(80.0), "West/Cost averages to its one cell");
+
+    // COUNT of an absent measure is also null, not 0: the group has no data at all,
+    // which is different from "counted and found empty".
+    let mut p3 = request("Sparse");
+    by_region(&mut p3);
+    measure(&mut p3, "Cost", "COUNT");
+    let resp3 = wire::query(&mut catalog, &p3).expect("count query");
+    assert_eq!(resp3.rows[0][1], Value::Null, "East/Cost has no cells to count");
+    assert_eq!(resp3.rows[1][1], json!(1.0), "West/Cost has one cell");
 }
 
 /// §3 `orderBy.output` is an OUTPUT column name, and an unknown one must be
