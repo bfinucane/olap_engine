@@ -53,6 +53,16 @@ impl VersionStore {
         self.version.load(Ordering::Acquire)
     }
 
+    /// Publishes a new version WITHOUT writing a cell.
+    ///
+    /// For STRUCTURAL changes: a hierarchy edit alters what an aggregate MEANS while
+    /// the stored values stay put, so nothing would otherwise invalidate a cached
+    /// total. Bumping the version discards those entries lazily, exactly as a write
+    /// does — without this, a cached aggregate survived a `.rollup`.
+    pub fn bump_version(&self) {
+        self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// A point-in-time snapshot, O(1): one `Arc` bump inside the store.
     pub fn snapshot(&self) -> SparseStore {
         self.read().snapshot()

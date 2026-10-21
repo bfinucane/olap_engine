@@ -109,6 +109,13 @@ impl Catalog {
             cubes: HashMap::new(),
         }
     }
+	/// Invalidates every cube's cached aggregates after a STRUCTURAL change.
+	///
+	/// Structural edits (`.rollup`, `.detach`, `.create_hierarchy`, `.delete_member`,
+	/// `.order`) are made directly on a shared `Dimension`, so the catalog does not
+	/// cheaply know which cubes reference it. Bumping every cube's version is
+	/// conservative and correct: structural changes are rare, admin-time operations,
+	/// and the alternative — a stale aggregate — is a wrong number with no error.
 	pub fn clear_all_caches(&mut self) {
         for cube in self.cubes.values_mut() {
             cube.clear_cache();

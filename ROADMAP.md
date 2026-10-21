@@ -266,32 +266,43 @@ This is a multi-phase project of its own, not "a next step."
 
 ---
 
-## Immediate next step
+## Where things stand
 
-**Phase 1b — the versioned (MVCC) storage engine.** Phase 1a (durable
-persistence) has landed: saves are atomic and non-destructive, the on-disk
-format is versioned and self-identifying, errors are typed, and a save → load
-round-trip is covered by a permanent integration test. Those guarantees are
-correct regardless of what 1b becomes, so no 1a work is thrown away.
+**Phase 1b — the versioned (MVCC) storage engine — is largely landed.**
 
-1b is the larger architectural commitment and the true source of concurrent
-isolation. It is scoped as its own phase, with an explicit
-**measure-before-committing** gate on memory churn. Before implementation
-begins, one design choice must be settled:
+* **M1** the trie is persistent (`Arc<Node>`, path-copy writes). `snapshot()` is O(1).
+* **M2** `Cube` holds a `VersionStore`: a version that advances on write and a
+  version-tagged cache. The four global `query_cache.clear()` calls are gone.
+* **M3** the server's catalog-wide `Mutex` is gone. Reads take a snapshot and never
+  block a writer; `Cube` is `Sync`.
+* **M4** (structural dimension changes versioned) is **deferred**. It protects a pinned
+  reader from a concurrent hierarchy edit, and no mutation surface exists that could
+  perform one concurrently — the server has no write endpoint, and the CLI mutates
+  single-threaded. The part of M4 that has value today landed anyway: structural
+  changes now bump every cube's version, so a cached aggregate cannot survive a
+  `.rollup` (`versioning_tests::a_structural_change_invalidates_cached_aggregations`).
 
-* **Version model as the storage engine itself** (MVCC directly over the
-  Patricia trie), versus a **versioned layer on top of an otherwise-mutable
-  store**. The former is the cleaner fit for an immutable trie and matches the
-  Infor model most faithfully; the latter is a smaller, more reversible first
-  slice. See Phase 1b above for the trade-offs.
+The measure-before-committing gate was honoured: `bench_mvcc` measured the old store
+first, the first gate FAILED, and the cost was re-derived and **accepted explicitly**
+(writes 2.7 KB / 2.8 µs, scans +33%/+20%) on the property that matters — per-write cost
+is bounded by fan-out, not by cube size. Details in `PHASE-1B-DESIGN.md`.
 
-Two further questions to resolve as part of that decision:
+**The open work is no longer 1b.** In rough order of value:
 
-1. **Snapshot granularity** — a single top-level catalog lock vs. per-dimension
-   locking for capturing a version.
-2. **Migration strategy** — hard-fail on an unknown format version for now
-   (simplest, already implemented as `UnsupportedVersion`) vs. building a
-   migration framework immediately.
+1. **COUNTD / MEDIAN / STDEV / VAR** — unadvertised, so honest; `countDistinctExact` is
+   `false` because there is no exact distinct count.
+2. **Dense (period) average** — "average per month" must divide by periods, not by
+   non-empty cells. Design and open questions in `AGGREGATIONS-DESIGN.md` §8–8b
+   (per-dimension denominator rules).
+3. **SQL `ORDER BY`** — the `order` fixture is in `EXPECT_FAILURE`; `LIMIT`/`OFFSET` work.
+4. **A write endpoint over HTTP** — needed before concurrent writers, and the reason M4
+   can wait.
+5. **LOD expressions** — `supportsLod` is `false`; LOD is a second query, not an expression.
+6. **Richer calculated fields** — the evaluator handles arithmetic, comparisons, `IF`,
+   `ZN`, `IFNULL` and aggregates; string/date functions and `CASE` are not implemented.
+
+Client-facing changes are tracked in `WIRE-CHANGES.md`, which is the file the Plateau
+session reads first.
 
 ---
 
@@ -300,8 +311,11 @@ Two further questions to resolve as part of that decision:
 | Phase | Theme | Depends on | Status |
 |------:|---------------------------------------|------------|-------------|
 | 1a | Durable persistence (atomic save) | — | **Done** |
-| 1b | Versioned/MVCC storage engine | 1a | Not started |
-| 1c | Protocol + server/client split | 1a, 1b | Not started |
+| 1b | Versioned/MVCC storage engine | 1a | **M1–M3 done**; M4 deferred — it protects a race that needs a mutation surface which does not exist yet |
+| 1c | Protocol + server/client split | 1a, 1b | **Done for reads**: protocol v1, HTTP server, Plateau client. No write endpoint, deliberately |
 | 2 | Users, security, access limits | 1c | Not started |
-| 3 | Calculations | 1c, 2 | Not started |
+| 3 | Calculations | 1c, 2 | **In part**: SUM/AVG/COUNT/MIN/MAX, calculated fields over the client's AST, `ZN`/`IFNULL`. Open: COUNTD, MEDIAN, STDEV, VAR, dense average, LOD |
 | 4 | Multidimensional syntax (MDX) | 1c, 2, 3 | Not started |
+
+Statuses here lag the code when a phase lands mid-session; `WIRE-CHANGES.md` is the
+client-facing record, and `git log` is the truth.

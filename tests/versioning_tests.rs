@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use olap_engine::catalog::catalog::Catalog;
 use olap_engine::cube::cube::Cube;
 use olap_engine::cube::node::CellValue;
 use olap_engine::dimension::dimension::Dimension;
@@ -109,4 +110,54 @@ fn a_cloned_cube_writes_independently() {
         "writing to a clone must not change the original"
     );
     assert_eq!(copy.query_consolidated(&["East"]), 500.0);
+}
+
+/// A STRUCTURAL change (no cell written) must invalidate cached aggregates.
+///
+/// Regression test for the defect M2 introduced: the cache became version-tagged and
+/// `clear_cache` became a no-op, so a `.rollup` could leave a stale total in place.
+/// Nothing is written between the two queries below - only the hierarchy changes - so
+/// a version bump is the only thing that can catch it.
+#[test]
+fn a_structural_change_invalidates_cached_aggregates() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Sales", &["Region", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog.get_cube_mut("Sales").expect("Sales");
+        for (region, value) in [("East", 10.0), ("West", 20.0), ("North", 5.0)] {
+            cube.write(&[region, "Sales"], CellValue::Numeric(value))
+                .expect("write");
+        }
+    }
+
+    catalog.create_hierarchy("Region", "All").expect("hierarchy");
+    {
+        let dim = catalog.get_dimension("Region").expect("Region");
+        let mut d = dim.write().expect("lock");
+        d.add_component_in(Some("All"), "All", "East", 1.0).expect("link East");
+        d.add_component_in(Some("All"), "All", "West", 1.0).expect("link West");
+    }
+    catalog.clear_all_caches();
+
+    let first = catalog
+        .get_cube("Sales")
+        .expect("cube")
+        .query_consolidated(&["All:All", "Sales"]);
+    assert_eq!(first, 30.0, "East 10 + West 20");
+
+    {
+        let dim = catalog.get_dimension("Region").expect("Region");
+        let mut d = dim.write().expect("lock");
+        d.add_component_in(Some("All"), "All", "North", 1.0).expect("link North");
+    }
+    catalog.clear_all_caches();
+
+    let second = catalog
+        .get_cube("Sales")
+        .expect("cube")
+        .query_consolidated(&["All:All", "Sales"]);
+    assert_eq!(
+        second, 35.0,
+        "the cached 30 must not survive a rollup that adds North (5)"
+    );
 }

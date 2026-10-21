@@ -224,7 +224,7 @@ Infor cared about), not micro-tuning.
 | M1b | the §7 gate, measured on the new store | **done** — failed at first, then re-derived and accepted (§7) |
 | M2 | `VersionStore` in `Cube`: version id, snapshot reads, version-tagged cache replacing the four `clear()` calls | **done** — `tests/versioning_tests.rs` (5): version advances per write; a snapshot read survives a later write; the cache is reused within a version and dropped after a write; a stale-tagged put is refused; a cloned cube writes independently |
 | M3 | server drops the catalog `Mutex` | **done** — `serve.rs` holds `Arc<Catalog>`, the plan/wire read paths take `&Catalog`, and `tests/concurrency_tests.rs` (rewritten: its old "absence" test said to replace it when 1b landed) proves one writer over 400 versions against 4 concurrent readers with no torn read, plus a pinned snapshot surviving a writer; `serve_http_tests::concurrent_requests_are_all_served_consistently` fires 8×10 describe+query requests |
-| M4 | structural dimension changes clone the dimension and bump the version | not started |
+| M4 | structural dimension changes clone the dimension and bump the version | **DEFERRED (2026-10)** — it protects a pinned reader from a *concurrent* hierarchy edit, and nothing can edit a hierarchy concurrently today: the server has no mutation endpoint and the CLI mutates single-threaded. The part with value now landed separately: structural changes bump every cube's version, so a cached aggregate cannot survive a `.rollup` (`versioning_tests::a_structural_change_invalidates_cached_aggregations`). Revisit when a write/mutation surface exists. |
 
 Each milestone leaves the suite green. M3 is where the coarse lock actually went away; M2
 only made the read path capable of not needing it.

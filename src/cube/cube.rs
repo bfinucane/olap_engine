@@ -497,10 +497,15 @@ fn calculate_jit(
         sum
     }
 	
+	/// Invalidates cached aggregates after a STRUCTURAL change.
+	///
+	/// A version-tagged cache normally invalidates itself when a write bumps the
+	/// version. Structural changes — a new hierarchy, a new parent/child link, a
+	/// reordered member — change what an aggregate MEANS without writing a cell, so
+	/// they must bump the version explicitly. Before this, `clear_cache` was a no-op
+	/// and a cached total survived a `.rollup`.
 	pub fn clear_cache(&mut self) {
-        // The cache is version-tagged now; clearing it is a no-op unless a caller
-        // needs the memory back. Kept for API compatibility.
-        let _ = self.store.cached_len();
+        self.store.bump_version();
     }
 	/// Streams data from a CSV file directly into the Cube.
 	/// Assumes the CSV columns exactly match the Dimension order, 
