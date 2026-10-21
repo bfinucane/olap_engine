@@ -332,7 +332,15 @@ fn route(
     // machine rewrite the catalogue. The CLI keeps that power.
     if path == "/v1/sql" {
         if req.method != "POST" {
-            return Err(method_not_allowed("POST"));
+            // A browser hitting this URL is almost certainly looking for the console
+            // page, which lives at /sql. "Method not allowed; use POST." is true and
+            // useless; say what to do instead.
+            return Err(WireError {
+                code: "invalid_argument",
+                message: "This is the SQL JSON endpoint: POST {\"sql\": \"SELECT ...\"}. \
+                          For the browser console, open /sql instead."
+                    .to_string(),
+            });
         }
         let body: SqlRequest = serde_json::from_slice(&req.body).map_err(|e| WireError {
             code: "invalid_argument",
@@ -360,6 +368,16 @@ fn route(
                 "elapsedMs": started.elapsed().as_millis() as u64,
             }),
         ));
+    }
+
+    // POST (or anything but GET) to the page's own URL: same confusion, other way.
+    if path == "/sql" {
+        return Err(WireError {
+            code: "invalid_argument",
+            message: "The SQL console PAGE is GET /sql. To run a query programmatically, \
+                      POST {\"sql\": \"SELECT ...\"} to /v1/sql."
+                .to_string(),
+        });
     }
 
     // Everything else is under /v1/{dataset}[/sample|/query].

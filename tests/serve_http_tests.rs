@@ -702,6 +702,31 @@ fn concurrent_requests_are_all_served_consistently() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn the_two_sql_urls_point_at_each_other_when_used_wrongly() {
+    // This is the mistake a browser makes: /v1/sql is the JSON endpoint, /sql is the
+    // page. Both wrong-method answers must send the reader to the other URL, because
+    // "Method not allowed; use POST." is true and useless.
+    let srv = server();
+
+    let api = get(&format!("{}/v1/sql", srv.base));
+    assert_eq!(api.status, 400, "GET on the POST endpoint");
+    assert_eq!(api.code(), "invalid_argument");
+    assert!(
+        api.body.contains("/sql"),
+        "the API's wrong-method answer must point at the page: {}",
+        api.body
+    );
+
+    let page = post_json(&format!("{}/sql", srv.base), r#"{"sql":"SELECT 1"}"#);
+    assert_eq!(page.status, 400, "POST on the page URL");
+    assert!(
+        page.body.contains("/v1/sql"),
+        "the page's wrong-method answer must point at the endpoint: {}",
+        page.body
+    );
+}
+
+#[test]
 fn get_sql_serves_the_console_page() {
     let srv = server();
     let resp = get(&format!("{}/sql", srv.base));
