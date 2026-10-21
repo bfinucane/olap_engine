@@ -1,5 +1,10 @@
 # Handover: attribute joins, engine → Plateau
 
+> **Read `WIRE-CHANGES.md` first.** It is the index and changelog for the whole wire
+> contract; this document is the join chapter of it. Since the join work landed, the
+> engine also added four aggregations, changed `countDistinctExact` to `false`, began
+> sending `null` for absent measure cells, and now evaluates calculated fields.
+
 **Status:** implemented in the engine and pushed. Nothing is needed from the engine side to
 start; this document is the whole contract.
 **Engine commit:** `115d063` (or later). If `GET /v1/capabilities` does not contain
