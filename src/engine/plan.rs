@@ -677,6 +677,13 @@ fn resolve_expression<'a>(
 /// Without this, a typo would silently aggregate nothing and yield an absent column —
 /// the "confident absence" failure mode, which reads like real data.
 fn assert_is_measure(cube: &crate::cube::cube::Cube, field: &str) -> Result<(), PlanError> {
+    // A MEASURE-LESS cube has exactly one implicit measure, `value`, which is not a
+    // member of any measure dimension and so cannot be checked that way. It is
+    // addressable from a plain measure AND from inside an expression — the two paths
+    // must agree, or `SUM(value) * 2` fails where `value` alone works.
+    if cube.measure_dimension.is_none() && field.eq_ignore_ascii_case("value") {
+        return Ok(());
+    }
     let Some(measure_dim) = &cube.measure_dimension else {
         return Err(PlanError::InvalidArgument(format!(
             "'{}' cannot be aggregated: cube '{}' has no measure dimension",
@@ -892,13 +899,9 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
                 }
             }
         } else {
-            // A MEASURE-LESS cube's implicit measure is addressed as `value`; it is not
-            // a member of any measure dimension, so it cannot be checked that way.
-            let implicit_value =
-                cube.measure_dimension.is_none() && m.name.eq_ignore_ascii_case("value");
-            if !implicit_value {
-                assert_is_measure(cube, &m.name)?;
-            }
+            // The measure-less `value` exemption lives in `assert_is_measure`, so the
+            // plain path and the expression path cannot disagree about it.
+            assert_is_measure(cube, &m.name)?;
             let aggregation = m.aggregation.as_deref().unwrap_or("SUM");
             if let Some(parsed) = crate::cube::aggregation::Aggregation::parse(aggregation) {
                 record_slot(&mut aggregations, &m.name, parsed)?;
@@ -1282,5 +1285,48 @@ mod calculated_field_tests {
         // the engine simply cannot evaluate two aggregations of one field yet.
         assert_eq!(err.code(), "unsupported_expression");
         assert!(err.to_string().contains("one aggregation per field"), "{err}");
+    }
+}
+#[cfg(test)]
+mod measure_less_calc_tests {
+    //! A measure-less cube addresses its only measure as `value`. The plain path
+    //! exempted it; the expression path must too, or `SUM(value) * 2` fails where
+    //! `value` alone works (found by probing the seeded catalogue).
+
+    use super::*;
+    use crate::catalog::catalog::Catalog;
+    use crate::cube::node::CellValue;
+
+    #[test]
+    fn a_calculated_field_works_on_a_measure_less_cube() {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Flat", &["Region"], None, true);
+        {
+            let cube = catalog.get_cube_mut("Flat").expect("Flat");
+            cube.write(&["East"], CellValue::Numeric(10.0)).expect("write");
+            cube.write(&["West"], CellValue::Numeric(30.0)).expect("write");
+        }
+
+        let plan: QueryRequest = serde_json::from_value(serde_json::json!({
+            "dataset": "Flat",
+            "protocolVersion": PROTOCOL_VERSION,
+            "groupBy": [{"name": "Region"}],
+            "measures": [{
+                "name": "Double",
+                "expr": {
+                    "type": "binary", "op": "*",
+                    "left": {"type": "call", "name": "SUM", "args": [{"type": "field", "name": "value"}]},
+                    "right": {"type": "number", "value": 2}
+                }
+            }]
+        }))
+        .expect("plan");
+
+        let PlanResult::Rows(rows) = execute_plan(&catalog, &plan).expect("runs") else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows.headers, vec!["Region", "Double"]);
+        assert_eq!(rows.rows[0], vec!["East", "20"]);
+        assert_eq!(rows.rows[1], vec!["West", "60"]);
     }
 }
