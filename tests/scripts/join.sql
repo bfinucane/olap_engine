@@ -26,9 +26,15 @@ SELECT Account, Name, Type, Sales, Units FROM Transactions JOIN Account_Attr USI
 -- 3. Constraint omitted: inferred because exactly one dimension conforms.
 SELECT Account, Name, Sales FROM Transactions JOIN Account_Attr
 
--- 4. An attribute missing for a key renders as '-' (left-join null handling).
+-- 4. LEFT JOIN keeps a key with no attribute row, rendering '-' (missing).
 INSERT INTO Transactions VALUES ('NA', '3000', 'Sales', 120)
+SELECT Account, Name, Type, Sales FROM Transactions LEFT JOIN Account_Attr USING (Account)
+
+-- 4b. A bare JOIN means INNER (standard SQL): the key must exist in BOTH cubes, so
+--     account 3000 is DROPPED rather than shown with dashes. It used to behave as
+--     LEFT, silently returning a row the keyword said should not exist.
 SELECT Account, Name, Type, Sales FROM Transactions JOIN Account_Attr USING (Account)
+SELECT Account, Name, Type, Sales FROM Transactions INNER JOIN Account_Attr USING (Account)
 
 -- 5. USING names a dimension that is not conformed to both cubes -> error.
 SELECT Account, Name, Sales FROM Transactions JOIN Account_Attr USING (Region)

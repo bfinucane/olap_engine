@@ -151,12 +151,24 @@ pub fn resolve(
 /// order given. An attribute that is not a member of the joined cube's measure
 /// dimension is an error: it used to produce a column of dashes, which reads as
 /// "every row is missing this attribute" rather than "you asked for the wrong name".
+/// Whether a primary row with no attribute row survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinMode {
+    /// Every primary row is kept; a key with no attribute row gets `missing`.
+    Left,
+    /// Only keys present in BOTH cubes survive. This is what SQL's `JOIN` and
+    /// `INNER JOIN` mean, and what a bare `JOIN` now does — it used to behave as LEFT,
+    /// which silently returned rows the keyword said should not exist.
+    Inner,
+}
+
 pub fn apply(
     catalog: &Catalog,
     primary: &mut ResultSet,
     resolved: &ResolvedJoin,
     attributes: &[String],
     missing: &str,
+    mode: JoinMode,
 ) -> Result<(), String> {
     if attributes.is_empty() {
         return Ok(());
@@ -262,6 +274,16 @@ pub fn apply(
         .iter()
         .map(|a| primary.headers.iter().position(|h| h == a).unwrap_or(0))
         .collect();
+
+    // INNER: drop primary rows whose key has no attribute row. Done BEFORE stitching,
+    // so a dropped row never acquires a placeholder that could be mistaken for data.
+    if mode == JoinMode::Inner {
+        primary.rows.retain(|row| {
+            row.get(key_idx)
+                .map(|key| index.contains_key(key))
+                .unwrap_or(false)
+        });
+    }
 
     for row in &mut primary.rows {
         row.resize(width, missing.to_string());

@@ -159,6 +159,9 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 //   * `ON (...)`, `NATURAL`, `CROSS` -> rejected with guidance.
                 let mut joined_cube_name = None;
                 let mut join_using: Option<Vec<String>> = None;
+                // Whether unmatched primary rows survive. Defaults to LEFT so a query
+                // with no join at all is unaffected.
+                let mut join_mode = attribute_join::JoinMode::Left;
                 // V1 implements ONE LEFT join. A second join used to be silently
                 // dropped (`relation.joins[0]` only), which returned columns of dashes
                 // with no error â€” the misleading kind of wrong answer.
@@ -175,11 +178,14 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                         joined_cube_name = Some(name.to_string());
                     }
                     match &join.join_operator {
-                        // A bare `JOIN` parses as `Inner`, so both arms are accepted and
-                        // both behave as a LEFT join â€” the one join semantic this engine
-                        // implements. (`INNER JOIN` written explicitly therefore does NOT
-                        // drop unmatched rows; it is an alias for the default here.)
-                        JoinOperator::Inner(c) | JoinOperator::LeftOuter(c) => match c {
+                        // A bare `JOIN` parses as `Inner`, and INNER is what it means:
+                        // rows whose key has no attribute row are DROPPED. It used to
+                        // behave as LEFT, which returned rows the keyword said should not
+                        // exist — a silent wrong answer. LEFT JOIN is how you ask for the
+                        // "attach if present" behaviour.
+                        JoinOperator::Inner(c) => {
+                            join_mode = attribute_join::JoinMode::Inner;
+                            match c {
                             JoinConstraint::Using(cols) => {
                                 join_using = Some(
                                     cols.iter().map(|i| i.value.clone()).collect(),
@@ -196,7 +202,29 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                                         .to_string(),
                                 );
                             }
-                        },
+                            }
+                        }
+                        JoinOperator::LeftOuter(c) => {
+                            join_mode = attribute_join::JoinMode::Left;
+                            match c {
+                                JoinConstraint::Using(cols) => {
+                                    join_using = Some(
+                                        cols.iter().map(|i| i.value.clone()).collect(),
+                                    );
+                                }
+                                JoinConstraint::None | JoinConstraint::Natural => {
+                                    join_using = None;
+                                }
+                                JoinConstraint::On(_) => {
+                                    return Err(
+                                        "JOIN ... ON is not supported. Since the only thing two \
+                                         cubes can join on is a shared (conformed) dimension, \
+                                         use USING (<dimension>)."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
                         // Refused rather than approximated: a left-stitch cannot honour
                         // them, and pretending otherwise is a wrong answer.
                         JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_) => {
@@ -533,6 +561,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                         resolved,
                         &requested_attributes,
                         attribute_join::SQL_MISSING,
+                        join_mode,
                     )?;
                 }
 

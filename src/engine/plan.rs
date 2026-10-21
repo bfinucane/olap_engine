@@ -639,6 +639,9 @@ fn apply_join(
         &resolved,
         &join.attributes,
         crate::engine::attribute_join::WIRE_MISSING,
+        // The wire's `join` has no type: it is always LEFT (keep every primary row).
+        // INNER exists only in the SQL front end, where a bare JOIN can say so.
+        crate::engine::attribute_join::JoinMode::Left,
     )
     .map_err(PlanError::InvalidArgument)?;
 

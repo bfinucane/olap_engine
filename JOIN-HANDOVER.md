@@ -164,8 +164,10 @@ message text is user-facing guidance and may be improved, so do not parse it.
    elsewhere.
 3. **One join per request.** `join` is a single object, so this is structural — you cannot
    even express two.
-4. **LEFT join only.** Every primary row is kept; a key with no attribute row is `null`.
-   There is no INNER/RIGHT/FULL over the wire.
+4. **The wire's `join` is LEFT semantics.** Every primary row is kept; a key with no
+   attribute row is `null`. There is no INNER/RIGHT/FULL *over the wire*.
+   (In the SQL front end, a bare `JOIN`/`INNER JOIN` now filters unmatched rows, as SQL
+   means; `LEFT JOIN` is how you ask for the keep-everything behaviour there.)
 5. **Attribute values are strings and are not measures.** They cannot be aggregated, and they
    never appear in `measureNames`.
 6. **The joined cube must be an attribute table** (`isAttributeTable: true`) with a measure
@@ -202,8 +204,8 @@ message text is user-facing guidance and may be improved, so do not parse it.
 > `dataType: "string"`. A key with no attribute row yields `null`. `orderBy` may reference an
 > attribute column.
 >
-> Left join only: every primary row is kept. One join per request. The key must appear in
-> `groupBy`. Errors: `invalid_argument` (non-conformed or ambiguous key, key not projected,
+> Left semantics: every primary row is kept, and a key with no attribute row yields
+> `null`. One join per request. The key must appear in `groupBy`. Errors: `invalid_argument` (non-conformed or ambiguous key, key not projected,
 > unknown attribute, name collision) or `unknown_dataset` (no such joined cube).
 >
 > **Additive v1 fields for discovery:** `capabilities.supportsJoin` (boolean),

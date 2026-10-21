@@ -46,12 +46,26 @@ Account | Name | Sales
 > INSERT INTO Transactions VALUES ('NA', '3000', 'Sales', 120)
 Upserted 1 row(s) into 'Transactions'.
 
-> SELECT Account, Name, Type, Sales FROM Transactions JOIN Account_Attr USING (Account)
+> SELECT Account, Name, Type, Sales FROM Transactions LEFT JOIN Account_Attr USING (Account)
 Account | Name | Type | Sales
 ----------------------------------------
 1000 | Cash Account | Asset | 500
 2000 | Revenue Account | Income | 300
 3000 | - | - | 120
+
+
+> SELECT Account, Name, Type, Sales FROM Transactions JOIN Account_Attr USING (Account)
+Account | Name | Type | Sales
+----------------------------------------
+1000 | Cash Account | Asset | 500
+2000 | Revenue Account | Income | 300
+
+
+> SELECT Account, Name, Type, Sales FROM Transactions INNER JOIN Account_Attr USING (Account)
+Account | Name | Type | Sales
+----------------------------------------
+1000 | Cash Account | Asset | 500
+2000 | Revenue Account | Income | 300
 
 
 > SELECT Account, Name, Sales FROM Transactions JOIN Account_Attr USING (Region)
