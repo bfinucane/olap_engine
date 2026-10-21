@@ -402,7 +402,7 @@ impl Default for Capabilities {
             // LOD is NOT implemented; the client must compute it (see docs).
             supports_lod: false,
             // No expression evaluator yet, so no function names are advertised.
-            expression_functions: Vec::new(),
+            expression_functions: crate::engine::calc::FUNCTIONS.iter().map(|f| f.to_string()).collect(),
             // `domainFor` is honoured (folded into the response).
             supports_inline_domain: true,
             max_rows: 100_000,
@@ -523,11 +523,18 @@ pub fn execute_plan(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult
                 "LOD expression (FIXED/INCLUDE/EXCLUDE); the client must compute it".to_string(),
             ));
         }
+        // A CALCULATED FIELD is now EVALUATED (engine::calc) rather than refused. Its
+        // shape is validated in `build_slice_query`, where the cube is at hand to check
+        // that every referenced field is really a measure of it.
         if m.expr.is_some() {
-            return Err(PlanError::UnsupportedExpression(format!(
-                "calculated field '{}' (evaluator not implemented yet)",
-                m.name
-            )));
+            if m.aggregation.is_some() {
+                return Err(PlanError::InvalidArgument(format!(
+                    "measure '{}' has both an aggregation and an expression; \
+                     a calculated field aggregates inside the expression",
+                    m.name
+                )));
+            }
+            continue;
         }
 
         // Parse the requested aggregation and REFUSE anything the engine cannot
@@ -561,9 +568,15 @@ pub fn execute_plan(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult
     let cube = catalog
         .get_cube(&plan.dataset)
         .ok_or_else(|| PlanError::UnknownDataset(plan.dataset.clone()))?;
+    // --- 3. Run it. ---
     let result = cube
         .query_slice(&slice)
         .map_err(PlanError::InvalidArgument)?;
+
+    // --- 3b. Calculated fields: evaluate the expressions over the aggregate slots the
+    //          slice just computed, BEFORE the join so the join appends to the final
+    //          column set. ---
+    let result = apply_calculated_fields(result, plan, cube)?;
 
     // --- 3a. Attribute join, BEFORE ordering and limiting: an attribute column is a
     //         real output column, so `orderBy` may reference it. ---
@@ -642,6 +655,187 @@ pub enum PlanResult {
 }
 
 /// Translates the plan's groupBy/measures/filters into a `SliceQuery`.
+/// Resolves a calculated-field reference to its AST.
+fn resolve_expression<'a>(
+    expr_ref: &'a ExprRef,
+    plan: &'a QueryRequest,
+) -> Result<&'a AstNode, PlanError> {
+    match expr_ref {
+        ExprRef::Ast(ast) => Ok(ast),
+        ExprRef::Named(key) => plan.expressions.get(key).ok_or_else(|| {
+            PlanError::InvalidArgument(format!(
+                "calculated field references '{}', which is not in the request's \
+                 `expressions` map",
+                key
+            ))
+        }),
+    }
+}
+
+/// A field aggregated inside an expression must be a MEASURE member of the cube.
+///
+/// Without this, a typo would silently aggregate nothing and yield an absent column —
+/// the "confident absence" failure mode, which reads like real data.
+fn assert_is_measure(cube: &crate::cube::cube::Cube, field: &str) -> Result<(), PlanError> {
+    let Some(measure_dim) = &cube.measure_dimension else {
+        return Err(PlanError::InvalidArgument(format!(
+            "'{}' cannot be aggregated: cube '{}' has no measure dimension",
+            field, cube.name
+        )));
+    };
+    let idx = cube
+        .dimension_names
+        .iter()
+        .position(|n| n == measure_dim)
+        .ok_or_else(|| {
+            PlanError::InvalidArgument(format!(
+                "measure dimension '{}' is missing from cube '{}'",
+                measure_dim, cube.name
+            ))
+        })?;
+    let dim = cube.dimensions[idx].read().unwrap();
+    if dim.get_id(field).is_none() {
+        return Err(PlanError::InvalidArgument(format!(
+            "'{}' is not a measure of '{}'",
+            field, cube.name
+        )));
+    }
+    Ok(())
+}
+
+/// Records how a field folds, refusing a SECOND, different aggregation of it.
+///
+/// v1 allows one aggregation per field (decision 4): the slice result names a column by
+/// measure, so `SUM([Sales]) / AVG([Sales])` cannot be represented yet.
+fn record_slot(
+    slots: &mut HashMap<String, crate::cube::aggregation::Aggregation>,
+    field: &str,
+    aggregation: crate::cube::aggregation::Aggregation,
+) -> Result<(), PlanError> {
+    match slots.get(field) {
+        Some(existing) if *existing != aggregation => Err(PlanError::InvalidArgument(format!(
+            "field '{}' is aggregated twice, as {} and as {}; \
+             v1 supports one aggregation per field",
+            field,
+            existing.name(),
+            aggregation.name()
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            slots.insert(field.to_string(), aggregation);
+            Ok(())
+        }
+    }
+}
+
+/// Evaluates each calculated measure over the slice's per-group aggregate slots.
+///
+/// Absence propagates (decision 2): a group where an input measure has no cells yields
+/// ABSENT, not 0 — `ZN`/`IFNULL` are how a formula asks for 0 instead.
+fn apply_calculated_fields(
+    result: ResultSet,
+    plan: &QueryRequest,
+    _cube: &crate::cube::cube::Cube,
+) -> Result<ResultSet, PlanError> {
+    if !plan.measures.iter().any(|m| m.expr.is_some()) {
+        return Ok(result);
+    }
+
+    let index: HashMap<&str, usize> = result
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.as_str(), i))
+        .collect();
+
+    enum Column {
+        Plain(usize),
+        Calc(AstNode, Vec<(String, usize)>),
+    }
+    let mut columns: Vec<Column> = Vec::with_capacity(plan.measures.len());
+
+    for m in &plan.measures {
+        match &m.expr {
+            Some(expr_ref) => {
+                let ast = resolve_expression(expr_ref, plan)?.clone();
+                let mut raw = Vec::new();
+                crate::engine::calc::collect_slots(&ast, &mut raw)
+                    .map_err(PlanError::UnsupportedExpression)?;
+                let mut slots = Vec::with_capacity(raw.len());
+                for (field, _) in raw {
+                    let idx = *index.get(field.as_str()).ok_or_else(|| {
+                        PlanError::InvalidArgument(format!(
+                            "calculated field '{}': '{}' is missing from the slice result",
+                            m.name, field
+                        ))
+                    })?;
+                    slots.push((field, idx));
+                }
+                columns.push(Column::Calc(ast, slots));
+            }
+            None => {
+                let idx = *index.get(m.name.as_str()).ok_or_else(|| {
+                    PlanError::InvalidArgument(format!(
+                        "measure '{}' is missing from the slice result",
+                        m.name
+                    ))
+                })?;
+                columns.push(Column::Plain(idx));
+            }
+        }
+    }
+
+    let mut group_idx = Vec::with_capacity(plan.group_by.len());
+    for g in &plan.group_by {
+        let idx = *index.get(g.name.as_str()).ok_or_else(|| {
+            PlanError::InvalidArgument(format!(
+                "groupBy column '{}' is missing from the slice result",
+                g.name
+            ))
+        })?;
+        group_idx.push(idx);
+    }
+
+    let mut headers: Vec<String> = plan.group_by.iter().map(|g| g.name.clone()).collect();
+    headers.extend(plan.measures.iter().map(|m| m.name.clone()));
+
+    let mut rows = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        let mut new_row = Vec::with_capacity(headers.len());
+        for &i in &group_idx {
+            new_row.push(row.get(i).cloned().unwrap_or_default());
+        }
+        for column in &columns {
+            match column {
+                Column::Plain(i) => new_row.push(row.get(*i).cloned().unwrap_or_default()),
+                Column::Calc(ast, slots) => {
+                    let lookup = |field: &str| -> Option<f64> {
+                        slots
+                            .iter()
+                            .find(|(f, _)| f == field)
+                            .and_then(|(_, i)| row.get(*i))
+                            .and_then(|cell| cell.parse::<f64>().ok())
+                    };
+                    let value = crate::engine::calc::evaluate(ast, &lookup)
+                        .map_err(PlanError::UnsupportedExpression)?;
+                    match value.into_number().map_err(PlanError::UnsupportedExpression)? {
+                        Some(n) => new_row.push(n.to_string()),
+                        // Absent: the engine's marker, which the wire turns into null.
+                        None => new_row.push("-".to_string()),
+                    }
+                }
+            }
+        }
+        rows.push(new_row);
+    }
+
+    Ok(ResultSet {
+        headers,
+        rows,
+        truncated: result.truncated,
+    })
+}
+
 fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuery, PlanError> {
     let cube = catalog
         .get_cube(&plan.dataset)
@@ -676,18 +870,43 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
         }
     }
 
-    // Measures. A bare aggregation names a stored member of the measure
-    // dimension; a calculated field was already refused above.
+    // Measures. A bare aggregation names a stored member of the measure dimension;
+    // a calculated field contributes its AGGREGATE SLOTS as hidden inputs, and the
+    // expression itself is evaluated after the slice returns (`apply_calculated_fields`).
     let mut requested_measures: Vec<String> = Vec::new();
+    let mut aggregations: HashMap<String, crate::cube::aggregation::Aggregation> = HashMap::new();
+    let mut has_calculated = false;
+
     for m in &plan.measures {
-        if m.expr.is_some() {
-            // Unreachable (refused in execute_plan), kept for safety.
-            return Err(PlanError::UnsupportedExpression(format!(
-                "calculated field '{}'",
-                m.name
-            )));
+        if let Some(expr_ref) = &m.expr {
+            has_calculated = true;
+            let ast = resolve_expression(expr_ref, plan)?;
+            let mut slots = Vec::new();
+            crate::engine::calc::collect_slots(ast, &mut slots)
+                .map_err(PlanError::UnsupportedExpression)?;
+            for (field, aggregation) in slots {
+                assert_is_measure(cube, &field)?;
+                record_slot(&mut aggregations, &field, aggregation)?;
+                if !requested_measures.contains(&field) {
+                    requested_measures.push(field);
+                }
+            }
+        } else {
+            // A MEASURE-LESS cube's implicit measure is addressed as `value`; it is not
+            // a member of any measure dimension, so it cannot be checked that way.
+            let implicit_value =
+                cube.measure_dimension.is_none() && m.name.eq_ignore_ascii_case("value");
+            if !implicit_value {
+                assert_is_measure(cube, &m.name)?;
+            }
+            let aggregation = m.aggregation.as_deref().unwrap_or("SUM");
+            if let Some(parsed) = crate::cube::aggregation::Aggregation::parse(aggregation) {
+                record_slot(&mut aggregations, &m.name, parsed)?;
+            }
+            if !requested_measures.contains(&m.name) {
+                requested_measures.push(m.name.clone());
+            }
         }
-        requested_measures.push(m.name.clone());
     }
 
     // Dimension-scope filters become the slice's WHERE. Measure-scope filters
@@ -710,9 +929,19 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
     }
 
     let mut output_columns: Vec<String> = plan.group_by.iter().map(|g| g.name.clone()).collect();
-    for m in &plan.measures {
-        if !output_columns.contains(&m.name) {
-            output_columns.push(m.name.clone());
+    if has_calculated {
+        // The slice must return the raw aggregate SLOTS; `apply_calculated_fields`
+        // evaluates the expressions and renames the columns to the requested names.
+        for field in &requested_measures {
+            if !output_columns.contains(field) {
+                output_columns.push(field.clone());
+            }
+        }
+    } else {
+        for m in &plan.measures {
+            if !output_columns.contains(&m.name) {
+                output_columns.push(m.name.clone());
+            }
         }
     }
 
@@ -735,19 +964,6 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
 
     if output_columns.is_empty() {
         output_columns.push("value".to_string());
-    }
-
-    // How each measure folds. An absent entry means SUM, so a caller that predates
-    // aggregation support is unaffected.
-    let mut aggregations: HashMap<String, crate::cube::aggregation::Aggregation> = HashMap::new();
-    for m in &plan.measures {
-        if let Some(agg) = m
-            .aggregation
-            .as_deref()
-            .and_then(crate::cube::aggregation::Aggregation::parse)
-        {
-            aggregations.insert(m.name.clone(), agg);
-        }
     }
 
     Ok(SliceQuery {
@@ -953,5 +1169,118 @@ pub fn format_plan_result(result: &PlanResult) -> String {
             }
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod calculated_field_tests {
+    //! End-to-end through `execute_plan`: an AST in, per-group numbers out.
+
+    use super::*;
+    use crate::catalog::catalog::Catalog;
+    use crate::cube::node::CellValue;
+
+    fn catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Sales", &["Region", "M"], Some("M"), true);
+        {
+            let cube = catalog.get_cube_mut("Sales").expect("Sales");
+            cube.write(&["East", "Sales"], CellValue::Numeric(100.0)).expect("write");
+            cube.write(&["East", "Cost"], CellValue::Numeric(40.0)).expect("write");
+            cube.write(&["West", "Sales"], CellValue::Numeric(200.0)).expect("write");
+            // West deliberately has NO Cost cell: the absent case.
+        }
+        catalog
+    }
+
+    fn agg(name: &str, field: &str) -> serde_json::Value {
+        serde_json::json!({"type": "call", "name": name, "args": [{"type": "field", "name": field}]})
+    }
+
+    fn plan(expr: serde_json::Value) -> QueryRequest {
+        serde_json::from_value(serde_json::json!({
+            "dataset": "Sales",
+            "protocolVersion": PROTOCOL_VERSION,
+            "groupBy": [{"name": "Region"}],
+            "measures": [{"name": "Margin", "expr": expr}]
+        }))
+        .expect("plan")
+    }
+
+    #[test]
+    fn a_calculated_measure_is_computed_per_group() {
+        let catalog = catalog();
+        // Sales - Cost, per region.
+        let expr = serde_json::json!({
+            "type": "binary", "op": "-", "left": agg("SUM", "Sales"), "right": agg("SUM", "Cost")
+        });
+        let result = execute_plan(&catalog, &plan(expr)).expect("plan runs");
+        let PlanResult::Rows(rows) = result else { panic!("expected rows") };
+
+        assert_eq!(rows.headers, vec!["Region", "Margin"]);
+        assert_eq!(rows.rows[0], vec!["East", "60"]);
+        // West has no Cost, so the subtraction is ABSENT, not 200 (decision 2).
+        assert_eq!(rows.rows[1], vec!["West", "-"]);
+    }
+
+    #[test]
+    fn zn_is_how_a_formula_asks_for_zero() {
+        let catalog = catalog();
+        let expr = serde_json::json!({
+            "type": "call", "name": "ZN", "args": [{
+                "type": "binary", "op": "-", "left": agg("SUM", "Sales"), "right": agg("SUM", "Cost")
+            }]
+        });
+        let result = execute_plan(&catalog, &plan(expr)).expect("plan runs");
+        let PlanResult::Rows(rows) = result else { panic!("expected rows") };
+        assert_eq!(rows.rows[0], vec!["East", "60"]);
+        // West: Sales 200 minus an ABSENT Cost is itself absent (decision 2), so ZN
+        // yields 0. The 200 is not subtracted from nothing — there is no subtraction to do.
+        assert_eq!(rows.rows[1], vec!["West", "0"], "ZN(absent) is 0");
+    }
+
+    #[test]
+    fn division_by_zero_is_absent_not_zero() {
+        let catalog = catalog();
+        let expr = serde_json::json!({
+            "type": "binary", "op": "/", "left": agg("SUM", "Cost"), "right": agg("SUM", "Cost")
+        });
+        let result = execute_plan(&catalog, &plan(expr)).expect("plan runs");
+        let PlanResult::Rows(rows) = result else { panic!("expected rows") };
+        assert_eq!(rows.rows[0], vec!["East", "1"], "40/40");
+        assert_eq!(rows.rows[1], vec!["West", "-"], "no Cost at all: absent, not 0/0");
+    }
+
+    #[test]
+    fn an_unsupported_function_is_refused_by_name() {
+        let catalog = catalog();
+        let expr = serde_json::json!({
+            "type": "call", "name": "ROUND", "args": [agg("SUM", "Sales"), {"type": "number", "value": 0.0}]
+        });
+        let err = execute_plan(&catalog, &plan(expr)).expect_err("ROUND is not implemented");
+        assert_eq!(err.code(), "unsupported_expression");
+        assert!(err.to_string().contains("ROUND"), "{err}");
+    }
+
+    #[test]
+    fn a_non_measure_field_is_refused() {
+        let catalog = catalog();
+        let err = execute_plan(&catalog, &plan(agg("SUM", "Region")))
+            .expect_err("Region is a dimension, not a measure");
+        assert_eq!(err.code(), "invalid_argument");
+        assert!(err.to_string().contains("not a measure"), "{err}");
+    }
+
+    #[test]
+    fn two_aggregations_of_one_field_are_refused() {
+        let catalog = catalog();
+        let expr = serde_json::json!({
+            "type": "binary", "op": "/", "left": agg("SUM", "Sales"), "right": agg("AVG", "Sales")
+        });
+        let err = execute_plan(&catalog, &plan(expr)).expect_err("mixed aggregation");
+        // `unsupported_expression`, not `invalid_argument`: the request is well formed;
+        // the engine simply cannot evaluate two aggregations of one field yet.
+        assert_eq!(err.code(), "unsupported_expression");
+        assert!(err.to_string().contains("one aggregation per field"), "{err}");
     }
 }

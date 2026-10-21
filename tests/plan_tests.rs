@@ -362,7 +362,13 @@ fn capabilities_declare_lod_unsupported_and_no_expression_functions() {
     assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
     // The load-bearing honesty bits: Plateau degrades on these.
     assert!(!caps.supports_lod, "LOD must NOT be claimed until implemented");
-    assert!(caps.expression_functions.is_empty(), "no evaluator yet, so no functions");
+    // A calculated-field evaluator exists now, but it implements exactly two
+    // non-aggregate functions. The list must be the implementation, not an aspiration.
+    assert_eq!(
+        caps.expression_functions,
+        vec!["ZN".to_string(), "IFNULL".to_string()],
+        "advertise exactly the functions that run"
+    );
     // Only what is actually honoured today.
     assert!(caps.filter_operators.contains(&"equals".to_string()));
     assert!(caps.filter_operators.contains(&"in".to_string()));

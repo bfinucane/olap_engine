@@ -171,9 +171,10 @@ fn capabilities_section4_keys_and_honest_declarations() {
         "COUNTD does not exist, so an exact distinct count cannot be claimed"
     );
     assert_eq!(v["maxRows"], json!(100_000));
-    assert!(
-        v["expressionFunctions"].as_array().unwrap().is_empty(),
-        "no evaluator yet, so no function names may be advertised"
+    assert_eq!(
+        v["expressionFunctions"],
+        json!(["ZN", "IFNULL"]),
+        "advertise exactly the functions that run"
     );
 }
 
@@ -1448,6 +1449,80 @@ fn describe_and_domain_together_expose_the_joinable_attributes() {
     let sales = wire::describe(&catalog, "Sales").expect("describe Sales");
     assert!(!sales.is_attribute_table, "Sales is a measure cube");
     assert_eq!(sales.measure_dimension.as_deref(), Some("Measure"));
+}
+
+/// §3 `expressions`: a calculated field arrives as an AST and the engine evaluates it
+/// (engine::calc). Plateau parses the formula; the engine never sees the text.
+#[test]
+fn query_evaluates_a_calculated_field() {
+    let mut catalog = build_catalog();
+    let mut p = request("Sales");
+    by_region(&mut p);
+    // Margin = SUM(Sales) - SUM(Cost)
+    //   East: (100 + 50) - (40 + 30) = 80
+    //   West: (200 + 25) - (80 + 15) = 130
+    p.measures.push(
+        serde_json::from_value(json!({
+            "name": "Margin",
+            "expr": {
+                "type": "binary", "op": "-",
+                "left": {"type": "call", "name": "SUM", "args": [{"type": "field", "name": "Sales"}]},
+                "right": {"type": "call", "name": "SUM", "args": [{"type": "field", "name": "Cost"}]}
+            }
+        }))
+        .expect("Measure"),
+    );
+
+    let resp = wire::query(&mut catalog, &p).expect("calculated field");
+    assert_eq!(resp.columns, vec!["Region", "Margin"]);
+    assert_eq!(resp.rows[0], vec![json!("East"), json!(80.0)]);
+    assert_eq!(resp.rows[1], vec![json!("West"), json!(130.0)]);
+    // A calculated field is a measure, and it is named as one.
+    assert!(resp.measure_names.contains(&"Margin".to_string()));
+}
+
+/// An operand with no cells makes the expression ABSENT (null), not zero — and `ZN` is
+/// the explicit way to ask for zero instead.
+#[test]
+fn a_calculated_field_over_an_absent_measure_is_null() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Sparse", &["Region", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog.get_cube_mut("Sparse").expect("Sparse");
+        cube.write(&["East", "Sales"], CellValue::Numeric(100.0)).expect("write");
+        cube.write(&["West", "Sales"], CellValue::Numeric(50.0)).expect("write");
+        cube.write(&["West", "Cost"], CellValue::Numeric(10.0)).expect("write");
+    }
+
+    let gap = json!({
+        "type": "binary", "op": "-",
+        "left": {"type": "call", "name": "SUM", "args": [{"type": "field", "name": "Sales"}]},
+        "right": {"type": "call", "name": "SUM", "args": [{"type": "field", "name": "Cost"}]}
+    });
+
+    let mut p = request("Sparse");
+    by_region(&mut p);
+    p.measures.push(serde_json::from_value(json!({"name": "Gap", "expr": gap})).expect("Measure"));
+    let resp = wire::query(&mut catalog, &p).expect("calc");
+    assert_eq!(
+        resp.rows[0],
+        vec![json!("East"), Value::Null],
+        "East has no Cost, so the gap is unknown - not 100"
+    );
+    assert_eq!(resp.rows[1], vec![json!("West"), json!(40.0)]);
+
+    // ZN turns the absence into 0.
+    let mut p2 = request("Sparse");
+    by_region(&mut p2);
+    p2.measures.push(
+        serde_json::from_value(json!({
+            "name": "Gap",
+            "expr": {"type": "call", "name": "ZN", "args": [gap]}
+        }))
+        .expect("Measure"),
+    );
+    let resp2 = wire::query(&mut catalog, &p2).expect("calc with ZN");
+    assert_eq!(resp2.rows[0], vec![json!("East"), json!(0.0)]);
 }
 
 // ---------------------------------------------------------------------------
