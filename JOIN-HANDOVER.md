@@ -14,18 +14,32 @@ section to paste there).
 
 ```powershell
 cd C:\Users\Startklar\Documents\deepseek-harness\default-workspace
-powershell -NoProfile -ExecutionPolicy Bypass -File .\start-engine.ps1   # port 8080
+.\start-engine.cmd            # port 8080, serves database.dev.bin
 ```
 
-`start-engine.ps1` copies `database.bin` → `database.dev.bin` and serves the copy. The
-seeded catalogue has `Sales` (Region/Segment/Category, implicit `value`) and `RegionAttr`
-(Region, Attribute) — enough to try a join immediately.
+`start-engine.cmd` is the reliable route on this machine: PowerShell's execution policy
+refuses unsigned `.ps1` files, so `.\start-engine.ps1` is blocked outright. The `.cmd`
+wrapper starts PowerShell with `-ExecutionPolicy Bypass` for that one script — the
+machine-wide policy is unchanged. Arguments pass through: `-Port 8090`, `-Fresh`, `-Cors`.
+
+Leave the window open; that window **is** the server, and Ctrl+C stops it. The script copies
+`database.bin` → `database.dev.bin` and serves the copy, so the seeded reference is never
+mutated. Running `serve.exe` directly skips that copy and loads `database.bin` itself — fine
+for read-only probing, but use the script for anything else.
 
 Check what you are talking to:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/v1/capabilities | Select-Object supportsJoin
 ```
+
+**Browsing `http://127.0.0.1:8080/` returns
+`{"error":"Unknown path '/'.","code":"invalid_argument"}` — that is correct, not a fault.**
+Every endpoint lives under `/v1/`; there is no index page. Use `/v1/capabilities` or
+`/v1/datasets`.
+
+The seeded catalogue has `Sales` (Region/Segment/Category, implicit `value`) and `RegionAttr`
+(Region, Attribute) — enough to try a join immediately.
 
 ---
 
