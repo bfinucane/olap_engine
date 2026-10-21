@@ -1,4 +1,4 @@
-use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, BinaryOperator, JoinConstraint, JoinOperator};
+use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, Value, BinaryOperator, JoinConstraint, JoinOperator};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap; 
@@ -14,7 +14,7 @@ use crate::engine::attribute_join;
 /// This gates the HTTP SQL console (`POST /v1/sql`). The console is read-only by
 /// design: the server binds a plain port with no authentication, so exposing
 /// CREATE/INSERT/DROP there would let any local process rewrite the catalogue. The
-/// CLI remains the place for writes. `execute_sql` itself is unrestricted — this is
+/// CLI remains the place for writes. `execute_sql` itself is unrestricted â€” this is
 /// the check in front of it, done on the parse tree rather than on string prefixes,
 /// so `SELECT` hidden in a comment or a second statement cannot slip past.
 pub fn ensure_read_only(sql: &str) -> Result<(), String> {
@@ -128,6 +128,13 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
         Statement::Query(query) => {
             if let SetExpr::Select(select) = &*query.body {
                 
+                                // --- 0. LIMIT / OFFSET ---
+                // Parsed up front so a malformed value is a clean error rather than a
+                // silently ignored clause. Applied AFTER the join (see below), because
+                // it counts output rows as the user sees them.
+                let row_limit = parse_limit(&query.limit)?;
+                let row_offset = parse_offset(&query.offset)?;
+
                                 // --- 1. IDENTIFY PRIMARY AND JOINED CUBES ---
                 // Get Primary Cube (e.g., Transactions)
                 let relation = select.from.first()
@@ -154,7 +161,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 let mut join_using: Option<Vec<String>> = None;
                 // V1 implements ONE LEFT join. A second join used to be silently
                 // dropped (`relation.joins[0]` only), which returned columns of dashes
-                // with no error — the misleading kind of wrong answer.
+                // with no error â€” the misleading kind of wrong answer.
                 if relation.joins.len() > 1 {
                     return Err(format!(
                         "Only one JOIN is supported (found {}). Join one attribute cube at a \
@@ -169,7 +176,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     }
                     match &join.join_operator {
                         // A bare `JOIN` parses as `Inner`, so both arms are accepted and
-                        // both behave as a LEFT join — the one join semantic this engine
+                        // both behave as a LEFT join â€” the one join semantic this engine
                         // implements. (`INNER JOIN` written explicitly therefore does NOT
                         // drop unmatched rows; it is an alias for the default here.)
                         JoinOperator::Inner(c) | JoinOperator::LeftOuter(c) => match c {
@@ -276,7 +283,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     // --- Aggregate function: SUM/AVG/COUNT/MIN/MAX over a measure ---
                     //
                     // Handled BEFORE the name-based branches, because
-                    // `proj.to_string()` is "AVG(Sales)" — not a column name — and
+                    // `proj.to_string()` is "AVG(Sales)" â€” not a column name â€” and
                     // taking it literally would report a confusing "Column
                     // 'AVG(Sales)' not found".
                     //
@@ -529,6 +536,11 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     )?;
                 }
 
+                // --- 5. LIMIT / OFFSET ---
+                // Applied last, to the materialised rows, so it counts exactly the
+                // output the user sees (after the join appended its columns).
+                apply_limit_offset(&mut result_set, row_limit, row_offset);
+
                 return Ok(format_result_set(result_set));
             }
             Err("Unsupported SELECT format.".to_string())
@@ -683,6 +695,57 @@ fn extract_where_map(expr: &Expr, filters: &mut HashMap<String, Vec<String>>) ->
 }
 
 // Helper: Formats the ResultSet into an ASCII table
+/// Parses `LIMIT <n>` (and `LIMIT ALL`, which means no limit).
+///
+/// A non-literal is refused rather than ignored: silently returning every row for
+/// `LIMIT 1+1` would look like the engine ignored the clause, which is worse than an
+/// error that says so.
+fn parse_limit(limit: &Option<Expr>) -> Result<Option<usize>, String> {
+    let Some(expr) = limit else { return Ok(None) };
+    match expr {
+        Expr::Value(Value::Number(text, _)) => text
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("LIMIT must be a non-negative integer, got '{}'.", text)),
+        Expr::Identifier(id) if id.value.eq_ignore_ascii_case("ALL") => Ok(None),
+        other => Err(format!(
+            "LIMIT must be a non-negative integer, got '{}'.",
+            other
+        )),
+    }
+}
+
+/// Parses `OFFSET <n> [ROW|ROWS]`.
+fn parse_offset(offset: &Option<sqlparser::ast::Offset>) -> Result<usize, String> {
+    let Some(offset) = offset else { return Ok(0) };
+    match &offset.value {
+        Expr::Value(Value::Number(text, _)) => text
+            .parse::<usize>()
+            .map_err(|_| format!("OFFSET must be a non-negative integer, got '{}'.", text)),
+        other => Err(format!(
+            "OFFSET must be a non-negative integer, got '{}'.",
+            other
+        )),
+    }
+}
+
+/// Applies LIMIT/OFFSET to the materialised rows.
+///
+/// `truncated` is set only when rows were genuinely cut, matching the wire layer's
+/// meaning ("the answer is a page, not the whole set").
+fn apply_limit_offset(result: &mut ResultSet, limit: Option<usize>, offset: usize) {
+    let total = result.rows.len();
+    if offset > 0 {
+        result.rows.drain(..offset.min(total));
+    }
+    if let Some(limit) = limit
+        && result.rows.len() > limit
+    {
+        result.rows.truncate(limit);
+        result.truncated = true;
+    }
+}
+
 fn format_result_set(rs: ResultSet) -> String {
     if rs.rows.is_empty() { return "0 rows returned.".to_string(); }
     let mut output = String::new();
@@ -717,8 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_and_scripts_are_refused_with_a_useful_message() {
-        for (bad, expected) in [
+    fn writes_and_scripts_are_refused_with_a_useful_message() {        for (bad, expected) in [
             ("DROP TABLE Sales", "DROP"),
             ("INSERT INTO Sales VALUES ('a', 1)", "INSERT"),
             ("CREATE TABLE T (A STRING, M MEASURE)", "CREATE TABLE"),
@@ -742,5 +804,78 @@ mod tests {
         // Not SQL at all (a REPL dot-command).
         assert!(ensure_read_only(".tree Geo All").is_err());
         assert!(ensure_read_only("").is_err());
+    }
+    // --- LIMIT / OFFSET ---
+
+    /// Pulls LIMIT/OFFSET out of a parsed query, exactly as the SELECT branch does.
+    fn limits_of(sql: &str) -> (Option<Expr>, Option<sqlparser::ast::Offset>) {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parses");
+        match statements.remove(0) {
+            Statement::Query(q) => (q.limit, q.offset),
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limit_and_offset_accept_integers_and_all() {
+        let (limit, _) = limits_of("SELECT Region FROM Sales LIMIT 5");
+        assert_eq!(parse_limit(&limit), Ok(Some(5)));
+
+        let (limit, _) = limits_of("SELECT Region FROM Sales LIMIT ALL");
+        assert_eq!(parse_limit(&limit), Ok(None), "LIMIT ALL means no limit");
+
+        let (limit, offset) = limits_of("SELECT Region FROM Sales LIMIT 2 OFFSET 3");
+        assert_eq!(parse_limit(&limit), Ok(Some(2)));
+        assert_eq!(parse_offset(&offset), Ok(3));
+
+        let (limit, offset) = limits_of("SELECT Region FROM Sales");
+        assert_eq!(parse_limit(&limit), Ok(None));
+        assert_eq!(parse_offset(&offset), Ok(0));
+    }
+
+    /// A non-literal is an ERROR, not a silently ignored clause: returning every row
+    /// for `LIMIT 1+1` would look like the engine ignored what the user wrote.
+    #[test]
+    fn limit_and_offset_refuse_expressions() {
+        let (limit, _) = limits_of("SELECT Region FROM Sales LIMIT 'two'");
+        let err = parse_limit(&limit).expect_err("a string is not a row count");
+        assert!(err.contains("non-negative integer"), "{err}");
+
+        let (limit, _) = limits_of("SELECT Region FROM Sales LIMIT 1 + 1");
+        assert!(parse_limit(&limit).is_err(), "an expression is not a row count");
+
+        let (_, offset) = limits_of("SELECT Region FROM Sales OFFSET 'x'");
+        assert!(parse_offset(&offset).is_err());
+    }
+
+    #[test]
+    fn apply_limit_offset_pages_without_lying_about_truncation() {
+        let rs = |n: usize| ResultSet {
+            headers: vec!["h".to_string()],
+            rows: (0..n).map(|i| vec![i.to_string()]).collect(),
+            truncated: false,
+        };
+
+        // Fewer rows than the limit: nothing cut, so `truncated` stays false.
+        let mut r = rs(2);
+        apply_limit_offset(&mut r, Some(5), 0);
+        assert_eq!(r.rows.len(), 2);
+        assert!(!r.truncated);
+
+        // More rows than the limit: cut, and flagged.
+        let mut r = rs(5);
+        apply_limit_offset(&mut r, Some(2), 0);
+        assert_eq!(r.rows, vec![vec!["0".to_string()], vec!["1".to_string()]]);
+        assert!(r.truncated, "rows were actually cut");
+
+        // OFFSET skips first, then LIMIT applies.
+        let mut r = rs(5);
+        apply_limit_offset(&mut r, Some(2), 3);
+        assert_eq!(r.rows, vec![vec!["3".to_string()], vec!["4".to_string()]]);
+
+        // An offset past the end is empty, not a panic.
+        let mut r = rs(2);
+        apply_limit_offset(&mut r, Some(2), 10);
+        assert!(r.rows.is_empty());
     }
 }

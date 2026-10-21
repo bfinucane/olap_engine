@@ -1,0 +1,60 @@
+Running script 'limit.sql'...
+> CREATE TABLE T (Region STRING, Product STRING, M MEASURE)
+Cube 'T' created. Measure dimension: M
+
+> INSERT INTO T VALUES ('East', 'A', 'Sales', 10)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('East', 'B', 'Sales', 20)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('West', 'A', 'Sales', 30)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('West', 'B', 'Sales', 40)
+Upserted 1 row(s) into 'T'.
+
+> SELECT Region, Product, Sales FROM T
+Region | Product | Sales
+------------------------------
+East | A | 10
+East | B | 20
+West | A | 30
+West | B | 40
+
+
+> SELECT Region, Product, Sales FROM T LIMIT 2
+Region | Product | Sales
+------------------------------
+East | A | 10
+East | B | 20
+
+
+> SELECT Region, Product, Sales FROM T LIMIT 2 OFFSET 1
+Region | Product | Sales
+------------------------------
+East | B | 20
+West | A | 30
+
+
+> SELECT Region, Product, Sales FROM T LIMIT 99
+Region | Product | Sales
+------------------------------
+East | A | 10
+East | B | 20
+West | A | 30
+West | B | 40
+
+
+> SELECT Region, Product, Sales FROM T LIMIT 0
+0 rows returned.
+
+> SELECT Region, Product, Sales FROM T LIMIT ALL
+Region | Product | Sales
+------------------------------
+East | A | 10
+East | B | 20
+West | A | 30
+West | B | 40
+
+
