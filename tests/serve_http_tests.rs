@@ -696,3 +696,88 @@ fn concurrent_requests_are_all_served_consistently() {
         client.join().expect("client thread must not panic");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The read-only SQL console (GET /sql, POST /v1/sql)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_sql_serves_the_console_page() {
+    let srv = server();
+    let resp = get(&format!("{}/sql", srv.base));
+
+    assert_eq!(resp.status, 200, "console page: {}", resp.body);
+    assert_eq!(
+        resp.header("content-type"),
+        Some("text/html; charset=utf-8"),
+        "the console is the one HTML response the server serves"
+    );
+    assert!(resp.body.contains("<textarea"), "it needs an input box");
+    assert!(
+        resp.body.to_lowercase().contains("read-only"),
+        "the page must say it is read-only before the user tries an INSERT"
+    );
+    assert!(resp.body.contains("/v1/sql"), "it posts to the SQL endpoint");
+}
+
+#[test]
+fn post_sql_runs_a_select() {
+    let srv = server();
+    let resp = post_json(
+        &format!("{}/v1/sql", srv.base),
+        r#"{"sql":"SELECT Region, Product, Measure, value FROM Sales"}"#,
+    );
+
+    assert_eq!(resp.status, 200, "select via the console: {}", resp.body);
+    let out = resp.json()["output"].as_str().expect("output is a string").to_string();
+    // The fixture has East/Widget, East/Gadget, West/Widget, West/Gadget for Sales.
+    assert!(out.contains("Region"), "header row missing:\n{out}");
+    assert!(out.contains("East") && out.contains("West"), "rows missing:\n{out}");
+    assert!(out.contains("Widget"), "measures missing:\n{out}");
+}
+
+#[test]
+fn post_sql_refuses_anything_but_a_select() {
+    let srv = server();
+
+    for (sql, kind) in [
+        ("DROP TABLE Sales", "DROP"),
+        ("INSERT INTO Sales VALUES ('East','Widget','Sales',1)", "INSERT"),
+        ("CREATE TABLE T (A STRING, M MEASURE)", "CREATE TABLE"),
+        ("SELECT 1; DROP TABLE Sales", "one statement"),
+    ] {
+        let body = serde_json::json!({ "sql": sql }).to_string();
+        let resp = post_json(&format!("{}/v1/sql", srv.base), &body);
+        assert_eq!(resp.status, 400, "must refuse: {sql}");
+        assert_eq!(resp.code(), "invalid_argument", "wrong code for: {sql}");
+        assert!(
+            resp.body.contains(kind),
+            "the message should mention {kind}: {}",
+            resp.body
+        );
+    }
+}
+
+#[test]
+fn the_sql_console_cannot_change_the_catalogue() {
+    let srv = server();
+    let before = get(&format!("{}/v1/datasets", srv.base)).json();
+
+    // A refused write, then a legitimate read: the served catalogue must be untouched.
+    let _ = post_json(
+        &format!("{}/v1/sql", srv.base),
+        r#"{"sql":"INSERT INTO Sales VALUES ('Nowhere','Nothing','Sales',999)"}"#,
+    );
+    let _ = post_json(
+        &format!("{}/v1/sql", srv.base),
+        r#"{"sql":"SELECT Region, Product, Measure, value FROM Sales"}"#,
+    );
+
+    let after = get(&format!("{}/v1/datasets", srv.base)).json();
+    assert_eq!(before, after, "the dataset list must be unchanged");
+    assert_eq!(
+        get(&format!("{}/v1/Sales", srv.base)).json()["rowCount"],
+        serde_json::json!(8),
+        "still the 8 fixture cells"
+    );
+}

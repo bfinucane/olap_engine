@@ -83,6 +83,14 @@ struct CatalogDiskFormat {
     cubes: HashMap<String, Cube>,
 }
 
+/// The whole database: dimensions (shared by `Arc`) and cubes.
+///
+/// `Clone` is shallow in the way that matters: each cube's `VersionStore` clone is an
+/// `Arc` bump, and dimensions are shared pointers. It exists so a caller that needs
+/// `&mut Catalog` (the SQL front end) can work on its own copy of the CUBE data —
+/// note the dimensions are still shared, so this is not isolation from a dimension
+/// mutation.
+#[derive(Clone)]
 pub struct Catalog {
     pub dimensions: HashMap<String, Arc<RwLock<Dimension>>>,
     pub cubes: HashMap<String, Cube>, // The Catalog now owns the Cubes

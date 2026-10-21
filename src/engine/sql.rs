@@ -9,8 +9,53 @@ use crate::catalog::catalog::Catalog;
 use crate::cube::cube::{SliceQuery, ResultSet, SplashMode};  
 use crate::engine::attribute_join;
 
+/// Rejects anything that is not exactly ONE `SELECT` statement.
+///
+/// This gates the HTTP SQL console (`POST /v1/sql`). The console is read-only by
+/// design: the server binds a plain port with no authentication, so exposing
+/// CREATE/INSERT/DROP there would let any local process rewrite the catalogue. The
+/// CLI remains the place for writes. `execute_sql` itself is unrestricted — this is
+/// the check in front of it, done on the parse tree rather than on string prefixes,
+/// so `SELECT` hidden in a comment or a second statement cannot slip past.
+pub fn ensure_read_only(sql: &str) -> Result<(), String> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|e| format!("Could not parse the SQL: {}", e))?;
+
+    match statements.len() {
+        0 => Err("Empty statement.".to_string()),
+        1 => match &statements[0] {
+            Statement::Query(_) => Ok(()),
+            other => Err(format!(
+                "The web SQL console is read-only, so only SELECT is allowed (got {}). \
+                 Use the CLI for CREATE/INSERT/DROP: \
+                 Patricia\\olap_engine\\target\\debug\\olap_engine.exe",
+                describe_statement(other)
+            )),
+        },
+        n => Err(format!(
+            "Only one statement at a time is allowed; this request contains {}.",
+            n
+        )),
+    }
+}
+
+/// A short human name for a statement kind, for the read-only refusal above.
+fn describe_statement(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::Query(_) => "SELECT",
+        Statement::Insert { .. } => "INSERT",
+        Statement::Update { .. } => "UPDATE",
+        Statement::Delete { .. } => "DELETE",
+        Statement::CreateTable { .. } => "CREATE TABLE",
+        Statement::Drop { .. } => "DROP",
+        Statement::AlterTable { .. } => "ALTER TABLE",
+        _ => "a non-SELECT statement",
+    }
+}
+
 // Changed return type from f64 to String to support textual success messages
 pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, String> {
+
 	
     let mut parseable_sql = sql_query.trim().to_string();
     let upper_sql = parseable_sql.to_uppercase();
@@ -652,4 +697,50 @@ fn format_result_set(rs: ResultSet) -> String {
         output.push('\n');
     }
     output
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate in front of the web console. It works on the PARSE TREE, so a
+    /// `SELECT` hidden in a comment or smuggled in behind a second statement cannot
+    /// get through on string matching.
+    #[test]
+    fn only_a_single_select_is_read_only() {
+        for ok in [
+            "SELECT Region FROM Sales",
+            "select Region, SUM(value) FROM Sales GROUP BY Region",
+            "  SELECT 1 ;  ",
+        ] {
+            assert!(ensure_read_only(ok).is_ok(), "should be allowed: {ok}");
+        }
+    }
+
+    #[test]
+    fn writes_and_scripts_are_refused_with_a_useful_message() {
+        for (bad, expected) in [
+            ("DROP TABLE Sales", "DROP"),
+            ("INSERT INTO Sales VALUES ('a', 1)", "INSERT"),
+            ("CREATE TABLE T (A STRING, M MEASURE)", "CREATE TABLE"),
+            ("DELETE FROM Sales", "DELETE"),
+        ] {
+            let err = ensure_read_only(bad).expect_err(bad);
+            assert!(
+                err.contains("read-only"),
+                "the message must say the console is read-only: {err}"
+            );
+            assert!(
+                err.contains(expected),
+                "the message should name the statement kind {expected}: {err}"
+            );
+        }
+
+        // Two statements: refused, because the second could be a write.
+        let err = ensure_read_only("SELECT 1; DROP TABLE Sales").expect_err("two statements");
+        assert!(err.contains("one statement"), "message: {err}");
+
+        // Not SQL at all (a REPL dot-command).
+        assert!(ensure_read_only(".tree Geo All").is_err());
+        assert!(ensure_read_only("").is_err());
+    }
 }

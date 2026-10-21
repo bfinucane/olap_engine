@@ -33,6 +33,73 @@ use olap_engine::engine::wire::{
     self, capabilities, datasets, describe, query, sample, ErrorResponse, SampleQuery, WireError,
 };
 
+/// Body of `POST /v1/sql`.
+#[derive(serde::Deserialize)]
+struct SqlRequest {
+    sql: String,
+}
+
+/// The read-only SQL console page, served at `GET /sql`.
+///
+/// Deliberately a single self-contained string: no assets, no build step, no
+/// framework. It talks to `POST /v1/sql`, which accepts exactly one SELECT.
+const SQL_CONSOLE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OLAP SQL console</title>
+<style>
+  body { font: 15px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  .note { color: #555; margin: 0 0 1rem; }
+  textarea { width: 100%; height: 8rem; font: 13px/1.45 ui-monospace, Consolas, monospace; padding: .6rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+  button { font: inherit; padding: .45rem 1rem; border: 1px solid #1a1a1a; background: #1a1a1a; color: #fff; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #333; }
+  #status { color: #555; margin-left: .75rem; }
+  pre { background: #f6f6f6; border: 1px solid #e2e2e2; border-radius: 6px; padding: .75rem; overflow: auto; min-height: 3rem; white-space: pre; }
+  code { background: #f0f0f0; padding: .05rem .25rem; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>OLAP SQL console</h1>
+<p class="note">
+  Read-only: only <code>SELECT</code> is accepted. Omitted dimensions default to their
+  first member, so name every dimension you want included in a total.
+  Ctrl+Enter runs the query.
+</p>
+<textarea id="sql" spellcheck="false">SELECT Region, Segment, Category, value FROM Sales</textarea>
+<div style="margin-top:.6rem">
+  <button id="run">Run</button><span id="status"></span>
+</div>
+<pre id="out"></pre>
+<script>
+const out = document.getElementById('out');
+const status = document.getElementById('status');
+async function run() {
+  status.textContent = 'running\u2026';
+  try {
+    const r = await fetch('/v1/sql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sql: document.getElementById('sql').value })
+    });
+    const j = await r.json();
+    out.textContent = ('output' in j) ? j.output : (j.error || JSON.stringify(j, null, 2));
+    status.textContent = r.ok ? (j.elapsedMs + ' ms') : ('error ' + r.status + ' (' + j.code + ')');
+  } catch (e) {
+    status.textContent = 'request failed';
+    out.textContent = String(e);
+  }
+}
+document.getElementById('run').onclick = run;
+document.getElementById('sql').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); }
+});
+</script>
+</body>
+</html>
+"#;
+
 fn main() {
     let (bind, db_path, cors) = parse_args();
 
@@ -206,6 +273,12 @@ fn handle_connection(
         return Ok(());
     }
 
+    // --- The SQL console page (the only non-JSON response) ---
+    if request.method == "GET" && request.path.trim_end_matches('/') == "/sql" {
+        write_response(&mut stream, 200, "text/html; charset=utf-8", SQL_CONSOLE_HTML, cors)?;
+        return Ok(());
+    }
+
     match route(&request, &shared) {
         Ok((status, value)) => {
             let text = value.to_string();
@@ -250,6 +323,43 @@ fn route(
             return Err(method_not_allowed("GET"));
         }
         return Ok((200, serde_json::to_value(datasets(shared)).unwrap()));
+    }
+
+    // POST /v1/sql — the read-only SQL console's endpoint.
+    //
+    // Deliberately restricted to a single SELECT (see `sql::ensure_read_only`): the
+    // port has no authentication, so a write path here would let anything on the
+    // machine rewrite the catalogue. The CLI keeps that power.
+    if path == "/v1/sql" {
+        if req.method != "POST" {
+            return Err(method_not_allowed("POST"));
+        }
+        let body: SqlRequest = serde_json::from_slice(&req.body).map_err(|e| WireError {
+            code: "invalid_argument",
+            message: format!("Malformed body; expected {{\"sql\": \"SELECT ...\"}}: {}", e),
+        })?;
+
+        olap_engine::engine::sql::ensure_read_only(&body.sql).map_err(|message| WireError {
+            code: "invalid_argument",
+            message,
+        })?;
+
+        let started = std::time::Instant::now();
+        let mut catalog = (**shared).clone();
+        let output = olap_engine::engine::sql::execute_sql(&mut catalog, &body.sql)
+            .map_err(|message| WireError {
+                code: "invalid_argument",
+                message,
+            })?;
+
+        return Ok((
+            200,
+            serde_json::json!({
+                "sql": body.sql,
+                "output": output,
+                "elapsedMs": started.elapsed().as_millis() as u64,
+            }),
+        ));
     }
 
     // Everything else is under /v1/{dataset}[/sample|/query].
