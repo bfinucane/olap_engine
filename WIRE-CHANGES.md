@@ -53,8 +53,17 @@ are the "lists" a spreadsheet front end needs, and the dictionaries the security
 build on.
 
 - **New datasets:** `#Cubes(#Cube, #Property)`, `#Dimensions(#Dimension, #Property)`,
-  `#Hierarchies(#Dimension, #Hierarchy)`, `#Members(#Dimension, #Member)`. All measure-less:
-  their value is a string, and a query appends the usual implicit `value` column.
+  `#Hierarchies(#Dimension, #Hierarchy)`, `#Members(#Dimension, #Hierarchy, #Member)`,
+  `#Edges(#Dimension, #Hierarchy, #Member, #Parent)`. All measure-less: their value is a
+  string, and a query appends the usual implicit `value` column (`#Edges` carries the
+  rollup weight as a number).
+- **Structure, not just lists:** `#Members` is keyed by hierarchy because a consolidated
+  member exists only in the hierarchies that define it; `#Edges` gives parent/child pairs
+  with the weight, which is everything a client needs to fold a tree. Roots are the members
+  that never appear as a `#Member` in `#Edges`.
+- **System cubes are not default-filled.** SQL normally injects the default member of every
+  dimension a query does not name; for `#` cubes that silently reduced a listing to one
+  arbitrary cell. Metadata reads as "all rows unless filtered".
 - **They appear in `/v1/datasets`**, deliberately — a client discovers the database through
   that list. `describe` now carries **`isSystem: boolean`** so a cube picker can hide them.
 - **`#` must be percent-encoded in a URL**: `GET /v1/%23Cubes`. The engine now decodes the

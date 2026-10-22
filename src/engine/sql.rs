@@ -525,8 +525,17 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     // We skip the Measure Dimension (it has special pivot rules)
                     if Some(dim_name) == p_m_dim.as_ref() { continue; }
 
-                    // If it's not an Axis and not Filtered, we must default it
-                    if !axes.contains(dim_name) && !filters.contains_key(dim_name) {
+                    // If it's not an Axis and not Filtered, we must default it.
+                    //
+                    // EXCEPT for system cubes: `#Cubes`, `#Members`, `#Edges` are metadata
+                    // TABLES, and a table reads as "all rows unless you filter". Defaulting
+                    // an unfiltered dimension silently reduced a discovery query to one
+                    // arbitrary cell combination and returned 0 rows while the cube was
+                    // full — the opposite of what a listing is for.
+                    if !axes.contains(dim_name)
+                        && !filters.contains_key(dim_name)
+                        && !crate::catalog::system_cubes::is_system(&primary_cube.name)
+                    {
                         let dim = primary_cube.dimensions[dim_idx].read().unwrap();
 
                         if let Some(default_name) = dim.get_default_member_name() {

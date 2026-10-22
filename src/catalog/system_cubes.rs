@@ -34,6 +34,7 @@ pub const CUBES: &str = "#Cubes";
 pub const DIMENSIONS: &str = "#Dimensions";
 pub const HIERARCHIES: &str = "#Hierarchies";
 pub const MEMBERS: &str = "#Members";
+pub const EDGES: &str = "#Edges";
 
 /// True when a name is system-owned (`#` prefix).
 pub fn is_system(name: &str) -> bool {
@@ -41,8 +42,21 @@ pub fn is_system(name: &str) -> bool {
 }
 
 /// The system cubes this module maintains.
-pub fn names() -> [&'static str; 4] {
-    [CUBES, DIMENSIONS, HIERARCHIES, MEMBERS]
+pub fn names() -> [&'static str; 5] {
+    [CUBES, DIMENSIONS, HIERARCHIES, MEMBERS, EDGES]
+}
+
+/// One hierarchy's members and parent/child edges, captured before the catalogue is touched.
+struct HierarchyFacts {
+    name: String,
+    members: Vec<String>,
+    /// (child, parent, weight)
+    edges: Vec<(String, String, f64)>,
+}
+
+struct DimensionFacts {
+    name: String,
+    hierarchies: Vec<HierarchyFacts>,
 }
 
 /// Rebuilds every system cube from the current catalogue state.
@@ -51,7 +65,7 @@ pub fn names() -> [&'static str; 4] {
 pub fn rebuild(catalog: &mut Catalog) {
     // --- 1. Snapshot USER content before touching the system cubes. ---
     let mut cubes: Vec<(String, Option<String>, bool)> = Vec::new();
-    let mut dimensions: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    let mut dimensions: Vec<DimensionFacts> = Vec::new();
 
     for cube in catalog.cubes.values() {
         if is_system(&cube.name) {
@@ -69,16 +83,57 @@ pub fn rebuild(catalog: &mut Catalog) {
             continue;
         }
         let mut dim = dimension.write().unwrap_or_else(|e| e.into_inner());
-        let hierarchies = dim.hierarchy_names();
-        let members = dim.member_order_names();
-        dimensions.push((name.clone(), hierarchies, members));
+        // `registered_ids()` lists only members the hierarchy has a NAME for; a
+        // consolidated parent can live in the consolidation map alone, so iterating it
+        // skipped every parent and produced an empty edge table. `display_order()` covers
+        // the whole tree — parents included — once it has been built.
+        dim.ensure_display_order();
+        let mut facts = DimensionFacts {
+            name: name.clone(),
+            hierarchies: Vec::new(),
+        };
+        // EVERY hierarchy, not just the default: a multi-hierarchy dimension keeps
+        // consolidated members (and their children) in the others, and listing only the
+        // default made them invisible to SQL.
+        for hierarchy_name in dim.hierarchy_names() {
+            let Some(hierarchy) = dim.hierarchy(&hierarchy_name) else {
+                continue;
+            };
+            let mut facts_for_hierarchy = HierarchyFacts {
+                name: hierarchy_name.clone(),
+                members: Vec::new(),
+                edges: Vec::new(),
+            };
+            for id in hierarchy.display_order().to_vec() {
+                // The DIMENSION owns the canonical id -> name map. A hierarchy keeps its own
+                // keys, which come back lowercased for members it did not itself create,
+                // making a listing read "bookcases" for "Bookcases".
+                let member = dim.get_name(id);
+                facts_for_hierarchy.members.push(member.clone());
+                for (child, weight) in hierarchy.children_of(id) {
+                    facts_for_hierarchy.edges.push((
+                        dim.get_name(*child),
+                        member.clone(),
+                        *weight,
+                    ));
+                }
+            }
+            facts.hierarchies.push(facts_for_hierarchy);
+        }
+        dimensions.push(facts);
     }
 
     // --- 2. (Re)create them. `add_cube` overwrites, which is the rebuild semantic. ---
     catalog.add_cube(CUBES, &["#Cube", "#Property"], None, true);
     catalog.add_cube(DIMENSIONS, &["#Dimension", "#Property"], None, true);
     catalog.add_cube(HIERARCHIES, &["#Dimension", "#Hierarchy"], None, true);
-    catalog.add_cube(MEMBERS, &["#Dimension", "#Member"], None, true);
+    catalog.add_cube(MEMBERS, &["#Dimension", "#Hierarchy", "#Member"], None, true);
+    catalog.add_cube(
+        EDGES,
+        &["#Dimension", "#Hierarchy", "#Member", "#Parent"],
+        None,
+        true,
+    );
 
     // --- 3. Populate. ---
     for (name, measure_dimension, is_aggregating) in &cubes {
@@ -90,17 +145,27 @@ pub fn rebuild(catalog: &mut Catalog) {
             if *is_aggregating { "false" } else { "true" },
         );
     }
-    for (name, hierarchies, _) in &dimensions {
-        put(catalog, DIMENSIONS, &[name, "hierarchyCount"], &hierarchies.len().to_string());
+    for dimension in &dimensions {
+        let count = dimension.hierarchies.len().to_string();
+        put(catalog, DIMENSIONS, &[&dimension.name, "hierarchyCount"], &count);
     }
-    for (name, hierarchies, _) in &dimensions {
-        for hierarchy in hierarchies {
-            put(catalog, HIERARCHIES, &[name, hierarchy], "1");
-        }
-    }
-    for (name, _, members) in &dimensions {
-        for member in members {
-            put(catalog, MEMBERS, &[name, member], "1");
+    for dimension in &dimensions {
+        for hierarchy in &dimension.hierarchies {
+            put(catalog, HIERARCHIES, &[&dimension.name, &hierarchy.name], "1");
+            for member in &hierarchy.members {
+                put(catalog, MEMBERS, &[&dimension.name, &hierarchy.name, member], "1");
+            }
+            // A ROOT is simply a member with no edge row; the client folds the edges into a
+            // tree and takes the members it never saw as a child. That is why the weight is
+            // the cell: the same edge carries the rollup share.
+            for (child, parent, weight) in &hierarchy.edges {
+                put_number(
+                    catalog,
+                    EDGES,
+                    &[&dimension.name, &hierarchy.name, child, parent],
+                    *weight,
+                );
+            }
         }
     }
 }
@@ -190,13 +255,15 @@ mod system_cube_tests {
             "every dimension owns a default hierarchy: {hierarchies:?}"
         );
 
+        // #Members is (dimension, hierarchy, member) since members are listed per
+        // hierarchy: consolidated members exist only in the hierarchies that define them.
         let members = rows(&catalog, MEMBERS);
         assert!(
-            members.iter().any(|r| r[0] == "Region" && r[1] == "East"),
+            members.iter().any(|r| r[0] == "Region" && r[2] == "East"),
             "{members:?}"
         );
         assert!(
-            members.iter().any(|r| r[0] == "Measure" && r[1] == "Revenue"),
+            members.iter().any(|r| r[0] == "Measure" && r[2] == "Revenue"),
             "{members:?}"
         );
     }
@@ -249,5 +316,89 @@ mod system_cube_tests {
             .write_splashed(&["Bogus", "x"], 1.0, crate::cube::cube::SplashMode::Replace)
             .expect_err("system cubes are read-only");
         assert!(err.contains("read-only"), "{err}");
+    }
+}
+/// Writes a NUMERIC system-cube cell (the edge weight) straight into the store.
+fn put_number(catalog: &mut Catalog, cube_name: &str, coords: &[&str], value: f64) {
+    let Some(cube) = catalog.get_cube_mut(cube_name) else {
+        return;
+    };
+    let ids: Vec<u32> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, member)| {
+            cube.dimensions[i]
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_leaf(member)
+        })
+        .collect();
+    cube.store.write(&ids, CellValue::Numeric(value));
+}
+
+#[cfg(test)]
+mod edge_tests {
+    //! `#Edges` and per-hierarchy `#Members`, which the CLI probe suggested were empty.
+
+    use super::*;
+    use crate::catalog::catalog::Catalog;
+
+    /// (dimension values..., value) for every cell, sorted for determinism.
+    fn rows(catalog: &Catalog, cube_name: &str) -> Vec<Vec<String>> {
+        let cube = catalog.get_cube(cube_name).expect("system cube");
+        let mut result: Vec<Vec<String>> = cube
+            .store
+            .scan_subcube(&vec![None; cube.dimensions.len()])
+            .into_iter()
+            .map(|(coords, value)| {
+                let mut row: Vec<String> = coords
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| cube.dimensions[i].read().unwrap().get_name(*id))
+                    .collect();
+                row.push(value.to_string());
+                result_push_value(&mut row, value);
+                row
+            })
+            .collect();
+        result.sort();
+        result
+    }
+
+    fn result_push_value(row: &mut Vec<String>, value: crate::cube::node::CellValue) {
+        // `CellValue`'s Display is what the scan gives us; keep it as the last column.
+        let _ = (row, value);
+    }
+
+    #[test]
+    fn edges_capture_the_hierarchy_structure() {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Sales", &["Region", "Measure"], Some("Measure"), true);
+        catalog.create_hierarchy("Region", "Rollup").expect("hierarchy");
+        {
+            let dim = catalog.get_dimension("Region").expect("Region");
+            let mut d = dim.write().expect("lock");
+            d.add_component_in(Some("Rollup"), "All", "East", 1.0)
+                .expect("East under All");
+            d.add_component_in(Some("Rollup"), "All", "West", 0.5)
+                .expect("West under All");
+        }
+        rebuild(&mut catalog);
+
+        let edges = rows(&catalog, EDGES);
+        assert!(
+            edges.iter().any(|r| r[2].eq_ignore_ascii_case("East") && r[3] == "All"),
+            "East -> All must be an edge: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|r| r[2].eq_ignore_ascii_case("West") && r[3] == "All" && r[4] == "0.5"),
+            "the weight travels as the cell: {edges:?}"
+        );
+
+        let members = rows(&catalog, MEMBERS);
+        assert!(
+            members.iter().any(|r| r[1] == "Rollup" && r[2] == "All"),
+            "the consolidated parent must be listed under Rollup: {members:?}"
+        );
     }
 }

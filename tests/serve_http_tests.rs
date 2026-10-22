@@ -394,7 +394,7 @@ fn get_datasets_lists_the_catalog_names_in_stored_casing_sorted() {
     // `isSystem` in describe is what a cube picker filters on); `#` sorts first.
     assert_eq!(
         resp.json()["datasets"],
-        serde_json::json!(["#Cubes", "#Dimensions", "#Hierarchies", "#Members", "Markets", "Sales"])
+        serde_json::json!(["#Cubes", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "Markets", "Sales"])
     );
 
     // Every advertised name must actually resolve as a dataset (the round trip
