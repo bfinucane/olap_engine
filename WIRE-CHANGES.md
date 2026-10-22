@@ -54,9 +54,16 @@ build on.
 
 - **New datasets:** `#Cubes(#Cube, #Property)`, `#Dimensions(#Dimension, #Property)`,
   `#Hierarchies(#Dimension, #Hierarchy)`, `#Members(#Dimension, #Hierarchy, #Member)`,
-  `#Edges(#Dimension, #Hierarchy, #Member, #Parent)`. All measure-less: their value is a
-  string, and a query appends the usual implicit `value` column (`#Edges` carries the
-  rollup weight as a number).
+  `#Edges(#Dimension, #Hierarchy, #Member, #Parent)`, `#Columns(#Cube, #Column, #Property)`.
+  All measure-less: their value is a string, and a query appends the usual implicit `value`
+  column (`#Edges` carries the rollup weight as a number).
+- **`#Columns` is the schema of everything**, including the system cubes themselves, so a
+  client can discover the shape of any dataset without already knowing it:
+  `SELECT #Column, #Property, value FROM #Columns WHERE #Cube = '#Members'` reports each
+  column's `kind` (`dimension`/`measure`), `dataType` and `cardinality`. A measure-less cube
+  also reports its implicit `value` column. This is the SQL equivalent of the per-dataset
+  `describe` response, and the reason the cube lists are self-describing rather than
+  documented only in prose.
 - **Structure, not just lists:** `#Members` is keyed by hierarchy because a consolidated
   member exists only in the hierarchies that define it; `#Edges` gives parent/child pairs
   with the weight, which is everything a client needs to fold a tree. Roots are the members

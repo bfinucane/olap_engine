@@ -24,6 +24,7 @@ over TM1's `}`:
 | `#Hierarchies(Dimension, Hierarchy)` | every hierarchy, including the default |
 | `#Members(Dimension, Hierarchy, Member)` | every member of every hierarchy, consolidated ones included |
 | `#Edges(Dimension, Hierarchy, Member, Parent)` | parent/child pairs with the rollup weight: the structure a client folds into a tree |
+| `#Columns(Cube, Column, Property)` | the schema of EVERY cube (kind, dataType, cardinality), system cubes included |
 
 **The `#` has one consequence worth stating**, because it is invisible until it bites:
 in a URL, `#` begins the fragment, so a client addressing `/v1/%23Cubes` must

@@ -1,14 +1,14 @@
 //! System cubes: read-only, automatically maintained views of the database itself.
 //!
 //! WHAT THEY ARE FOR
-//!   A front end needs to *list* what exists — cubes, dimensions, hierarchies, members —
+//!   A front end needs to *list* what exists Ã¢â‚¬â€ cubes, dimensions, hierarchies, members Ã¢â‚¬â€
 //!   without MDX and without a second metadata API that can drift from the catalogue.
 //!   These are ordinary cubes, so a client lists the database by sending a normal query.
-//!   The security design (`SECURITY-DESIGN.md` §0) also hangs its `Role`/`Dimension`/
+//!   The security design (`SECURITY-DESIGN.md` Ã‚Â§0) also hangs its `Role`/`Dimension`/
 //!   `Member` dictionaries on the same mechanism.
 //!
 //! NAMING
-//!   `#` prefix — the Infor convention (the user's choice; TM1 would use `}`). Any name
+//!   `#` prefix Ã¢â‚¬â€ the Infor convention (the user's choice; TM1 would use `}`). Any name
 //!   beginning with `#` is system-owned: read-only to users, and excluded from the
 //!   listings below.
 //!
@@ -21,7 +21,7 @@
 //!   `#Members` lists members; the members of `#Members` include the names it is writing.
 //!   Listing itself is self-referential (the list would have to contain its own contents),
 //!   so system cubes describe USER content only. Their dictionary dimensions (`#Cube`,
-//!   `#Member`, …) are system-owned too and are skipped for the same reason.
+//!   `#Member`, Ã¢â‚¬Â¦) are system-owned too and are skipped for the same reason.
 //!
 //! WHEN THEY REBUILD
 //!   On load, and after every command in the CLI (`main.rs`). The HTTP server never
@@ -35,17 +35,16 @@ pub const DIMENSIONS: &str = "#Dimensions";
 pub const HIERARCHIES: &str = "#Hierarchies";
 pub const MEMBERS: &str = "#Members";
 pub const EDGES: &str = "#Edges";
+pub const COLUMNS: &str = "#Columns";
 
 /// True when a name is system-owned (`#` prefix).
 pub fn is_system(name: &str) -> bool {
     name.starts_with('#')
 }
-
 /// The system cubes this module maintains.
-pub fn names() -> [&'static str; 5] {
-    [CUBES, DIMENSIONS, HIERARCHIES, MEMBERS, EDGES]
+pub fn names() -> [&'static str; 6] {
+    [CUBES, DIMENSIONS, HIERARCHIES, MEMBERS, EDGES, COLUMNS]
 }
-
 /// One hierarchy's members and parent/child edges, captured before the catalogue is touched.
 struct HierarchyFacts {
     name: String,
@@ -53,12 +52,18 @@ struct HierarchyFacts {
     /// (child, parent, weight)
     edges: Vec<(String, String, f64)>,
 }
-
 struct DimensionFacts {
     name: String,
     hierarchies: Vec<HierarchyFacts>,
 }
-
+/// One column of one cube: the schema row of `#Columns`.
+struct ColumnFacts {
+    cube: String,
+    column: String,
+    kind: String,
+    data_type: String,
+    cardinality: usize,
+}
 /// Rebuilds every system cube from the current catalogue state.
 ///
 /// Cheap enough to call after each command: it copies names, not data.
@@ -70,23 +75,21 @@ pub fn rebuild(catalog: &mut Catalog) {
     for cube in catalog.cubes.values() {
         if is_system(&cube.name) {
             continue;
-        }
-        cubes.push((
+        }        cubes.push((
             cube.name.clone(),
             cube.measure_dimension.clone(),
             cube.is_aggregating,
         ));
     }
-
+    // #Columns is the SCHEMA OF EVERYTHING, so it includes the system cubes themselves:
     for (name, dimension) in catalog.dimensions.iter() {
         if is_system(name) {
             continue;
-        }
-        let mut dim = dimension.write().unwrap_or_else(|e| e.into_inner());
+        }        let mut dim = dimension.write().unwrap_or_else(|e| e.into_inner());
         // `registered_ids()` lists only members the hierarchy has a NAME for; a
         // consolidated parent can live in the consolidation map alone, so iterating it
         // skipped every parent and produced an empty edge table. `display_order()` covers
-        // the whole tree — parents included — once it has been built.
+        // the whole tree Ã¢â‚¬â€ parents included Ã¢â‚¬â€ once it has been built.
         dim.ensure_display_order();
         let mut facts = DimensionFacts {
             name: name.clone(),
@@ -116,13 +119,9 @@ pub fn rebuild(catalog: &mut Catalog) {
                         member.clone(),
                         *weight,
                     ));
-                }
-            }
-            facts.hierarchies.push(facts_for_hierarchy);
-        }
-        dimensions.push(facts);
+                }            }            facts.hierarchies.push(facts_for_hierarchy);
+        }        dimensions.push(facts);
     }
-
     // --- 2. (Re)create them. `add_cube` overwrites, which is the rebuild semantic. ---
     catalog.add_cube(CUBES, &["#Cube", "#Property"], None, true);
     catalog.add_cube(DIMENSIONS, &["#Dimension", "#Property"], None, true);
@@ -134,7 +133,41 @@ pub fn rebuild(catalog: &mut Catalog) {
         None,
         true,
     );
+    catalog.add_cube(COLUMNS, &["#Cube", "#Column", "#Property"], None, true);
 
+    // otherwise the one table you need to read first is the one you cannot look up. It is
+    // safe to include them (unlike #Members, which would have to list its own contents)
+    // because a cube's column list does not depend on its cells.
+    let mut columns: Vec<ColumnFacts> = Vec::new();
+    for cube in catalog.cubes.values() {
+        for (i, dim_name) in cube.dimension_names.iter().enumerate() {
+            let cardinality = cube.dimensions[i]
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            let kind = if cube.measure_dimension.as_deref() == Some(dim_name.as_str()) {
+                "measure"
+            } else {
+                "dimension"
+            };
+            columns.push(ColumnFacts {
+                cube: cube.name.clone(),
+                column: dim_name.clone(),
+                kind: kind.to_string(),
+                data_type: "string".to_string(),
+                cardinality,
+            });
+        }        // A measure-less cube has an implicit `value` column; say so, so a client does not
+        // have to learn that rule from the documentation.
+        if cube.measure_dimension.is_none() {
+            columns.push(ColumnFacts {
+                cube: cube.name.clone(),
+                column: "value".to_string(),
+                kind: "measure".to_string(),
+                data_type: "number".to_string(),
+                cardinality: 0,
+            });
+        }    }
     // --- 3. Populate. ---
     for (name, measure_dimension, is_aggregating) in &cubes {
         put(catalog, CUBES, &[name, "measureDimension"], measure_dimension.as_deref().unwrap_or(""));
@@ -144,18 +177,15 @@ pub fn rebuild(catalog: &mut Catalog) {
             &[name, "isAttributeTable"],
             if *is_aggregating { "false" } else { "true" },
         );
-    }
-    for dimension in &dimensions {
+    }    for dimension in &dimensions {
         let count = dimension.hierarchies.len().to_string();
         put(catalog, DIMENSIONS, &[&dimension.name, "hierarchyCount"], &count);
-    }
-    for dimension in &dimensions {
+    }    for dimension in &dimensions {
         for hierarchy in &dimension.hierarchies {
             put(catalog, HIERARCHIES, &[&dimension.name, &hierarchy.name], "1");
             for member in &hierarchy.members {
                 put(catalog, MEMBERS, &[&dimension.name, &hierarchy.name, member], "1");
-            }
-            // A ROOT is simply a member with no edge row; the client folds the edges into a
+            }            // A ROOT is simply a member with no edge row; the client folds the edges into a
             // tree and takes the members it never saw as a child. That is why the weight is
             // the cell: the same edge carries the rollup share.
             for (child, parent, weight) in &hierarchy.edges {
@@ -165,11 +195,14 @@ pub fn rebuild(catalog: &mut Catalog) {
                     &[&dimension.name, &hierarchy.name, child, parent],
                     *weight,
                 );
-            }
-        }
-    }
-}
-
+            }        }    }
+    // The schema of everything: which columns each cube has, of what kind, how big.
+    for column in &columns {
+        put(catalog, COLUMNS, &[&column.cube, &column.column, "kind"], &column.kind);
+        put(catalog, COLUMNS, &[&column.cube, &column.column, "dataType"], &column.data_type);
+        let cardinality = column.cardinality.to_string();
+        put(catalog, COLUMNS, &[&column.cube, &column.column, "cardinality"], &cardinality);
+    }}
 /// Writes one system-cube cell straight into the store.
 ///
 /// Deliberately NOT `Cube::write`: that refuses writes to system cubes, because they are
@@ -190,7 +223,6 @@ fn put(catalog: &mut Catalog, cube_name: &str, coords: &[&str], value: &str) {
         .collect();
     cube.store.write(&ids, CellValue::String(value.to_string()));
 }
-
 #[cfg(test)]
 mod system_cube_tests {
     //! S0: `#` cubes are derived views of the catalogue, read-only, and refreshed.
@@ -206,11 +238,9 @@ mod system_cube_tests {
             let cube = catalog.get_cube_mut("Sales").expect("Sales");
             cube.write(&["East", "Revenue"], CellValue::Numeric(10.0))
                 .expect("write");
-        }
-        rebuild(&mut catalog);
+        }        rebuild(&mut catalog);
         catalog
     }
-
     /// Reads every cell of a system cube as (dimension values..., string value).
     fn rows(catalog: &Catalog, cube_name: &str) -> Vec<Vec<String>> {
         let cube = catalog.get_cube(cube_name).expect("system cube");
@@ -231,7 +261,6 @@ mod system_cube_tests {
         result.sort();
         result
     }
-
     #[test]
     fn the_system_cubes_describe_the_catalogue() {
         let catalog = catalog_with_sales();
@@ -267,7 +296,6 @@ mod system_cube_tests {
             "{members:?}"
         );
     }
-
     /// A system cube must NOT list itself: the member list would have to contain the
     /// names it is in the middle of writing.
     #[test]
@@ -284,7 +312,6 @@ mod system_cube_tests {
             "no # dictionary dimension may appear in #Dimensions: {dimensions:?}"
         );
     }
-
     #[test]
     fn a_rebuild_picks_up_new_content() {
         let mut catalog = catalog_with_sales();
@@ -297,7 +324,6 @@ mod system_cube_tests {
             "a cube created after the last rebuild must appear"
         );
     }
-
     #[test]
     fn writes_to_a_system_cube_are_refused() {
         let catalog = catalog_with_sales();
@@ -316,9 +342,7 @@ mod system_cube_tests {
             .write_splashed(&["Bogus", "x"], 1.0, crate::cube::cube::SplashMode::Replace)
             .expect_err("system cubes are read-only");
         assert!(err.contains("read-only"), "{err}");
-    }
-}
-/// Writes a NUMERIC system-cube cell (the edge weight) straight into the store.
+    }}/// Writes a NUMERIC system-cube cell (the edge weight) straight into the store.
 fn put_number(catalog: &mut Catalog, cube_name: &str, coords: &[&str], value: f64) {
     let Some(cube) = catalog.get_cube_mut(cube_name) else {
         return;
@@ -335,7 +359,6 @@ fn put_number(catalog: &mut Catalog, cube_name: &str, coords: &[&str], value: f6
         .collect();
     cube.store.write(&ids, CellValue::Numeric(value));
 }
-
 #[cfg(test)]
 mod edge_tests {
     //! `#Edges` and per-hierarchy `#Members`, which the CLI probe suggested were empty.
@@ -364,12 +387,10 @@ mod edge_tests {
         result.sort();
         result
     }
-
     fn result_push_value(row: &mut Vec<String>, value: crate::cube::node::CellValue) {
         // `CellValue`'s Display is what the scan gives us; keep it as the last column.
         let _ = (row, value);
     }
-
     #[test]
     fn edges_capture_the_hierarchy_structure() {
         let mut catalog = Catalog::new();
@@ -382,8 +403,7 @@ mod edge_tests {
                 .expect("East under All");
             d.add_component_in(Some("Rollup"), "All", "West", 0.5)
                 .expect("West under All");
-        }
-        rebuild(&mut catalog);
+        }        rebuild(&mut catalog);
 
         let edges = rows(&catalog, EDGES);
         assert!(
@@ -399,6 +419,86 @@ mod edge_tests {
         assert!(
             members.iter().any(|r| r[1] == "Rollup" && r[2] == "All"),
             "the consolidated parent must be listed under Rollup: {members:?}"
+        );
+    }}
+#[cfg(test)]
+mod schema_tests {
+    //! `#Columns`: the schema of the catalogue itself.
+
+    use super::*;
+    use crate::catalog::catalog::Catalog;
+    use crate::cube::node::CellValue;
+
+    fn catalog_with_sales() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Sales", &["Region", "Measure"], Some("Measure"), true);
+        {
+            let cube = catalog.get_cube_mut("Sales").expect("Sales");
+            cube.write(&["East", "Revenue"], CellValue::Numeric(10.0)).expect("write");
+        }        rebuild(&mut catalog);
+        catalog
+    }
+    fn rows(catalog: &Catalog, cube_name: &str) -> Vec<Vec<String>> {
+        let cube = catalog.get_cube(cube_name).expect("system cube");
+        let mut result: Vec<Vec<String>> = cube
+            .store
+            .scan_subcube(&vec![None; cube.dimensions.len()])
+            .into_iter()
+            .map(|(coords, value)| {
+                let mut row: Vec<String> = coords
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| cube.dimensions[i].read().unwrap().get_name(*id))
+                    .collect();
+                row.push(value.to_string());
+                row
+            })
+            .collect();
+        result.sort();
+        result
+    }    /// `#Columns` is the schema of everything, and it must include the system cubes:
+    /// otherwise the first table a person needs to read is the one they cannot look up.
+    #[test]
+    fn the_schema_cube_describes_every_cube() {
+        let catalog = catalog_with_sales();
+        // (cube, column, property, value)
+        let columns = rows(&catalog, COLUMNS);
+
+        assert!(
+            columns.iter().any(|r| r[0] == "Sales" && r[1] == "Region" && r[2] == "kind" && r[3] == "dimension"),
+            "a dimension column: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|r| r[0] == "Sales" && r[1] == "Measure" && r[2] == "kind" && r[3] == "measure"),
+            "the measure dimension is marked as such: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|r| r[0] == "Sales" && r[1] == "Region" && r[2] == "cardinality"),
+            "cardinality is reported: {columns:?}"
+        );
+
+        // The system cubes describe themselves and each other.
+        assert!(
+            columns.iter().any(|r| r[0] == "#Members" && r[1] == "#Member"),
+            "#Members' own columns: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|r| r[0] == "#Columns" && r[1] == "#Cube"),
+            "#Columns describes itself: {columns:?}"
+        );
+    }
+    /// A measure-less cube has an implicit `value` column; a client should not have to learn
+    /// that rule from documentation.
+    #[test]
+    fn a_measure_less_cube_reports_an_implicit_value_column() {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Attributes", &["Region", "Attribute"], Some("Attribute"), false);
+        rebuild(&mut catalog);
+
+        let columns = rows(&catalog, COLUMNS);
+        assert!(
+            columns.iter().any(|r| r[0] == "Attributes" && r[1] == "Attribute" && r[3] == "measure"),
+            "the attribute dimension is the measure here: {columns:?}"
         );
     }
 }

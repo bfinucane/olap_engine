@@ -261,6 +261,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
             ".help" => {
                 let _ = writeln!(out, "Available Commands:");
                                 let _ = writeln!(out, "  .cubes                       - List all cubes in the catalog");
+                let _ = writeln!(out, "  .schema [cube]               - Columns of a cube (kind, type, cardinality); no arg lists cubes");
                 let _ = writeln!(out, "  .dimensions                  - List all dimensions and their hierarchies");
                 let _ = writeln!(out, "  .create_hierarchy <dim> <h>  - Create a hierarchy inside a dimension");
                 let _ = writeln!(out, "  .import <file.csv> <cube>    - Import numeric data from CSV");
@@ -300,7 +301,75 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                     let cube = &catalog.cubes[name];
                     let m_dim = cube.measure_dimension.clone().unwrap_or_else(|| "None".to_string());
                     let cube_type = if cube.is_aggregating { "Transactional" } else { "Attribute" };
-                    let _ = writeln!(out, "  - {} [{}] (Dims: {:?}) [Measure Dim: {}]", name, cube_type, cube.dimension_names, m_dim);
+                    let _ = writeln!(out, "  - {} [{}] (Dims: {:?}) [Measure Dim: {}]", cube.name, cube_type, cube.dimension_names, m_dim);
+                }
+                // Say these exist. A person cannot discover a system cube by guessing; they
+                // are listed separately because they are engine-maintained, not user data.
+                let mut system: Vec<&String> = catalog
+                    .cubes
+                    .keys()
+                    .filter(|k| olap_engine::catalog::system_cubes::is_system(k))
+                    .collect();
+                if !system.is_empty() {
+                    system.sort();
+                    let _ = writeln!(out, "  System cubes (read-only, describe the database itself):");
+                    for name in system {
+                        let system_name = &catalog.cubes[name].name;
+                        let _ = writeln!(out, "  - {}   (.schema {} to see its columns)", system_name, system_name);
+                    }
+                }
+            }
+
+            // The object-explorer "columns" pane: what a person needs before they can write
+            // a query, without having read any documentation.
+            ".schema" => {
+                if parts.len() == 1 {
+                    let _ = writeln!(out, "Usage: .schema <cube>   (use .cubes to list them)");
+                    let _ = writeln!(out, "The same information is a query: SELECT #Column, #Property, value FROM #Columns WHERE #Cube = '<cube>'");
+                } else if parts.len() > 2 {
+                    let _ = writeln!(out, "Usage: .schema <cube>");
+                    ok = false;
+                } else {
+                    match catalog.get_cube(parts[1]) {
+                        Some(cube) => {
+                            let note = if olap_engine::catalog::system_cubes::is_system(&cube.name) {
+                                "  [system cube: maintained by the engine, read-only]"
+                            } else if cube.is_aggregating {
+                                ""
+                            } else {
+                                "  [attribute table]"
+                            };
+                            let _ = writeln!(
+                                out,
+                                "Cube '{}' ({} dimensions){}",
+                                cube.name,
+                                cube.dimension_names.len(),
+                                note
+                            );
+                            for (i, dim_name) in cube.dimension_names.iter().enumerate() {
+                                let cardinality = cube.dimensions[i].read().unwrap().len();
+                                let kind = if cube.measure_dimension.as_deref()
+                                    == Some(dim_name.as_str())
+                                {
+                                    "measure"
+                                } else {
+                                    "dimension"
+                                };
+                                let _ = writeln!(
+                                    out,
+                                    "  - {:<12} {:<9} cardinality {}",
+                                    dim_name, kind, cardinality
+                                );
+                            }
+                            if cube.measure_dimension.is_none() {
+                                let _ = writeln!(out, "  - {:<12} {:<9} implicit", "value", "measure");
+                            }
+                        }
+                        None => {
+                            let _ = writeln!(out, "Cube '{}' not found.", parts[1]);
+                            ok = false;
+                        }
+                    }
                 }
             }
             

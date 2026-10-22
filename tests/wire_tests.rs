@@ -1781,10 +1781,19 @@ fn a_system_cube_answers_a_normal_query() {
         names.iter().any(|n| n == "Sales"),
         "the domain of #Cube must include the user's cubes: {names:?}"
     );
-    assert!(
-        !names.iter().any(|n| n.starts_with('#')),
-        "system cubes must not list themselves: {names:?}"
-    );
+    // The DOMAIN is shared with #Columns, which deliberately DOES describe the system
+    // cubes, so their names are legitimately in it. What must not happen is #Cubes listing
+    // them as ROWS: a cube's listing describes user content only.
+    let mut p2 = request("#Cubes");
+    p2.group_by = vec![serde_json::from_value(json!({"name": "#Cube"})).expect("GroupBy")];
+    let rows = wire::query(&mut catalog, &p2).expect("query #Cubes").rows;
+    for row in &rows {
+        let cube_name = row[0].as_str().unwrap_or("");
+        assert!(
+            !cube_name.starts_with('#'),
+            "#Cubes must not list a system cube as a row: {cube_name:?}"
+        );
+    }
 }
 /// `value` STANDS FOR ALL MEASURES when the cube defines a measure dimension: one column
 /// per measure member, with the labels a client needs to render them.
