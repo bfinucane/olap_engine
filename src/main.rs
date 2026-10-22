@@ -139,6 +139,9 @@ fn run_batch(script: &str, args: &CliArgs) -> ExitCode {
     // Always start from a clean, empty catalog so runs are hermetic and
     // independent of any database.bin lying around.
     let mut catalog = Catalog::new();
+    // A batch run starts empty, but a script may query the system cubes before it
+    // creates anything, so build them up front too.
+    olap_engine::catalog::system_cubes::rebuild(&mut catalog);
 
     let mut output = String::new();
     let script_ok = run_script(&mut catalog, script, &mut output);
@@ -285,7 +288,13 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                         ".cubes" => {
                 let _ = writeln!(out, "Cubes in Catalog:");
                 // Deterministic order (HashMap iteration is randomized per run).
-                let mut names: Vec<&String> = catalog.cubes.keys().collect();
+                // System cubes (`#`) are engine internals: hidden from a human listing,
+                // still queryable by name and still listed by /v1/datasets with isSystem.
+                let mut names: Vec<&String> = catalog
+                    .cubes
+                    .keys()
+                    .filter(|k| !olap_engine::catalog::system_cubes::is_system(k))
+                    .collect();
                 names.sort();
                 for name in names {
                     let cube = &catalog.cubes[name];
@@ -784,7 +793,13 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                 let _ = writeln!(out, "Dimensions in Catalog:");
                 // Deterministic order: `dimensions` is a HashMap, so sort keys
                 // to keep output stable across runs (important for golden tests).
-                let mut names: Vec<&String> = catalog.dimensions.keys().collect();
+                // System (`#`) dictionary dimensions are engine internals: hidden here,
+                // still queryable by name.
+                let mut names: Vec<&String> = catalog
+                    .dimensions
+                    .keys()
+                    .filter(|k| !olap_engine::catalog::system_cubes::is_system(k))
+                    .collect();
                 names.sort();
                 for name in names {
                     let dim = catalog.dimensions[name].read().unwrap();
@@ -830,6 +845,11 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
             Err(e) => { let _ = writeln!(out, "Error: {}", e); ok = false; }
         }
     }
+
+    // System cubes are DERIVED. Refresh them after every command, so a listing query
+    // sees the effect of the command that just ran (a new cube, a new member from an
+    // INSERT, a hierarchy edit). Cheap: it copies names, not data.
+    olap_engine::catalog::system_cubes::rebuild(catalog);
 
     // Stop the stopwatch and append the execution time
     let elapsed = start_time.elapsed();

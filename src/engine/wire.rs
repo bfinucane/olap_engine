@@ -103,6 +103,12 @@ pub struct CatalogResponse {
     /// `Cube::is_aggregating`, which is what the engine itself uses to decide.
     #[serde(rename = "isAttributeTable")]
     pub is_attribute_table: bool,
+    /// True when the cube is engine-maintained (`#` prefix): a read-only view of the
+    /// database itself (`#Cubes`, `#Dimensions`, `#Hierarchies`, `#Members`), not user
+    /// data. Listed so a client can query them; flagged so a UI can hide them from a
+    /// normal cube picker.
+    #[serde(rename = "isSystem")]
+    pub is_system: bool,
 }
 
 /// §1 `CatalogResponse.columns[]`.
@@ -549,6 +555,7 @@ pub fn describe(catalog: &Catalog, dataset: &str) -> Result<CatalogResponse, Wir
         columns,
         measure_dimension: cube.measure_dimension.clone(),
         is_attribute_table: !cube.is_aggregating,
+        is_system: crate::catalog::system_cubes::is_system(&cube.name),
     })
 }
 

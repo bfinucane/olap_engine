@@ -317,12 +317,19 @@ fn get_datasets_lists_the_catalog_names_in_stored_casing_sorted() {
     assert_eq!(resp.header("Content-Type"), Some("application/json"));
 
     // Fixture inserts `Sales` then `Markets`; the response must be sorted.
-    assert_eq!(resp.json()["datasets"], serde_json::json!(["Markets", "Sales"]));
+    //
+    // The `#`-prefixed system cubes are listed too, deliberately: a client discovers the
+    // database by listing datasets, and `isSystem` in `describe` is what tells a cube
+    // picker to hide them. `#` sorts before letters, so they lead.
+    assert_eq!(
+        resp.json()["datasets"],
+        serde_json::json!(["#Cubes", "#Dimensions", "#Hierarchies", "#Members", "Markets", "Sales"])
+    );
 
     // Every advertised name must be describable via the verbatim name — the
-    // round trip Plateau depends on.
-    for name in ["Markets", "Sales"] {
-        let d = get(&format!("{}/v1/{}", srv.base, name));
+    // round trip Plateau depends on. (`#` must be percent-encoded in the URL.)
+    for (name, url) in [("Markets", "Markets"), ("Sales", "Sales"), ("#Cubes", "%23Cubes")] {
+        let d = get(&format!("{}/v1/{}", srv.base, url));
         assert_eq!(d.status, 200, "advertised dataset '{name}' must be describable");
         assert_eq!(d.json()["dataset"], serde_json::json!(name));
     }

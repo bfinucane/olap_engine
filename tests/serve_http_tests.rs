@@ -389,9 +389,13 @@ fn get_datasets_lists_the_catalog_names_in_stored_casing_sorted() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.header("Content-Type"), Some("application/json"));
 
-    // The fixture builds `Sales` and `Markets`; the response is sorted, so the
-    // order is `Markets` then `Sales` regardless of insertion order.
-    assert_eq!(resp.json()["datasets"], serde_json::json!(["Markets", "Sales"]));
+    // The fixture builds `Sales` and `Markets`; the response is sorted. The `#` system
+    // cubes are listed too (a client discovers the database through this list, and
+    // `isSystem` in describe is what a cube picker filters on); `#` sorts first.
+    assert_eq!(
+        resp.json()["datasets"],
+        serde_json::json!(["#Cubes", "#Dimensions", "#Hierarchies", "#Members", "Markets", "Sales"])
+    );
 
     // Every advertised name must actually resolve as a dataset (the round trip
     // the client depends on), and the routing must NOT mistake `datasets` for a
@@ -810,20 +814,17 @@ fn the_sql_console_cannot_change_the_catalogue() {
 /// A `#`-prefixed dataset must be addressed as `%23` over HTTP.
 ///
 /// `#` begins a URL fragment, so a raw one never reaches a server; without path decoding
-/// a system cube would be reachable in SQL but not over the wire. The 404 below proves
-/// both halves: the request routed, and the name it matched was `#Cubes`.
+/// a system cube would be reachable in SQL but not over the wire.
 #[test]
 fn a_hash_prefixed_dataset_needs_percent_encoding() {
     let srv = server();
 
     let resp = get(&format!("{}/v1/%23Cubes", srv.base));
-    assert_eq!(resp.status, 404, "no such cube yet, but it must ROUTE: {}", resp.body);
-    assert_eq!(resp.code(), "unknown_dataset");
-    assert!(
-        resp.body.contains("#Cubes"),
-        "the decoded name is what the router matched: {}",
-        resp.body
-    );
+    assert_eq!(resp.status, 200, "the request must route AND resolve: {}", resp.body);
+    let body = resp.json();
+    assert_eq!(body["dataset"], serde_json::json!("#Cubes"));
+    // Flagged, so a UI can hide it while the client can still query it.
+    assert_eq!(body["isSystem"], serde_json::json!(true));
 
     // An ordinary dataset is unaffected by decoding.
     assert_eq!(get(&format!("{}/v1/Sales", srv.base)).status, 200);

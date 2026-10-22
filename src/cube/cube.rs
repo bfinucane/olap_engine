@@ -247,6 +247,14 @@ impl Cube {
     /// plan over the wire): aborting the process instead of returning an error
     /// is not acceptable for a public API.
     pub fn write(&self, members: &[&str], value: CellValue) -> Result<(), String> {
+        // System cubes are engine-maintained: a user write would be overwritten by the
+        // next rebuild, so refuse it rather than accept data that silently disappears.
+        if crate::catalog::system_cubes::is_system(&self.name) {
+            return Err(format!(
+                "'{}' is a system cube: it is maintained by the engine and is read-only.",
+                self.name
+            ));
+        }
         if self.dimensions.len() != members.len() {
             return Err(format!(
                 "Expected {} coordinate(s), got {}.",
@@ -316,6 +324,12 @@ impl Cube {
         value: f64,
         mode: SplashMode,
     ) -> Result<usize, String> {
+        if crate::catalog::system_cubes::is_system(&self.name) {
+            return Err(format!(
+                "'{}' is a system cube: it is maintained by the engine and is read-only.",
+                self.name
+            ));
+        }
         if self.dimensions.len() != members.len() {
             return Err(format!(
                 "Expected {} coordinate(s), got {}.",
@@ -512,6 +526,13 @@ fn calculate_jit(
 	/// and the LAST column is the numeric Value.
 	/// Returns a human-readable summary of the import on success.
 	pub fn import_csv(&mut self, filepath: &str, has_headers: bool) -> Result<String, Box<dyn std::error::Error>> {
+        if crate::catalog::system_cubes::is_system(&self.name) {
+            return Err(format!(
+                "'{}' is a system cube: it is maintained by the engine and is read-only.",
+                self.name
+            )
+            .into());
+        }
                 // Create a CSV reader
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(has_headers)

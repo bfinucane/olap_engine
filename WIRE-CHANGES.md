@@ -24,6 +24,30 @@ normative — it is the paste-ready text to put THERE, plus what a client must d
 
 ## Changelog (newest first)
 
+### system cubes (`#` prefix) and `describe.isSystem`
+
+A front end can now **list the database** with an ordinary query: `#Cubes`, `#Dimensions`,
+`#Hierarchies` and `#Members` are read-only cubes describing the catalogue itself. They
+are the "lists" a spreadsheet front end needs, and the dictionaries the security work will
+build on.
+
+- **New datasets:** `#Cubes(#Cube, #Property)`, `#Dimensions(#Dimension, #Property)`,
+  `#Hierarchies(#Dimension, #Hierarchy)`, `#Members(#Dimension, #Member)`. All measure-less:
+  their value is a string, and a query appends the usual implicit `value` column.
+- **They appear in `/v1/datasets`**, deliberately — a client discovers the database through
+  that list. `describe` now carries **`isSystem: boolean`** so a cube picker can hide them.
+- **`#` must be percent-encoded in a URL**: `GET /v1/%23Cubes`. The engine now decodes the
+  path, so a raw `#` would also work if a client could send one (HTTP clients treat it as a
+  fragment and usually cannot). In SQL the name is written bare: `SELECT … FROM #Cubes`.
+- **They are read-only.** `INSERT INTO #Cubes …` is refused: "'#Cubes' is a system cube: it
+  is maintained by the engine and is read-only."
+- **They describe USER content only** — system cubes do not list themselves or their
+  dictionary dimensions, because a member list containing its own contents is
+  self-referential.
+- **Refreshed** on load and after every CLI command. The HTTP server never writes, so its
+  system cubes cannot go stale while it runs.
+
+
 ### `e99f5c8` — calculated fields are EVALUATED
 
 `Measure.expr` (an inline AST, or a name into `expressions`) used to be refused with

@@ -272,6 +272,7 @@ fn describe_section1_shape_and_measure_hint() {
             "columns",
             "dataset",
             "isAttributeTable",
+            "isSystem",
             "measureDimension",
             "primaryKey",
             "rowCount",
@@ -279,6 +280,7 @@ fn describe_section1_shape_and_measure_hint() {
         "CatalogResponse field names"
     );
     assert_eq!(resp.dataset, "Sales");
+    assert!(!resp.is_system, "Sales is user data, not a system cube");
     assert_eq!(resp.row_count, 8, "rowCount is the leaf-cell count");
     assert_eq!(resp.primary_key, Value::Null);
     assert_eq!(
@@ -1741,4 +1743,46 @@ fn cell_to_value_keeps_numbers_numeric_and_strings_textual() {
         json!("Cash")
     );
     assert_eq!(wire::protocol_version(), PROTOCOL_VERSION);
+}
+
+/// `#` cubes are listed but flagged, so a client can query them and a UI can hide them.
+#[test]
+fn a_system_cube_is_listed_and_flagged() {
+    let mut catalog = build_catalog();
+    olap_engine::catalog::system_cubes::rebuild(&mut catalog);
+
+    // Listed: a client lists the database by querying it normally.
+    let datasets = wire::datasets(&catalog).datasets;
+    assert!(
+        datasets.iter().any(|d| d == "#Cubes"),
+        "system cubes must be listed so they can be queried: {datasets:?}"
+    );
+
+    // Flagged, so a cube picker can filter them out.
+    let cubes = wire::describe(&catalog, "#Cubes").expect("describe #Cubes");
+    assert!(cubes.is_system, "#Cubes is a system cube");
+    assert!(!cubes.is_attribute_table, "it is a measure-less cube, not an attribute table");
+
+    let sales = wire::describe(&catalog, "Sales").expect("describe Sales");
+    assert!(!sales.is_system);
+}
+
+/// A system cube is queryable like any other, which is the point: no second metadata API.
+#[test]
+fn a_system_cube_answers_a_normal_query() {
+    let mut catalog = build_catalog();
+    olap_engine::catalog::system_cubes::rebuild(&mut catalog);
+
+    let mut p = request("#Cubes");
+    p.domain_for = vec!["#Cube".to_string()];
+    let resp = wire::query(&mut catalog, &p).expect("query #Cubes");
+    let names = resp.domain.get("#Cube").expect("#Cube domain");
+    assert!(
+        names.iter().any(|n| n == "Sales"),
+        "the domain of #Cube must include the user's cubes: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with('#')),
+        "system cubes must not list themselves: {names:?}"
+    );
 }

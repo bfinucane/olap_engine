@@ -473,6 +473,10 @@ impl Catalog {
             dim_arc.write().unwrap().refresh_display_order();
         }
 
+        // System cubes are DERIVED, so regenerate them rather than trusting the file:
+        // a catalogue saved by an older build must still list correctly.
+        super::system_cubes::rebuild(&mut catalog);
+
         Ok(catalog)
     }
 }
