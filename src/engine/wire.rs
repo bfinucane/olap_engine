@@ -28,7 +28,8 @@ use std::collections::HashMap;
 use crate::catalog::catalog::Catalog;
 use crate::cube::node::CellValue;
 use crate::engine::plan::{
-    execute_plan, Capabilities, PlanError, PlanResult, QueryRequest, PROTOCOL_VERSION,
+    execute_plan, expand_implicit_value, Capabilities, PlanError, PlanResult, QueryRequest,
+    PROTOCOL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +246,13 @@ pub fn datasets(catalog: &Catalog) -> DatasetsResponse {
 /// is derived from whether `limit` actually removed rows.
 pub fn query(catalog: &Catalog, plan: &QueryRequest) -> Result<QueryResponse, WireError> {
     let started = std::time::Instant::now();
+
+    // `value` stands for ALL measures when the cube has a measure dimension. Expand it
+    // BEFORE executing, so the response's measure list matches its columns — deciding
+    // "is this a measure?" from the request is what makes `null` and `measureLabels`
+    // come out right.
+    let expanded = expand_implicit_value(catalog, plan);
+    let plan = &expanded;
 
     // How many rows existed BEFORE the limit, so we can report `truncated`
     // honestly. We recompute this only when a limit is present.

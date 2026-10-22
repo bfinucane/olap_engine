@@ -1786,3 +1786,50 @@ fn a_system_cube_answers_a_normal_query() {
         "system cubes must not list themselves: {names:?}"
     );
 }
+/// `value` STANDS FOR ALL MEASURES when the cube defines a measure dimension: one column
+/// per measure member, with the labels a client needs to render them.
+#[test]
+fn value_expands_to_one_column_per_measure() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Two", &["Region", "Measure"], Some("Measure"), true);
+    {
+        let cube = catalog.get_cube_mut("Two").expect("Two");
+        cube.write(&["East", "Sales"], CellValue::Numeric(10.0)).expect("write");
+        cube.write(&["East", "Cost"], CellValue::Numeric(20.0)).expect("write");
+        cube.write(&["West", "Sales"], CellValue::Numeric(5.0)).expect("write");
+        // West has no Cost: that column must be null, not the string "-".
+    }
+
+    let mut p = request("Two");
+    by_region(&mut p);
+    p.measures.push(
+        serde_json::from_value(json!({"name": "value", "aggregation": "SUM"})).expect("Measure"),
+    );
+
+    let resp = wire::query(&mut catalog, &p).expect("value expansion");
+    assert_eq!(resp.columns, vec!["Region", "Sales", "Cost"]);
+    assert_eq!(resp.measure_names, vec!["Sales", "Cost"]);
+    assert_eq!(resp.measure_labels, vec!["SUM(Sales)", "SUM(Cost)"]);
+    assert_eq!(resp.rows[0], vec![json!("East"), json!(10.0), json!(20.0)]);
+    assert_eq!(
+        resp.rows[1],
+        vec![json!("West"), json!(5.0), Value::Null],
+        "an absent measure is null, and the expanded column must be treated as a measure"
+    );
+}
+
+/// On a cube whose measure dimension is still empty, `value` expands to nothing: the honest
+/// answer is zero rows, not an error about a measure that cannot exist yet.
+#[test]
+fn value_on_an_empty_measure_dimension_returns_no_rows() {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Fresh", &["Region", "Measure"], Some("Measure"), true);
+
+    let mut p = request("Fresh");
+    by_region(&mut p);
+    p.measures.push(serde_json::from_value(json!({"name": "value"})).expect("Measure"));
+
+    let resp = wire::query(&mut catalog, &p).expect("no error for an empty table");
+    assert!(resp.rows.is_empty(), "no data yet: {:?}", resp.rows);
+    assert!(resp.measure_names.is_empty(), "nothing to pivot");
+}

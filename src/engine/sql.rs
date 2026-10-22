@@ -389,6 +389,23 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     let col_raw = proj.to_string();
                     let col_name = col_raw.split('.').next_back().unwrap().trim().to_string();
 
+                    // `value` stands for ALL MEASURES when the cube defines a measure
+                    // dimension: one COLUMN per measure member. Before this, SQL broke the
+                    // result out by measure into separate ROWS under a single column named
+                    // "value", which disagreed with the plan layer (it refused `value`
+                    // outright) and mislabelled the numbers. An empty measure dimension
+                    // expands to nothing and yields zero rows, not an error.
+                    if col_name.eq_ignore_ascii_case("value") && primary_cube.measure_dimension.is_some()
+                    {
+                        for member in primary_cube.measure_member_names() {
+                            if !requested_measures.contains(&member) {
+                                requested_measures.push(member.clone());
+                            }
+                            output_columns.push(member);
+                        }
+                        continue;
+                    }
+
                     output_columns.push(col_name.clone());
                     
                     let mut found = false; // Track if we successfully categorized the column

@@ -576,8 +576,30 @@ impl Dimension {
         }
     }
 
+    /// The member used when a query leaves this dimension unnamed.
+    ///
+    /// It must be ADDRESSABLE in the DEFAULT hierarchy, because that is how a generated
+    /// filter is resolved. A dimension with several hierarchies can have its
+    /// first-created member living in one of the others — `default_member_id` follows
+    /// "first added", not "first in the default hierarchy" — which produced
+    /// `Member 'Furniture' not found` when such a name was injected as a filter.
+    ///
+    /// Falling back to the LOWEST id present in the default hierarchy keeps the choice
+    /// deterministic (ids are never reused), where iterating a HashMap would not.
     pub fn get_default_member_name(&self) -> Option<String> {
-        self.default_member_id.map(|id| self.get_name(id))
+        if let Some(name) = self.default_member_id.map(|id| self.get_name(id))
+            && self.get_id_in(None, &name).is_some()
+        {
+            return Some(name);
+        }
+
+        let hierarchy = self.resolve_hierarchy(None)?;
+        let lowest = hierarchy
+            .registered_ids()
+            .into_iter()
+            .min()
+            .and_then(|id| hierarchy.member_name(id).map(str::to_string));
+        lowest
     }
 
     // --- QUERIES OVER THE LEAF BANK / HIERARCHIES ---

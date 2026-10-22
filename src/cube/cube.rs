@@ -282,6 +282,24 @@ impl Cube {
         Ok(())
     }
 
+            /// Member names of the MEASURE dimension, in display order.
+            ///
+            /// Empty when the cube is measure-less (it has an implicit `value` instead) or
+            /// when the measure dimension has no members yet. Both front ends use this to
+            /// expand a request for `value` into "all measures, one column each".
+            pub fn measure_member_names(&self) -> Vec<String> {
+                let Some(measure_dim) = &self.measure_dimension else {
+                    return Vec::new();
+                };
+                let Some(idx) = self.dimension_names.iter().position(|n| n == measure_dim) else {
+                    return Vec::new();
+                };
+                let mut dim = self.dimensions[idx]
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                dim.member_order_names()
+            }
+
             /// True when at least one of the given coordinates names a Consolidated
             /// (aggregated) member of this cube. Used by INSERT to decide whether a
             /// numeric write should be splashed down to leaves.

@@ -752,17 +752,25 @@ fn get_sql_serves_the_console_page() {
 #[test]
 fn post_sql_runs_a_select() {
     let srv = server();
+    // NOTE: `value` pivots ALL measures into columns, so it cannot be combined with the
+    // measure dimension as an axis. This query is the pivot form: one column per measure
+    // member (Sales, Cost), one row per Region x Product.
     let resp = post_json(
         &format!("{}/v1/sql", srv.base),
-        r#"{"sql":"SELECT Region, Product, Measure, value FROM Sales"}"#,
+        r#"{"sql":"SELECT Region, Product, value FROM Sales"}"#,
     );
 
     assert_eq!(resp.status, 200, "select via the console: {}", resp.body);
     let out = resp.json()["output"].as_str().expect("output is a string").to_string();
-    // The fixture has East/Widget, East/Gadget, West/Widget, West/Gadget for Sales.
+    // The fixture has East/Widget, East/Gadget, West/Widget, West/Gadget.
     assert!(out.contains("Region"), "header row missing:\n{out}");
     assert!(out.contains("East") && out.contains("West"), "rows missing:\n{out}");
-    assert!(out.contains("Widget"), "measures missing:\n{out}");
+    assert!(out.contains("Widget"), "products missing:\n{out}");
+    // The pivot: measure members became COLUMNS, not a Measure column.
+    assert!(
+        out.contains("Sales") && out.contains("Cost"),
+        "value should expand to one column per measure:\n{out}"
+    );
 }
 
 #[test]

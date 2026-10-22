@@ -713,6 +713,46 @@ fn assert_is_measure(cube: &crate::cube::cube::Cube, field: &str) -> Result<(), 
     Ok(())
 }
 
+/// Rewrites a request so an implicit `value` measure becomes the cube's actual measure
+/// members (one measure per member, keeping each measure's aggregation).
+///
+/// Both front doors need this BEFORE the response is shaped. The wire decides whether a
+/// column is a measure by looking at the REQUEST, so a `value` that only expanded inside
+/// `execute_plan` produced columns the response did not recognise as measures — they came
+/// back as the literal string `"-"` instead of `null`, and with no measure labels.
+pub fn expand_implicit_value(catalog: &Catalog, plan: &QueryRequest) -> QueryRequest {
+    let Some(cube) = catalog.get_cube(&plan.dataset) else {
+        return plan.clone();
+    };
+    // Only a cube WITH a measure dimension has anything to expand into; a measure-less
+    // cube's implicit `value` is already the real thing.
+    if cube.measure_dimension.is_none()
+        || !plan
+            .measures
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case("value") && m.expr.is_none())
+    {
+        return plan.clone();
+    }
+
+    let members = cube.measure_member_names();
+    let mut expanded = plan.clone();
+    let mut measures = Vec::with_capacity(plan.measures.len() + members.len());
+    for m in &plan.measures {
+        if m.name.eq_ignore_ascii_case("value") && m.expr.is_none() {
+            for member in &members {
+                let mut measure = m.clone();
+                measure.name = member.clone();
+                measures.push(measure);
+            }
+        } else {
+            measures.push(m.clone());
+        }
+    }
+    expanded.measures = measures;
+    expanded
+}
+
 /// Records how a field folds, refusing a SECOND, different aggregation of it.
 ///
 /// v1 allows one aggregation per field (decision 4): the slice result names a column by
@@ -886,6 +926,9 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
     let mut requested_measures: Vec<String> = Vec::new();
     let mut aggregations: HashMap<String, crate::cube::aggregation::Aggregation> = HashMap::new();
     let mut has_calculated = false;
+    // Set when `value` was expanded into the measure members, so `output_columns` comes
+    // from the expansion rather than from the requested names.
+    let mut expanded_value = false;
 
     for m in &plan.measures {
         if let Some(expr_ref) = &m.expr {
@@ -899,6 +942,26 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
                 record_slot(&mut aggregations, &field, aggregation)?;
                 if !requested_measures.contains(&field) {
                     requested_measures.push(field);
+                }
+            }
+        } else if m.name.eq_ignore_ascii_case("value") && cube.measure_dimension.is_some() {
+            // `value` STANDS FOR ALL MEASURES when the cube defines a measure dimension:
+            // one output column per measure member, in display order. More useful than an
+            // error, and consistent with the SQL front end.
+            //
+            // On a cube whose measure dimension is still EMPTY this expands to nothing, so
+            // the query returns 0 rows — the honest answer for "no data yet" — instead of
+            // an error about a measure that cannot exist yet.
+            expanded_value = true;
+            let parsed = m
+                .aggregation
+                .as_deref()
+                .and_then(crate::cube::aggregation::Aggregation::parse)
+                .unwrap_or(crate::cube::aggregation::Aggregation::Sum);
+            for member in cube.measure_member_names() {
+                record_slot(&mut aggregations, &member, parsed)?;
+                if !requested_measures.contains(&member) {
+                    requested_measures.push(member);
                 }
             }
         } else {
@@ -935,9 +998,9 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
     }
 
     let mut output_columns: Vec<String> = plan.group_by.iter().map(|g| g.name.clone()).collect();
-    if has_calculated {
-        // The slice must return the raw aggregate SLOTS; `apply_calculated_fields`
-        // evaluates the expressions and renames the columns to the requested names.
+    if has_calculated || expanded_value {
+        // The slice returns the raw aggregate slots; `apply_calculated_fields` evaluates
+        // the expressions and renames the columns to the requested names.
         for field in &requested_measures {
             if !output_columns.contains(field) {
                 output_columns.push(field.clone());

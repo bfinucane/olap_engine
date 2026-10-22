@@ -24,6 +24,27 @@ normative — it is the paste-ready text to put THERE, plus what a client must d
 
 ## Changelog (newest first)
 
+### `value` means ALL MEASURES when the cube has a measure dimension
+
+- **Wire:** `measures: [{"name": "value"}]` used to be refused ("'value' is not a measure")
+  on a cube with a measure dimension. It now expands to **one column per measure member**,
+  in display order, with `measureNames`/`measureLabels` set accordingly. An absent cell is
+  `null`.
+- **SQL:** `SELECT Region, value FROM T` used to break the result out by measure into
+  separate ROWS under a column named `value`. It now pivots the same way as the wire:
+  `Region | Sales | Cost`.
+- **An empty measure dimension expands to nothing**, so the query returns **0 rows** rather
+  than an error — the honest answer for a table with no data yet. A table created and not
+  yet populated is a normal cube; `describe` reports `rowCount: 0` and `cardinality: 0`.
+- **`value` cannot be combined with the measure dimension as an axis**: they contradict, and
+  the request is refused with "Cannot select both measure dimension and specific measures."
+- Measure-less cubes are unchanged: there `value` IS the stored cell.
+
+**Also fixed:** a generated default member (the filter injected for a dimension a query
+leaves unnamed) is now only used if it exists in the dimension's **default hierarchy**. A
+multi-hierarchy dimension could have its first-created member in another hierarchy, which
+produced `Member 'Furniture' not found` on a perfectly ordinary query.
+
 ### system cubes (`#` prefix) and `describe.isSystem`
 
 A front end can now **list the database** with an ordinary query: `#Cubes`, `#Dimensions`,
