@@ -806,3 +806,25 @@ fn the_sql_console_cannot_change_the_catalogue() {
         "still the 8 fixture cells"
     );
 }
+
+/// A `#`-prefixed dataset must be addressed as `%23` over HTTP.
+///
+/// `#` begins a URL fragment, so a raw one never reaches a server; without path decoding
+/// a system cube would be reachable in SQL but not over the wire. The 404 below proves
+/// both halves: the request routed, and the name it matched was `#Cubes`.
+#[test]
+fn a_hash_prefixed_dataset_needs_percent_encoding() {
+    let srv = server();
+
+    let resp = get(&format!("{}/v1/%23Cubes", srv.base));
+    assert_eq!(resp.status, 404, "no such cube yet, but it must ROUTE: {}", resp.body);
+    assert_eq!(resp.code(), "unknown_dataset");
+    assert!(
+        resp.body.contains("#Cubes"),
+        "the decoded name is what the router matched: {}",
+        resp.body
+    );
+
+    // An ordinary dataset is unaffected by decoding.
+    assert_eq!(get(&format!("{}/v1/Sales", srv.base)).status, 200);
+}

@@ -236,10 +236,14 @@ fn handle_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
-    let (path, query) = match target.split_once('?') {
+    let (raw_path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
     };
+    // Percent-decode the path. A client addressing a `#`-prefixed system cube MUST send
+    // `%23` (a raw `#` starts a fragment and never reaches a server), so without this the
+    // cube would be unreachable over HTTP while still working in SQL.
+    let path = percent_decode(&raw_path);
 
     // --- Headers (we only need Content-Length) ---
     let mut content_length = 0usize;
@@ -502,4 +506,29 @@ fn write_response(
         stream.write_all(body.as_bytes())?;
     }
     stream.flush()
+}
+
+/// Percent-decodes a URL path (`%23` -> `#`, `%20` -> space).
+///
+/// Needed for `#`-prefixed system cubes: a raw `#` begins a URL fragment, so a client
+/// must send `/v1/%23Cubes`. Decoding the whole path is correct here because the router
+/// compares literal segments; there is no user-supplied path template.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                && let Ok(byte) = u8::from_str_radix(hex, 16)
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
