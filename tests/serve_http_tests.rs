@@ -155,10 +155,11 @@ fn spawn_server_with_security(
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        // Behind auth, the proof of life is a 401 on a protected route: /capabilities
-        // cannot return 200 without a token.
+        // Behind auth, the proof of life is a 401 on a protected route. NOT
+        // /v1/capabilities: that one is deliberately public so a client can discover
+        // authRequired before it has a token.
         let ready = match security {
-            Some(_) => status_of(&server.base, "/v1/capabilities") == Some(401),
+            Some(_) => status_of(&server.base, "/v1/datasets") == Some(401),
             None => get_json(&server.base, "/v1/capabilities").is_some(),
         };
         if ready {
@@ -655,6 +656,13 @@ fn cors_headers_are_present_when_enabled_and_absent_otherwise() {
     let preflight = request("OPTIONS", &format!("{b}/v1/Sales/query"), None);
     assert_eq!(preflight.status, 204, "preflight is 204");
     assert_eq!(preflight.header("Access-Control-Allow-Methods"), Some("GET, POST, OPTIONS"));
+    // Authorization MUST be advertised: a browser sending a bearer token preflights, and a
+    // header absent from this list means the authenticated request never leaves.
+    assert_eq!(
+        preflight.header("Access-Control-Allow-Headers"),
+        Some("Content-Type, Authorization"),
+        "a bearer token needs its header allowed through CORS"
+    );
     assert!(preflight.body.is_empty(), "204 carries no body");
 
     // A server WITHOUT --cors emits none of them. A second, differently configured
@@ -933,6 +941,9 @@ fn a_request_without_a_token_is_unauthorised() {
         resp.body
     );
 
+    // Capabilities is the ONE public data-adjacent route (feature flags only).
+    assert_eq!(get(&format!("{}/v1/capabilities", srv.base)).status, 200);
+
     // An unknown route is indistinguishable from a known one: no structure leak.
     let unknown = get(&format!("{}/v1/does-not-exist", srv.base));
     assert_eq!(unknown.status, 401, "auth must run BEFORE routing: {}", unknown.body);
@@ -1011,13 +1022,17 @@ fn a_malformed_login_body_is_an_invalid_argument() {
 
 /// Capabilities advertise whether a token is needed, so a client can show a login screen
 /// instead of firing requests that all fail.
+/// Capabilities must be readable WITHOUT a token: it is where a client learns that a
+/// token is needed. Requiring auth here would hide `authRequired` exactly when it matters.
 #[test]
-fn capabilities_report_whether_authentication_is_required() {
+fn capabilities_are_public_and_report_whether_authentication_is_required() {
     let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
-    let header = auth_header(&login(&srv.base, "alice", "wonderland"));
-    let resp = request_with_auth("GET", &format!("{}/v1/capabilities", srv.base), None, Some(&header));
-    assert_eq!(resp.status, 200);
+
+    let resp = get(&format!("{}/v1/capabilities", srv.base));
+    assert_eq!(resp.status, 200, "capabilities must not require a token: {}", resp.body);
     assert_eq!(resp.json()["authRequired"], serde_json::json!(true));
+    // It still reveals nothing about the data.
+    assert!(resp.json().get("datasets").is_none());
 }
 
 /// Development mode (`--allow-anonymous`) serves without a token and says so, so a client

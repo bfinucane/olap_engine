@@ -515,7 +515,26 @@ fn handle_connection(
     //
     // Checked BEFORE routing, so an unauthenticated caller learns nothing about which
     // datasets exist: every route (including an unknown one) answers 401 identically.
-    let session = if security.require_auth {
+    //
+    // EXCEPT `GET /v1/capabilities`: it is PUBLIC because it is how a client discovers
+    // that a token is needed at all. Requiring auth for it would make `authRequired`
+    // unreadable exactly when it matters, and it leaks only feature flags, never data.
+    let public_route =
+        request.method == "GET" && request.path.trim_end_matches('/') == "/v1/capabilities";
+    let session = if public_route {
+        // A token is optional here, but a presented one must still be valid.
+        if request.authorization.is_empty() {
+            None
+        } else {
+            match security.session_for(&request.authorization) {
+                Some(session) => Some(session),
+                None => {
+                    write_json(&mut stream, 401, &unauthorized_body(), cors)?;
+                    return Ok(());
+                }
+            }
+        }
+    } else if security.require_auth {
         match security.session_for(&request.authorization) {
             Some(session) => Some(session),
             None => {
@@ -761,7 +780,9 @@ fn write_response(
     if cors {
         head.push_str("Access-Control-Allow-Origin: *\r\n");
         head.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-        head.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
+        // Authorization MUST be allowed: a browser sends a preflight before an authenticated
+        // request, and a header absent from this list makes the request never leave.
+        head.push_str("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
     }
     head.push_str("\r\n");
 

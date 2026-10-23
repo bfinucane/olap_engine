@@ -47,7 +47,10 @@ produced `Member 'Furniture' not found` on a perfectly ordinary query.
 
 ### Authentication: `POST /v1/login`, bearer tokens, `capabilities.authRequired`
 
-Every `/v1` route except `POST /v1/login` now requires `Authorization: Bearer <token>`.
+Every `/v1` route except `POST /v1/login` and `GET /v1/capabilities` requires
+`Authorization: Bearer <token>`. Capabilities is deliberately PUBLIC: it is how a client
+discovers that a token is needed (`authRequired`), so protecting it would hide the answer
+exactly when it matters. It exposes feature flags only, never data.
 Missing, malformed, unknown and expired tokens all return **401** with
 `{"error": "Authentication required. ...", "code": "unauthorized"}` — deliberately one
 message, so a caller learns nothing about which part failed.
@@ -66,6 +69,9 @@ POST /v1/login   {"user": "...", "password": "..."}
   the lifetime is 12 hours.
 - **Auth runs before routing**, so an unauthenticated request gets 401 for an unknown path
   too — it cannot probe which datasets exist.
+- **CORS (`--cors`) now allows `Authorization`** in `Access-Control-Allow-Headers`. Without
+  it a browser preflight for a bearer token is refused, and the request never leaves the
+  browser — it looked like an auth failure but was a CORS failure.
 - Creating users is a CLI action, not a wire one:
   `serve.exe --add-user admin --role admin` (prompts), `serve.exe --list-users`.
 
