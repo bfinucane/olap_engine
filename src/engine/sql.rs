@@ -934,3 +934,90 @@ mod tests {
         assert!(r.rows.is_empty());
     }
 }
+
+/// Every cube name referenced by a read-only SQL statement.
+///
+/// WHY THIS EXISTS
+///   Table access (SECURITY-DESIGN.md S2) is enforced in the HTTP layer, on the dataset name
+///   in the URL. `POST /v1/sql` takes a whole statement instead, so without this a restricted
+///   role could read any cube by sending SQL for it - a complete bypass of the permission
+///   system. The transport checks the names this returns against the session's table access
+///   BEFORE anything executes.
+///
+/// The walk covers what this engine's SQL actually accepts: a single query, subqueries,
+/// set operations (UNION/EXCEPT/INTERSECT) and JOINs. A name it cannot attribute is not
+/// silently ignored for security purposes: the transport refuses the statement in that case.
+pub fn referenced_tables(sql: &str) -> Result<Vec<String>, String> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|e| format!("Could not parse the SQL: {e}"))?;
+    let mut names: Vec<String> = Vec::new();
+
+    fn collect_set_expr(
+        body: &sqlparser::ast::SetExpr,
+        out: &mut Vec<String>,
+    ) {
+        use sqlparser::ast::SetExpr;
+        match body {
+            SetExpr::Select(select) => {
+                for table_with_joins in &select.from {
+                    collect_table_factor(&table_with_joins.relation, out);
+                    for join in &table_with_joins.joins {
+                        collect_table_factor(&join.relation, out);
+                    }
+                }
+                // Subqueries in WHERE / HAVING / projection are not part of the supported
+                // feature set, but a SELECT inside them would still be a bypass if it were
+                // silently skipped; `collect_table_factor` walks derived tables below.
+            }
+            SetExpr::Query(query) => collect_query(query, out),
+            SetExpr::SetOperation { left, right, .. } => {
+                collect_set_expr(left, out);
+                collect_set_expr(right, out);
+            }
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => {
+                // Not read-only statements; `ensure_read_only` refuses them first.
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_query(query: &sqlparser::ast::Query, out: &mut Vec<String>) {
+        // With WITH, the CTEs are named queries: their inner tables are real cubes here
+        // (this engine has no view layer), so they are collected too.
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                collect_query(&cte.query, out);
+            }
+        }
+        collect_set_expr(&query.body, out);
+    }
+
+    fn collect_table_factor(
+        factor: &sqlparser::ast::TableFactor,
+        out: &mut Vec<String>,
+    ) {
+        match factor {
+            sqlparser::ast::TableFactor::Table { name, .. } => {
+                out.push(name.to_string());
+            }
+            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+                collect_query(subquery, out);
+            }
+            sqlparser::ast::TableFactor::NestedJoin { table_with_joins, .. } => {
+                collect_table_factor(&table_with_joins.relation, out);
+                for join in &table_with_joins.joins {
+                    collect_table_factor(&join.relation, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for statement in &statements {
+        if let sqlparser::ast::Statement::Query(query) = statement {
+            collect_query(query, &mut names);
+        }
+    }
+    names.dedup();
+    Ok(names)
+}

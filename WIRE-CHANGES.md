@@ -45,6 +45,21 @@ leaves unnamed) is now only used if it exists in the dimension's **default hiera
 multi-hierarchy dimension could have its first-created member in another hierarchy, which
 produced `Member 'Furniture' not found` on a perfectly ordinary query.
 
+### Table access: hidden cubes look non-existent
+
+A role may be denied a cube (`#TableSecurity`). The wire makes that invisible rather than
+returning 403:
+
+- `GET /v1/datasets` **omits** cubes the caller may not read.
+- `GET /v1/{cube}`, `/sample`, `/query`, and `POST /v1/sql` (any statement naming the cube,
+  including joins and subqueries) answer **404 `unknown_dataset`**, byte-for-byte the same
+  shape as a cube that does not exist.
+- `#TableSecurity` is a new system cube (`#Role, #Cube` -> `READ|WRITE|NONE`) and appears in
+  `#Columns`; it is an ADMIN-writable control cube, unlike the derived system cubes.
+- With no rule, the default is ACCEPT: a cube is visible. Rules restrict; they do not grant.
+
+Clients that key on `unknown_dataset` to mean "deleted/typo" should treat it as "not available
+to you" — the engine deliberately does not distinguish.
 ### Authentication: `POST /v1/login`, bearer tokens, `capabilities.authRequired`
 
 Every `/v1` route except `POST /v1/login` and `GET /v1/capabilities` requires

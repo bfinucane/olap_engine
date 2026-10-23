@@ -326,7 +326,7 @@ fn get_datasets_lists_the_catalog_names_in_stored_casing_sorted() {
     // picker to hide them. `#` sorts before letters, so they lead.
     assert_eq!(
         resp.json()["datasets"],
-        serde_json::json!(["#Columns", "#Cubes", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "Markets", "Sales"])
+        serde_json::json!(["#Columns", "#Cubes", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "#TableSecurity", "Markets", "Sales"])
     );
 
     // Every advertised name must be describable via the verbatim name — the

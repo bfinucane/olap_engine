@@ -144,7 +144,7 @@ feature.
 |---|---|---|
 | S0 | **DONE** - system cubes (section 0), read-only and auto-refreshed | #Cubes/#Dimensions/#Hierarchies/#Members describe the catalogue; a write to a # cube is refused; the lists update after CREATE TABLE and after a new member; describe flags them isSystem; covered by catalog::system_cubes unit tests and serve_http decoding tests |
 | S1 | **DONE** — users, roles, `POST /v1/login`, bearer tokens | login returns a token; a request without one is `401` when auth is required; a bad password is `401` without saying which part failed |
-| S2 | table access | a role at `NONE` on a cube sees `unknown_dataset`; another role sees it |
+| S2 | **DONE** — table access | a role at `NONE` on a cube sees `unknown_dataset`; another role sees it |
 | S3 | dimension access with wildcard + overrides | a denied member is absent from rows *and* from totals; the wildcard covers the rest |
 | S4 | write permissions | a `READ`-only role's write is refused; an `ACCEPT`-default write still works |
 | S5 | joins respect both sides | a join to a forbidden cube is absent; a join on a forbidden dimension yields absent attributes, not an error |
@@ -206,3 +206,45 @@ read-only test; the rule becomes:
 
 Until then the HTTP server has no write endpoint at all, so control cubes are writable only
 from the CLI that owns the catalogue.
+
+---
+
+## 11. S2 implementation notes — table access
+
+**The rule store.** `#TableSecurity(#Role, #Cube)` -> `READ | WRITE | NONE`, written by an
+admin with plain SQL:
+
+```text
+INSERT INTO #TableSecurity VALUES ('reader', 'Sales', 'NONE')
+```
+
+It is a CONTROL cube, and the first cube that is writable while the six derived cubes stay
+read-only. `system_cubes::is_derived()` is an exact list, not a name-prefix test; the rebuild
+creates the control cube only when it is ABSENT, so permissions are never wiped by a rebuild.
+
+**Default ACCEPT, and what that forces for several roles.** The user chose Infor's
+default-accept. That has a consequence the design did not spell out: "union across roles"
+cannot work, because a role with no rule would grant everything and `NONE` could never bind.
+The implemented rule is therefore **the most restrictive EXPLICIT rule wins**; a rule-less
+role does not raise the level. Adding a role can only narrow, which is also the safe direction.
+This is worth confirming — it is the one place the implementation had to choose between the
+written design ("union") and the chosen default.
+
+**What a restriction looks like.** A forbidden cube is reported exactly like a missing one:
+`unknown_dataset` / 404, and it is omitted from `GET /v1/datasets`. Nothing confirms it exists.
+
+**The SQL bypass, closed.** `POST /v1/sql` takes a whole statement, so table access cannot be
+checked from the URL. `sql::referenced_tables()` extracts every cube named anywhere in the
+statement (FROM, JOINs, subqueries, set operations) and the transport refuses the statement
+BEFORE execution if any of them is forbidden. A hidden cube is refused with the same
+`unknown_dataset` answer.
+
+**Known limits, deliberate.**
+- `WRITE` is recorded and parsed but not yet enforced: the HTTP server has no write endpoint.
+  Write enforcement belongs to S4.
+- `#TableSecurity` itself is readable by default (it is just a cube). An admin can hide it
+  with a rule of its own: `INSERT INTO #TableSecurity VALUES ('reader', '#TableSecurity',
+  'NONE')` — enforcement still works, because the server reads the cube from the catalogue
+  directly rather than through the wire.
+- There is no `clear_rule`: the engine has no single-cell removal API, and an empty level reads
+  as a malformed rule (fails closed). To restore access, write `WRITE` explicitly.

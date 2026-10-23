@@ -42,6 +42,7 @@ use olap_engine::engine::plan::QueryRequest;
 use olap_engine::engine::wire::{
     self, capabilities, datasets, describe, query, sample, ErrorResponse, SampleQuery, WireError,
 };
+use olap_engine::security::access::TableAccess;
 use olap_engine::security::session::{Session, SessionStore};
 use olap_engine::security::store::{default_path as default_security_path, SecurityFile};
 
@@ -585,9 +586,22 @@ fn route(
     security: &SecurityState,
     session: Option<&Session>,
 ) -> Result<(u16, serde_json::Value), WireError> {
-    // The session is not yet used for authorisation (table and dimension permissions land
-    // in S2/S3), but it is resolved and threaded here so enforcement has one place to go.
-    let _ = session;
+    // TABLE ACCESS (S2). Default ACCEPT: a role with no rule sees everything, and a rule
+    // exists to RESTRICT. An unauthenticated request (development mode) carries no roles and
+    // is therefore unrestricted - the AUTHENTICATION check is what refuses those requests,
+    // not this policy.
+    let access = TableAccess::for_roles(
+        shared,
+        session.map(|s| s.roles.as_slice()).unwrap_or(&[]),
+    );
+
+    // A cube the caller may not read is reported EXACTLY like a cube that does not exist:
+    // admitting "forbidden" would confirm that a hidden dataset exists, which the design
+    // calls a silent leak.
+    let hidden = |name: &str| WireError {
+        code: "unknown_dataset",
+        message: format!("Dataset '{name}' not found."),
+    };
     // Strip a trailing slash for uniform matching.
     let path = req.path.trim_end_matches('/');
 
@@ -609,7 +623,10 @@ fn route(
         if req.method != "GET" {
             return Err(method_not_allowed("GET"));
         }
-        return Ok((200, serde_json::to_value(datasets(shared)).unwrap()));
+        let mut resp = datasets(shared);
+        // A hidden cube must not even be advertised.
+        resp.datasets.retain(|name| access.can_read(name));
+        return Ok((200, serde_json::to_value(resp).unwrap()));
     }
 
     // POST /v1/sql — the read-only SQL console's endpoint.
@@ -638,6 +655,20 @@ fn route(
             code: "invalid_argument",
             message,
         })?;
+
+        // Table access applies to SQL too. Without this, a role denied a cube on the wire
+        // route could read it by wrapping the same query in SQL - a complete bypass.
+        let referenced = olap_engine::engine::sql::referenced_tables(&body.sql).map_err(
+            |message| WireError {
+                code: "invalid_argument",
+                message,
+            },
+        )?;
+        for table in &referenced {
+            if !access.can_read(table) {
+                return Err(hidden(table));
+            }
+        }
 
         let started = std::time::Instant::now();
         let mut catalog = (**shared).clone();
@@ -683,6 +714,12 @@ fn route(
         Some((d, op)) => (d, op),
         None => (rest, ""),
     };
+
+    // Hides the cube from everyone who may not read it, including the sample and query
+    // sub-routes, before any work is done.
+    if !access.can_read(dataset) {
+        return Err(hidden(dataset));
+    }
 
     match (req.method.as_str(), operation) {
         // GET /v1/{dataset} -> describe

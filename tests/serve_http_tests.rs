@@ -439,7 +439,7 @@ fn get_datasets_lists_the_catalog_names_in_stored_casing_sorted() {
     // `isSystem` in describe is what a cube picker filters on); `#` sorts first.
     assert_eq!(
         resp.json()["datasets"],
-        serde_json::json!(["#Columns", "#Cubes", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "Markets", "Sales"])
+        serde_json::json!(["#Columns", "#Cubes", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "#TableSecurity", "Markets", "Sales"])
     );
 
     // Every advertised name must actually resolve as a dataset (the round trip
@@ -1044,4 +1044,179 @@ fn development_mode_serves_without_a_token_and_says_so() {
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["authRequired"], serde_json::json!(false));
     assert_eq!(get(&format!("{}/v1/datasets", srv.base)).status, 200);
+}
+// ---------------------------------------------------------------------------
+// S2: table access (SECURITY-DESIGN.md §3)
+// ---------------------------------------------------------------------------
+
+/// A server that requires auth AND has table rules written into the database.
+///
+/// `users` are `(name, password, roles)`; `rules` are `(role, cube, level)`. The catalogue is
+/// loaded, the rules applied through the same API an admin's SQL INSERT reaches, and saved.
+fn authenticated_server_with_rules(
+    users: &[(&str, &str, &[&str])],
+    rules: &[(&str, &str, &str)],
+) -> Server {
+    let (db_path, log_path) = unique_paths("tabledb");
+    write_fixture(&db_path);
+
+    if !rules.is_empty() {
+        let mut catalog = Catalog::load_from_disk(db_path.to_str().expect("utf8 path")).expect("load fixture");
+        for (role, cube, level) in rules {
+            let level = olap_engine::security::access::Level::parse(level)
+                .unwrap_or_else(|| panic!("bad level {level:?}"));
+            olap_engine::security::access::set_rule(&mut catalog, role, cube, level)
+                .expect("set rule");
+        }
+        catalog.save_to_disk(db_path.to_str().expect("utf8 path")).expect("save rules");
+    }
+
+    let security_path = log_path.with_extension("security.json");
+    let mut file = olap_engine::security::store::SecurityFile::default();
+    for (name, password, roles) in users {
+        let roles: Vec<String> = roles.iter().map(|role| role.to_string()).collect();
+        file.upsert_user(name, password, &roles).expect("create user");
+    }
+    file.save(&security_path).expect("save security file");
+
+    spawn_server_with_security(&db_path, &log_path, true, Some(&security_path))
+}
+
+fn token_for(srv: &Server, user: &str, password: &str) -> String {
+    let resp = login(&srv.base, user, password);
+    assert_eq!(resp.status, 200, "login for {user}: {}", resp.body);
+    auth_header(&resp)
+}
+
+/// A role whose `NONE` rule hides just one cube: hidden everywhere, and never advertised.
+#[test]
+fn a_none_rule_hides_the_cube_from_every_route() {
+    let srv = authenticated_server_with_rules(
+        &[
+            ("reader", "wonderland", &["reader"]),
+            ("admin", "adminpw", &["admin"]),
+        ],
+        &[("reader", "Sales", "NONE")],
+    );
+
+    let reader = token_for(&srv, "reader", "wonderland");
+    let admin = token_for(&srv, "admin", "adminpw");
+
+    // The admin has no rule: DEFAULT ACCEPT keeps the cube visible.
+    let admin_describe = request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&admin));
+    assert_eq!(admin_describe.status, 200, "admin must still see Sales");
+
+    // The reader is refused on every route that names the cube, with the SAME answer a
+    // missing cube gives: the response must not reveal that it exists.
+    for path in ["/v1/Sales", "/v1/Sales/sample?limit=1", "/v1/Sales/query"] {
+        let resp = if path.ends_with("/query") {
+            request_with_auth(
+                "POST",
+                &format!("{}{path}", srv.base),
+                Some(r#"{"dataset":"Sales","groupBy":[]}"#),
+                Some(&reader),
+            )
+        } else {
+            request_with_auth("GET", &format!("{}{path}", srv.base), None, Some(&reader))
+        };
+        assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+        assert_eq!(resp.code(), "unknown_dataset", "{path}: {}", resp.body);
+    }
+
+    // Indistinguishable in status and code. The MESSAGE names the requested cube (the caller
+    // already knows what they asked for); what must not differ is whether the engine treats
+    // it as non-existent.
+    let missing = request_with_auth("GET", &format!("{}/v1/NoSuchCube", srv.base), None, Some(&reader));
+    let hidden_resp = request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&reader));
+    assert_eq!(missing.status, hidden_resp.status);
+    assert_eq!(missing.code(), hidden_resp.code());
+
+    // The dataset list does not advertise it, but still lists everything else.
+    let listed = request_with_auth("GET", &format!("{}/v1/datasets", srv.base), None, Some(&reader));
+    let names: Vec<String> = listed.json()["datasets"]
+        .as_array()
+        .expect("datasets array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(!names.contains(&"Sales".to_string()), "Sales must be hidden: {names:?}");
+    assert!(names.contains(&"Markets".to_string()), "Markets stays visible: {names:?}");
+
+    // And it does not block anything else.
+    assert_eq!(
+        request_with_auth("GET", &format!("{}/v1/Markets", srv.base), None, Some(&reader)).status,
+        200
+    );
+}
+
+/// SQL is the obvious bypass: the same query wrapped in a statement. It must be refused
+/// BEFORE execution, and the error must look like a missing dataset.
+#[test]
+fn sql_cannot_bypass_table_access() {
+    let srv = authenticated_server_with_rules(
+        &[("reader", "wonderland", &["reader"])],
+        &[("reader", "Sales", "NONE")],
+    );
+    let reader = token_for(&srv, "reader", "wonderland");
+
+    let run = |sql: &str| {
+        request_with_auth(
+            "POST",
+            &format!("{}/v1/sql", srv.base),
+            Some(&format!("{{\"sql\":\"{sql}\"}}")),
+            Some(&reader),
+        )
+    };
+
+    let denied = run("SELECT Region, Product, Measure, value FROM Sales");
+    assert_eq!(denied.status, 404, "SQL bypass: {}", denied.body);
+    assert_eq!(denied.code(), "unknown_dataset");
+
+    // A JOIN reaches a second cube, so both names are checked.
+    let joined = run("SELECT Region, value FROM Markets JOIN Sales USING (Region)");
+    assert_eq!(joined.status, 404, "join bypass: {}", joined.body);
+
+    // Everything else still runs.
+    let allowed = run("SELECT Region, value FROM Markets");
+    assert_eq!(allowed.status, 200, "permitted SQL must still work: {}", allowed.body);
+}
+
+/// The user-chosen default: no rule means access. This is the Infor behaviour, and it is
+/// pinned so a later "secure by default" change is a deliberate decision, not a drift.
+#[test]
+fn a_role_with_no_rule_keeps_full_access() {
+    let srv = authenticated_server_with_rules(
+        &[("analyst", "wonderland", &["analyst"])],
+        &[("other", "Sales", "NONE")],
+    );
+    let analyst = token_for(&srv, "analyst", "wonderland");
+
+    assert_eq!(
+        request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&analyst)).status,
+        200,
+        "DEFAULT ACCEPT: a role with no rule sees everything"
+    );
+
+    let listed = request_with_auth("GET", &format!("{}/v1/datasets", srv.base), None, Some(&analyst));
+    let names = listed.json()["datasets"].as_array().cloned().unwrap_or_default();
+    assert!(
+        names.iter().any(|v| v.as_str() == Some("Sales")),
+        "Sales must be listed for a role with no rule"
+    );
+}
+
+/// A second role must not undo a restriction. With default-accept, taking the most
+/// PERMISSIVE role would make NONE impossible to enforce.
+#[test]
+fn a_second_ruleless_role_does_not_undo_a_restriction() {
+    let srv = authenticated_server_with_rules(
+        &[("readonly", "wonderland", &["reader", "analyst"])],
+        &[("reader", "Sales", "NONE")],
+    );
+    let token = token_for(&srv, "readonly", "wonderland");
+    assert_eq!(
+        request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&token)).status,
+        404,
+        "the restriction in ANY held role binds"
+    );
 }

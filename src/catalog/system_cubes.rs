@@ -37,13 +37,34 @@ pub const MEMBERS: &str = "#Members";
 pub const EDGES: &str = "#Edges";
 pub const COLUMNS: &str = "#Columns";
 
+/// The control cube holding table access: `(#Role, #Cube)` -> `READ` | `WRITE` | `NONE`.
+///
+/// UNLIKE the six derived cubes above, this one is WRITABLE: the engine never generates its
+/// contents, an admin writes them. It is therefore `control`, not `derived`, and the
+/// read-only guard in `Cube::write` must not apply to it.
+pub const TABLE_SECURITY: &str = "#TableSecurity";
+
 /// True when a name is system-owned (`#` prefix).
 pub fn is_system(name: &str) -> bool {
     name.starts_with('#')
 }
-/// The system cubes this module maintains.
+/// The system cubes this module maintains: derived, rebuilt, READ-ONLY.
 pub fn names() -> [&'static str; 6] {
     [CUBES, DIMENSIONS, HIERARCHIES, MEMBERS, EDGES, COLUMNS]
+}
+
+/// True for the cubes the engine DERIVES from the catalogue and regenerates on every rebuild.
+///
+/// These are read-only to users, because anything written would be overwritten by the next
+/// rebuild. This is an exact list rather than a name-prefix test: the security control cubes
+/// (`#TableSecurity`) also carry the prefix but must be writable.
+pub fn is_derived(name: &str) -> bool {
+    names().iter().any(|derived| derived.eq_ignore_ascii_case(name))
+}
+
+/// True for the engine's writable control cubes (security data).
+pub fn is_control(name: &str) -> bool {
+    name.eq_ignore_ascii_case(TABLE_SECURITY)
 }
 /// One hierarchy's members and parent/child edges, captured before the catalogue is touched.
 struct HierarchyFacts {
@@ -134,6 +155,11 @@ pub fn rebuild(catalog: &mut Catalog) {
         true,
     );
     catalog.add_cube(COLUMNS, &["#Cube", "#Column", "#Property"], None, true);
+    // CONTROL cube: created once, never overwritten. `add_cube` would wipe the permissions
+    // on every rebuild, and a rebuild runs after every command.
+    if catalog.get_cube(TABLE_SECURITY).is_none() {
+        catalog.add_cube(TABLE_SECURITY, &["#Role", "#Cube"], None, true);
+    }
 
     // otherwise the one table you need to read first is the one you cannot look up. It is
     // safe to include them (unlike #Members, which would have to list its own contents)
