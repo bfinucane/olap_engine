@@ -371,6 +371,14 @@ pub struct Capabilities {
     /// silently get un-joined data rather than an error.
     #[serde(rename = "supportsJoin")]
     pub supports_join: bool,
+    /// Whether requests must carry a bearer token (S1, SECURITY-DESIGN.md §5).
+    ///
+    /// A client reads this at startup and shows a login screen instead of firing
+    /// requests that would all be 401. Additive: an older client ignores the field and
+    /// simply receives 401s, which is a clearer failure than silently unauthenticated
+    /// data access.
+    #[serde(rename = "authRequired")]
+    pub auth_required: bool,
 }
 
 impl Default for Capabilities {
@@ -409,6 +417,9 @@ impl Default for Capabilities {
             // Attribute joins on a conformed dimension are implemented
             // (`engine::attribute_join`, shared with SQL).
             supports_join: true,
+            // The library cannot know whether it is served behind auth; the binary
+            // overrides this from its own flags.
+            auth_required: false,
         }
     }
 }

@@ -143,7 +143,7 @@ feature.
 | # | Slice | Proof |
 |---|---|---|
 | S0 | **DONE** - system cubes (section 0), read-only and auto-refreshed | #Cubes/#Dimensions/#Hierarchies/#Members describe the catalogue; a write to a # cube is refused; the lists update after CREATE TABLE and after a new member; describe flags them isSystem; covered by catalog::system_cubes unit tests and serve_http decoding tests |
-| S1 | users, roles, `POST /v1/login`, bearer tokens | login returns a token; a request without one is `401` when auth is required; a bad password is `401` without saying which part failed |
+| S1 | **DONE** — users, roles, `POST /v1/login`, bearer tokens | login returns a token; a request without one is `401` when auth is required; a bad password is `401` without saying which part failed |
 | S2 | table access | a role at `NONE` on a cube sees `unknown_dataset`; another role sees it |
 | S3 | dimension access with wildcard + overrides | a denied member is absent from rows *and* from totals; the wildcard covers the rest |
 | S4 | write permissions | a `READ`-only role's write is refused; an `ACCEPT`-default write still works |
@@ -164,3 +164,45 @@ what MiniSheet needs for lists, with or without security.
    with `isSystem: true` and left to the client to filter?
 5. **Read-only roles and the SQL console**: the console runs as whoever logs in; should a
    `READ`-only role even see it, given it only issues SELECTs?
+
+---
+
+## 9. Implementation notes and deviations (S1)
+
+Three decisions had to be made while building S1, each against a constraint the design did
+not know about. They are recorded rather than silently absorbed.
+
+1. **PBKDF2-HMAC-SHA256 instead of argon2.** This workspace builds with `--offline` against
+   a 17-crate cache and cannot reach crates.io, so no crypto crate can be added. Rather
+   than ship no hashing, `security::hash` implements SHA-256, HMAC-SHA256 and PBKDF2
+   against published RFC/FIPS vectors. A stored record keeps an ALGORITHM TAG and its
+   iteration count, so moving to argon2 later is a per-user upgrade, not a format change.
+   PBKDF2 is not memory-hard: it is adequate for a localhost tool and NOT a substitute for
+   argon2 on a network-exposed deployment.
+
+2. **Identity lives in `security.json`, not in the catalogue and not in a cube.** Adding
+   `users` to `Catalog` would change the bincode format and make every existing
+   `database.bin` fail to load (or, worse, misread). Credentials must also not live in a
+   cube, because cubes are queryable. So users, roles and password verifiers sit beside the
+   database in a small JSON file: readable and repairable by hand, absent file = no users.
+   The `#` security CUBES will still hold permissions (S2), as designed.
+
+3. **Authentication is required by default and the server fails CLOSED.** With no users
+   defined it refuses to start and prints the exact `--add-user` command, rather than
+   starting open and hoping someone notices. `--allow-anonymous` exists for development but
+   must be asked for. The test suites pass it explicitly.
+
+## 10. The writable/read-only collision (for S2)
+
+S0 made every `#`-prefixed cube read-only, on the reasoning that the engine rebuilds them.
+The S2 permission cubes (`#TableSecurity`, `#DimensionSecurity`) are the opposite: the whole
+point is that an admin WRITES them. `is_system()` (name prefix) therefore cannot remain the
+read-only test; the rule becomes:
+
+* **derived** system cubes (`#Cubes`, `#Dimensions`, `#Hierarchies`, `#Members`, `#Edges`,
+  `#Columns`) — rebuilt from the catalogue, read-only;
+* **control** cubes (`#TableSecurity`, `#DimensionSecurity`, ...) — admin-writable, and
+  write access to them is reserved for an admin session once enforcement lands.
+
+Until then the HTTP server has no write endpoint at all, so control cubes are writable only
+from the CLI that owns the catalogue.

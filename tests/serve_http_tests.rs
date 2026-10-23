@@ -101,6 +101,20 @@ fn unique_paths(tag: &str) -> (PathBuf, PathBuf) {
 /// process is still reading `--db`. The probe is `/v1/capabilities`, which needs no
 /// dataset, so this works for an empty server too.
 fn spawn_server(db_path: &PathBuf, log_path: &PathBuf, cors: bool) -> Server {
+    spawn_server_with_security(db_path, log_path, cors, None)
+}
+
+/// Spawns a server, optionally behind authentication.
+///
+/// `security = None` runs it in development mode (`--allow-anonymous`): this suite is
+/// about the data transport, and every one of those tests would otherwise need a login.
+/// The auth tests use `Some(path)` and get the REQUIRED behaviour the binary defaults to.
+fn spawn_server_with_security(
+    db_path: &PathBuf,
+    log_path: &PathBuf,
+    cors: bool,
+    security: Option<&PathBuf>,
+) -> Server {
     let exe = env!("CARGO_BIN_EXE_serve");
     let log = std::fs::File::create(log_path).expect("create server log");
 
@@ -116,6 +130,14 @@ fn spawn_server(db_path: &PathBuf, log_path: &PathBuf, cors: bool) -> Server {
         .arg(db_path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log.try_clone().expect("clone log handle")));
+    match security {
+        Some(path) => {
+            command.arg("--security").arg(path);
+        }
+        None => {
+            command.arg("--allow-anonymous");
+        }
+    }
     if cors {
         command.arg("--cors");
     }
@@ -133,7 +155,13 @@ fn spawn_server(db_path: &PathBuf, log_path: &PathBuf, cors: bool) -> Server {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if get_json(&server.base, "/v1/capabilities").is_some() {
+        // Behind auth, the proof of life is a 401 on a protected route: /capabilities
+        // cannot return 200 without a token.
+        let ready = match security {
+            Some(_) => status_of(&server.base, "/v1/capabilities") == Some(401),
+            None => get_json(&server.base, "/v1/capabilities").is_some(),
+        };
+        if ready {
             return server;
         }
         if let Ok(Some(status)) = server.child.try_wait() {
@@ -147,6 +175,13 @@ fn spawn_server(db_path: &PathBuf, log_path: &PathBuf, cors: bool) -> Server {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The HTTP status of a GET, or `None` if the port is not answering.
+fn status_of(base: &str, path: &str) -> Option<u16> {
+    let addr = base.trim_start_matches("http://");
+    TcpStream::connect(addr).ok()?;
+    Some(request("GET", &format!("{base}{path}"), None).status)
 }
 
 /// A server with CORS enabled — what every routing test uses.
@@ -281,6 +316,12 @@ impl HttpResponse {
 /// Sends one request over a fresh connection (`Connection: close`). `body` is
 /// sent as `application/json` when present.
 fn request(method: &str, url: &str, body: Option<&str>) -> HttpResponse {
+    request_with_auth(method, url, body, None)
+}
+
+/// As `request`, but carries a bearer token. `auth` is the full header value
+/// (`Bearer <token>`), so the test can also send a malformed one.
+fn request_with_auth(method: &str, url: &str, body: Option<&str>, auth: Option<&str>) -> HttpResponse {
     let addr = url.trim_start_matches("http://");
     let (authority, target) = match addr.split_once('/') {
         Some((a, t)) => (a, format!("/{t}")),
@@ -294,6 +335,9 @@ fn request(method: &str, url: &str, body: Option<&str>) -> HttpResponse {
     let mut head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n"
     );
+    if let Some(header) = auth {
+        head.push_str(&format!("Authorization: {header}\r\n"));
+    }
     if let Some(b) = body {
         head.push_str("Content-Type: application/json\r\n");
         head.push_str(&format!("Content-Length: {}\r\n", b.len()));
@@ -836,4 +880,153 @@ fn a_hash_prefixed_dataset_needs_percent_encoding() {
 
     // An ordinary dataset is unaffected by decoding.
     assert_eq!(get(&format!("{}/v1/Sales", srv.base)).status, 200);
+}
+// ---------------------------------------------------------------------------
+// S1: authentication (SECURITY-DESIGN.md §5)
+// ---------------------------------------------------------------------------
+
+impl Server {
+    /// Starts a server that REQUIRES authentication, with the given users:
+    /// `(name, password, roles)`.
+    fn authenticated(users: &[(&str, &str, &[&str])]) -> Server {
+        let (db_path, log_path) = unique_paths("authdb");
+        write_fixture(&db_path);
+
+        let security_path = log_path.with_extension("security.json");
+        let mut file = olap_engine::security::store::SecurityFile::default();
+        for (name, password, roles) in users {
+            let roles: Vec<String> = roles.iter().map(|role| role.to_string()).collect();
+            file.upsert_user(name, password, &roles).expect("create user");
+        }
+        file.save(&security_path).expect("save security file");
+
+        spawn_server_with_security(&db_path, &log_path, true, Some(&security_path))
+    }
+}
+
+fn login(base: &str, user: &str, password: &str) -> HttpResponse {
+    post_json(
+        &format!("{base}/v1/login"),
+        &format!("{{\"user\":\"{user}\",\"password\":\"{password}\"}}"),
+    )
+}
+
+fn auth_header(resp: &HttpResponse) -> String {
+    let body = resp.json();
+    let token = body["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("login response has no token: {}", resp.body));
+    format!("Bearer {token}")
+}
+
+/// Without a token, every protected route answers 401 and says nothing else.
+#[test]
+fn a_request_without_a_token_is_unauthorised() {
+    let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
+
+    let resp = get(&format!("{}/v1/datasets", srv.base));
+    assert_eq!(resp.status, 401, "body: {}", resp.body);
+    assert_eq!(resp.code(), "unauthorized");
+    assert!(
+        !resp.body.contains("Sales"),
+        "an unauthenticated response must not leak dataset names: {}",
+        resp.body
+    );
+
+    // An unknown route is indistinguishable from a known one: no structure leak.
+    let unknown = get(&format!("{}/v1/does-not-exist", srv.base));
+    assert_eq!(unknown.status, 401, "auth must run BEFORE routing: {}", unknown.body);
+    assert_eq!(unknown.code(), "unauthorized");
+}
+
+/// A successful login yields a token that unlocks the data routes.
+#[test]
+fn login_issues_a_token_that_unlocks_the_api() {
+    let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
+
+    let resp = login(&srv.base, "alice", "wonderland");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let body = resp.json();
+    assert_eq!(body["user"], serde_json::json!("alice"));
+    assert_eq!(body["roles"], serde_json::json!(["reader"]));
+    assert_eq!(body["token"].as_str().map(str::len), Some(64), "32 bytes as hex");
+    assert!(body["expiresAt"].as_u64().unwrap_or(0) > 0);
+
+    let header = auth_header(&resp);
+    let describe = request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&header));
+    assert_eq!(describe.status, 200, "tokened request: {}", describe.body);
+    assert_eq!(describe.json()["dataset"], serde_json::json!("Sales"));
+
+    // The same route stays closed without it.
+    assert_eq!(get(&format!("{}/v1/Sales", srv.base)).status, 401);
+}
+
+/// A wrong password and an unknown user must be INDISTINGUISHABLE: anything else lets an
+/// attacker enumerate valid user names.
+#[test]
+fn a_wrong_password_and_an_unknown_user_are_indistinguishable() {
+    let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
+
+    let wrong_password = login(&srv.base, "alice", "not-the-password");
+    let unknown_user = login(&srv.base, "nobody", "not-the-password");
+
+    assert_eq!(wrong_password.status, 401);
+    assert_eq!(unknown_user.status, 401);
+    assert_eq!(wrong_password.code(), "unauthorized");
+    assert_eq!(unknown_user.code(), "unauthorized");
+    assert_eq!(
+        wrong_password.body, unknown_user.body,
+        "the two failures must look identical"
+    );
+}
+
+/// A made-up or malformed token is rejected like a missing one.
+#[test]
+fn a_garbage_token_is_rejected() {
+    let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
+    let url = format!("{}/v1/datasets", srv.base);
+
+    for header in ["Bearer deadbeef", "Bearer ", "Basic Zm9vOmJhcg==", "deadbeef"] {
+        let resp = request_with_auth("GET", &url, None, Some(header));
+        assert_eq!(resp.status, 401, "header {header:?}: {}", resp.body);
+        assert_eq!(resp.code(), "unauthorized");
+    }
+}
+
+/// Error codes are the contract: the client switches on them, not on prose.
+#[test]
+fn a_malformed_login_body_is_an_invalid_argument() {
+    let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
+
+    for body in ["not json", "{}", "{\"user\":\"alice\"}"] {
+        let resp = post_json(&format!("{}/v1/login", srv.base), body);
+        assert_eq!(resp.status, 400, "body {body:?}: {}", resp.body);
+        assert_eq!(resp.code(), "invalid_argument");
+    }
+
+    // The login endpoint only accepts POST.
+    let resp = get(&format!("{}/v1/login", srv.base));
+    assert_eq!(resp.status, 405, "{}", resp.body);
+}
+
+/// Capabilities advertise whether a token is needed, so a client can show a login screen
+/// instead of firing requests that all fail.
+#[test]
+fn capabilities_report_whether_authentication_is_required() {
+    let srv = Server::authenticated(&[("alice", "wonderland", &["reader"])]);
+    let header = auth_header(&login(&srv.base, "alice", "wonderland"));
+    let resp = request_with_auth("GET", &format!("{}/v1/capabilities", srv.base), None, Some(&header));
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["authRequired"], serde_json::json!(true));
+}
+
+/// Development mode (`--allow-anonymous`) serves without a token and says so, so a client
+/// written against a protected deployment still works in development.
+#[test]
+fn development_mode_serves_without_a_token_and_says_so() {
+    let srv = server(); // the shared helper starts with --allow-anonymous
+    let resp = get(&format!("{}/v1/capabilities", srv.base));
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["authRequired"], serde_json::json!(false));
+    assert_eq!(get(&format!("{}/v1/datasets", srv.base)).status, 200);
 }

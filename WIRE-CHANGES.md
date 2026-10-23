@@ -45,6 +45,30 @@ leaves unnamed) is now only used if it exists in the dimension's **default hiera
 multi-hierarchy dimension could have its first-created member in another hierarchy, which
 produced `Member 'Furniture' not found` on a perfectly ordinary query.
 
+### Authentication: `POST /v1/login`, bearer tokens, `capabilities.authRequired`
+
+Every `/v1` route except `POST /v1/login` now requires `Authorization: Bearer <token>`.
+Missing, malformed, unknown and expired tokens all return **401** with
+`{"error": "Authentication required. ...", "code": "unauthorized"}` — deliberately one
+message, so a caller learns nothing about which part failed.
+
+```
+POST /v1/login   {"user": "...", "password": "..."}
+200              {"token": "<64 hex chars>", "user": "...", "roles": ["..."], "expiresAt": 1792805349}
+401              {"error": "Invalid user name or password.", "code": "unauthorized"}
+```
+
+- **Wrong password and unknown user are indistinguishable** (same status, same body, and a
+  decoy hash is computed for unknown users so the timing does not leak either).
+- **`capabilities.authRequired`** tells a client up front whether to show a login screen.
+  In development mode (`--allow-anonymous`) it is `false`.
+- **Sessions live in memory**: a restart logs everyone out. `expiresAt` is a Unix timestamp;
+  the lifetime is 12 hours.
+- **Auth runs before routing**, so an unauthenticated request gets 401 for an unknown path
+  too — it cannot probe which datasets exist.
+- Creating users is a CLI action, not a wire one:
+  `serve.exe --add-user admin --role admin` (prompts), `serve.exe --list-users`.
+
 ### system cubes (`#` prefix) and `describe.isSystem`
 
 A front end can now **list the database** with an ordinary query: `#Cubes`, `#Dimensions`,

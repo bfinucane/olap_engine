@@ -124,6 +124,9 @@ fn spawn_server(db_path: &PathBuf, log_path: &PathBuf) -> Server {
     let child = Command::new(exe)
         .args(["--bind", &format!("127.0.0.1:{port}"), "--db"])
         .arg(db_path)
+        // This suite is about dataset names, not identity: run in development mode.
+        // The authentication behaviour has its own tests in serve_http_tests.
+        .arg("--allow-anonymous")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log.try_clone().expect("clone log handle")))
         .spawn()

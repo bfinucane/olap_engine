@@ -15,9 +15,19 @@
 //!   GET  /v1/{dataset}               -> describe
 //!   GET  /v1/{dataset}/sample?limit=N&offset=M[&columns=a,b]  -> sample
 //!   POST /v1/{dataset}/query         -> query   (body is a QueryRequest)
+//!   POST /v1/login                   -> session token (PUBLIC: it is how you get one)
+//!
+//! AUTHENTICATION (SECURITY-DESIGN.md §5)
+//!   Every /v1 route except /v1/login requires `Authorization: Bearer <token>`.
+//!   Required by default; `--allow-anonymous` turns it off for development.
+//!   Users live in `security.json` beside the database, created with
+//!   `serve.exe --add-user <name> --role <role>`.
 //!
 //! USAGE
 //!   cargo run --bin serve -- [--bind 127.0.0.1:8080] [--db database.bin] [--cors]
+//!                             [--security security.json] [--allow-anonymous]
+//!   cargo run --bin serve -- --add-user alice --role reader --password secret
+//!   cargo run --bin serve -- --list-users
 //!
 //! CORS is off by default. Turn it on (`--cors`, or `OLAP_CORS=1`) while the
 //! Plateau dev server runs on a different origin.
@@ -32,6 +42,42 @@ use olap_engine::engine::plan::QueryRequest;
 use olap_engine::engine::wire::{
     self, capabilities, datasets, describe, query, sample, ErrorResponse, SampleQuery, WireError,
 };
+use olap_engine::security::session::{Session, SessionStore};
+use olap_engine::security::store::{default_path as default_security_path, SecurityFile};
+
+/// Everything the request path needs to authenticate a caller.
+///
+/// The security file is loaded once at startup. Creating a user requires a restart, which
+/// is deliberate for S1: a permission change should be an explicit act, not something that
+/// silently takes effect while requests are in flight.
+struct SecurityState {
+    file: SecurityFile,
+    sessions: SessionStore,
+    /// When false the server is in development mode and every request is anonymous.
+    require_auth: bool,
+}
+
+impl SecurityState {
+    fn new(file: SecurityFile, require_auth: bool) -> Self {
+        Self {
+            file,
+            sessions: SessionStore::new(12 * 60 * 60), // 12 hours
+            require_auth,
+        }
+    }
+
+    /// Resolves an `Authorization` header to a live session.
+    ///
+    /// The scheme is matched case-insensitively because HTTP auth schemes are tokens and
+    /// clients differ on the casing.
+    fn session_for(&self, header: &str) -> Option<Session> {
+        let (scheme, token) = header.trim().split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        self.sessions.validate(token.trim())
+    }
+}
 
 /// Body of `POST /v1/sql`.
 #[derive(serde::Deserialize)]
@@ -101,9 +147,50 @@ document.getElementById('sql').addEventListener('keydown', e => {
 "#;
 
 fn main() {
-    let (bind, db_path, cors) = parse_args();
+    let config = parse_args();
 
-    let catalog = load_catalog(&db_path);
+    // Admin utilities act on the security file and exit; they never start a server.
+    if config.list_users || config.add_user.is_some() {
+        std::process::exit(run_admin_command(&config));
+    }
+
+    let security_path = config
+        .security
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| default_security_path(Path::new(&config.db)));
+    let security_file = match SecurityFile::load(&security_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("Could not load the security file: {e}");
+            std::process::exit(2);
+        }
+    };
+    if security_file.is_empty() && !config.allow_anonymous {
+        eprintln!("No users are defined in '{}'.", security_path.display());
+        eprintln!("Authentication is REQUIRED by default, so nobody could call this server.");
+        eprintln!();
+        eprintln!("Create the first user, then start it again:");
+        eprintln!(
+            "  serve.exe --add-user admin --role admin --security {}",
+            security_path.display()
+        );
+        eprintln!("...or start in development mode with --allow-anonymous.");
+        std::process::exit(2);
+    }
+    eprintln!(
+        "Authentication: {} ({} user(s) in '{}').",
+        if config.allow_anonymous {
+            "DISABLED (--allow-anonymous)"
+        } else {
+            "required (bearer token)"
+        },
+        security_file.users.len(),
+        security_path.display()
+    );
+    let security = Arc::new(SecurityState::new(security_file, !config.allow_anonymous));
+
+    let catalog = load_catalog(&config.db);
     // No catalog-wide lock (Phase 1b M3). Reads take an O(1) snapshot of a cube's
     // `VersionStore` and never need the write path; the engine exposes no write
     // endpoint over HTTP, so the only writer is the REPL/import that owns the
@@ -111,10 +198,10 @@ fn main() {
     // behind one lock for no correctness benefit.
     let shared = Arc::new(catalog);
 
-    let listener = match TcpListener::bind(&bind) {
+    let listener = match TcpListener::bind(&config.bind) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Could not bind {}: {}", bind, e);
+            eprintln!("Could not bind {}: {}", config.bind, e);
             std::process::exit(1);
         }
     };
@@ -122,19 +209,21 @@ fn main() {
     eprintln!(
         "olap_engine protocol v{} listening on http://{}",
         wire::protocol_version(),
-        bind
+        config.bind
     );
-    if cors {
+    if config.cors {
         eprintln!("CORS enabled (Access-Control-Allow-Origin: *).");
     }
-    eprintln!("Load 'http://{bind}/v1' as the engine base URL in Plateau.");
+    eprintln!("Load 'http://{}/v1' as the engine base URL in Plateau.", config.bind);
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let shared = Arc::clone(&shared);
+                let security = Arc::clone(&security);
+                let cors = config.cors;
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, shared, cors) {
+                    if let Err(e) = handle_connection(stream, shared, cors, security) {
                         // A client that hangs up mid-response is normal; do not
                         // spam the log for it.
                         if e.kind() != std::io::ErrorKind::BrokenPipe {
@@ -148,31 +237,157 @@ fn main() {
     }
 }
 
-/// Parses `--bind`, `--db`, `--cors` / `OLAP_CORS`.
-fn parse_args() -> (String, String, bool) {
+/// Command-line configuration.
+struct Config {
+    bind: String,
+    db: String,
+    cors: bool,
+    /// Development mode: no token required. Off unless asked for.
+    allow_anonymous: bool,
+    security: Option<String>,
+    add_user: Option<String>,
+    roles: Vec<String>,
+    password: Option<String>,
+    list_users: bool,
+}
+
+/// Parses `--bind`, `--db`, `--cors` / `OLAP_CORS`, `--security`, `--allow-anonymous`,
+/// `--add-user`, `--role`, `--password`, `--list-users`.
+fn parse_args() -> Config {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut bind = "127.0.0.1:8080".to_string();
-    let mut db = "database.bin".to_string();
-    let mut cors =
-        std::env::var("OLAP_CORS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut config = Config {
+        bind: "127.0.0.1:8080".to_string(),
+        db: "database.bin".to_string(),
+        cors: std::env::var("OLAP_CORS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        allow_anonymous: false,
+        security: None,
+        add_user: None,
+        roles: Vec::new(),
+        password: None,
+        list_users: false,
+    };
 
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
             "--bind" if i + 1 < argv.len() => {
-                bind = argv[i + 1].clone();
+                config.bind = argv[i + 1].clone();
                 i += 1;
             }
             "--db" if i + 1 < argv.len() => {
-                db = argv[i + 1].clone();
+                config.db = argv[i + 1].clone();
                 i += 1;
             }
-            "--cors" => cors = true,
+            "--security" if i + 1 < argv.len() => {
+                config.security = Some(argv[i + 1].clone());
+                i += 1;
+            }
+            "--add-user" if i + 1 < argv.len() => {
+                config.add_user = Some(argv[i + 1].clone());
+                i += 1;
+            }
+            "--role" if i + 1 < argv.len() => {
+                config.roles.push(argv[i + 1].clone());
+                i += 1;
+            }
+            "--password" if i + 1 < argv.len() => {
+                config.password = Some(argv[i + 1].clone());
+                i += 1;
+            }
+            "--cors" => config.cors = true,
+            "--allow-anonymous" => config.allow_anonymous = true,
+            "--list-users" => config.list_users = true,
             _ => {}
         }
         i += 1;
     }
-    (bind, db, cors)
+    config
+}
+
+/// `--add-user` / `--list-users`. Returns the process exit code.
+fn run_admin_command(config: &Config) -> i32 {
+    let path = config
+        .security
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| default_security_path(Path::new(&config.db)));
+    let mut file = match SecurityFile::load(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    if config.list_users {
+        if file.is_empty() {
+            println!("No users in '{}'.", path.display());
+        } else {
+            println!("Users in '{}':", path.display());
+            let mut names: Vec<String> = file.users.iter().map(|u| u.name.clone()).collect();
+            names.sort();
+            for name in names {
+                if let Some(user) = file.user(&name) {
+                    let roles = if user.roles.is_empty() {
+                        "(no roles)".to_string()
+                    } else {
+                        user.roles.join(", ")
+                    };
+                    println!("  {:<20} {}", name, roles);
+                }
+            }
+        }
+        if !file.roles.is_empty() {
+            println!("Roles: {}", file.roles.join(", "));
+        }
+        return 0;
+    }
+
+    let Some(name) = &config.add_user else {
+        return 0;
+    };
+
+    // The password is read from --password when given (scriptable), else from stdin
+    // (one line). Neither is echoed securely: a shell history or a piped stdout can
+    // capture it, so this is documented as a development-grade bootstrap.
+    let password = match &config.password {
+        Some(password) => password.clone(),
+        None => {
+            eprint!("Password for '{name}': ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                eprintln!("Could not read a password from stdin.");
+                return 1;
+            }
+            line.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+
+    match file.upsert_user(name, &password, &config.roles) {
+        Ok(()) => match file.save(&path) {
+            Ok(()) => {
+                println!(
+                    "User '{name}' saved to '{}' with role(s): {}",
+                    path.display(),
+                    if config.roles.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        config.roles.join(", ")
+                    }
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        Err(e) => {
+            eprintln!("Could not create the user: {e}");
+            1
+        }
+    }
 }
 
 /// Loads `db_path` if it exists, else starts empty (matching the REPL's
@@ -202,6 +417,8 @@ struct Request {
     /// Raw query string (everything after `?`), if any.
     query: String,
     body: Vec<u8>,
+    /// The raw `Authorization` header value (empty when absent).
+    authorization: String,
 }
 
 impl Request {
@@ -225,6 +442,7 @@ fn handle_connection(
     mut stream: TcpStream,
     shared: Arc<Catalog>,
     cors: bool,
+    security: Arc<SecurityState>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
@@ -245,8 +463,9 @@ fn handle_connection(
     // cube would be unreachable over HTTP while still working in SQL.
     let path = percent_decode(&raw_path);
 
-    // --- Headers (we only need Content-Length) ---
+    // --- Headers (Content-Length and Authorization) ---
     let mut content_length = 0usize;
+    let mut authorization = String::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -256,10 +475,12 @@ fn handle_connection(
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = value.trim().to_string();
+            }
         }
     }
 
@@ -269,7 +490,7 @@ fn handle_connection(
         reader.read_exact(&mut body)?;
     }
 
-    let request = Request { method, path, query, body };
+    let request = Request { method, path, query, body, authorization };
 
     // --- CORS preflight ---
     if request.method == "OPTIONS" {
@@ -283,7 +504,42 @@ fn handle_connection(
         return Ok(());
     }
 
-    match route(&request, &shared) {
+    // --- Login: the one route that cannot require a token, because it issues them ---
+    if request.path.trim_end_matches('/') == "/v1/login" {
+        let (status, value) = login_response(&request, &security);
+        write_json(&mut stream, status, &value.to_string(), cors)?;
+        return Ok(());
+    }
+
+    // --- Authentication ---
+    //
+    // Checked BEFORE routing, so an unauthenticated caller learns nothing about which
+    // datasets exist: every route (including an unknown one) answers 401 identically.
+    let session = if security.require_auth {
+        match security.session_for(&request.authorization) {
+            Some(session) => Some(session),
+            None => {
+                write_json(&mut stream, 401, &unauthorized_body(), cors)?;
+                return Ok(());
+            }
+        }
+    } else {
+        // Development mode: a token is optional, but if one is presented it must be
+        // valid - a stale token failing silently would hide a client bug.
+        if request.authorization.is_empty() {
+            None
+        } else {
+            match security.session_for(&request.authorization) {
+                Some(session) => Some(session),
+                None => {
+                    write_json(&mut stream, 401, &unauthorized_body(), cors)?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    match route(&request, &shared, &security, session.as_ref()) {
         Ok((status, value)) => {
             let text = value.to_string();
             write_json(&mut stream, status, &text, cors)?;
@@ -307,7 +563,12 @@ fn handle_connection(
 fn route(
     req: &Request,
     shared: &Arc<Catalog>,
+    security: &SecurityState,
+    session: Option<&Session>,
 ) -> Result<(u16, serde_json::Value), WireError> {
+    // The session is not yet used for authorisation (table and dimension permissions land
+    // in S2/S3), but it is resolved and threaded here so enforcement has one place to go.
+    let _ = session;
     // Strip a trailing slash for uniform matching.
     let path = req.path.trim_end_matches('/');
 
@@ -316,7 +577,10 @@ fn route(
         if req.method != "GET" {
             return Err(method_not_allowed("GET"));
         }
-        return Ok((200, serde_json::to_value(capabilities()).unwrap()));
+        let mut caps = capabilities();
+        // The binary knows how it was started; the library cannot.
+        caps.auth_required = security.require_auth;
+        return Ok((200, serde_json::to_value(caps).unwrap()));
     }
 
     // GET /v1/datasets — the list of queryable dataset names. Checked BEFORE the
@@ -531,4 +795,79 @@ fn percent_decode(text: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+// ---------------------------------------------------------------------------
+// Authentication endpoints and helpers
+// ---------------------------------------------------------------------------
+
+/// Body of `POST /v1/login`.
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    user: String,
+    password: String,
+}
+
+/// Successful `POST /v1/login` response.
+#[derive(serde::Serialize)]
+struct LoginResponse {
+    token: String,
+    user: String,
+    roles: Vec<String>,
+    #[serde(rename = "expiresAt")]
+    expires_at: u64,
+}
+
+/// The single unauthorised response, so every failure looks the same.
+fn unauthorized_body() -> String {
+    // Deliberately one message for "no token", "unknown token" and "expired token":
+    // a caller learns only that they must log in, never why the token was rejected.
+    let env = ErrorResponse {
+        error: "Authentication required. POST /v1/login to obtain a bearer token.".to_string(),
+        code: "unauthorized".to_string(),
+    };
+    serde_json::to_string(&env).unwrap_or_else(|_| {
+        "{\"error\":\"Authentication required.\",\"code\":\"unauthorized\"}".to_string()
+    })
+}
+
+/// Handles `POST /v1/login`.
+fn login_response(req: &Request, security: &SecurityState) -> (u16, serde_json::Value) {
+    if req.method != "POST" {
+        let env = ErrorResponse {
+            error: "POST a JSON body {\"user\": ..., \"password\": ...} to log in.".to_string(),
+            code: "method_not_allowed".to_string(),
+        };
+        return (405, serde_json::to_value(env).unwrap());
+    }
+
+    let parsed: Result<LoginRequest, _> = serde_json::from_slice(&req.body);
+    let Ok(LoginRequest { user, password }) = parsed else {
+        let env = ErrorResponse {
+            error: "Login body must be JSON with 'user' and 'password'.".to_string(),
+            code: "invalid_argument".to_string(),
+        };
+        return (400, serde_json::to_value(env).unwrap());
+    };
+
+    match security.file.authenticate(&user, &password) {
+        Some(roles) => {
+            let (token, session) = security.sessions.issue(&user, roles);
+            let body = LoginResponse {
+                token,
+                user: session.user,
+                roles: session.roles,
+                expires_at: session.expires_at,
+            };
+            (200, serde_json::to_value(body).unwrap())
+        }
+        None => {
+            // Same message for an unknown user and a wrong password: the response must
+            // not tell an attacker which half was right.
+            let env = ErrorResponse {
+                error: "Invalid user name or password.".to_string(),
+                code: "unauthorized".to_string(),
+            };
+            (401, serde_json::to_value(env).unwrap())
+        }
+    }
 }

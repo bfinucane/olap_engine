@@ -1,10 +1,10 @@
-//! Integration tests for the Plateau wire layer (`engine::wire`) — ENGINE-PROTOCOL.md v1.
+//! Integration tests for the Plateau wire layer (`engine::wire`) â€” ENGINE-PROTOCOL.md v1.
 //!
 //! These cover the RESPONSE half of the protocol: the four operations and the JSON
 //! shapes a Plateau client parses. The plan -> engine REQUEST half is covered by
 //! `tests/plan_tests.rs`; this file is deliberately about what goes back on the wire.
 //!
-//! Normative source: `ENGINE-PROTOCOL.md` §1-§4 (kept in
+//! Normative source: `ENGINE-PROTOCOL.md` Â§1-Â§4 (kept in
 //! `<workspace>/tableau-clone/docs/`). Where this file asserts a shape, the section
 //! reference is in the test name.
 //!
@@ -27,14 +27,14 @@ use serde_json::{json, Value};
 /// A cube shaped to exercise every response field, with measured totals so the
 /// numbers can be asserted exactly.
 ///
-///   Sales(Region, Product, Measure) — 4 leaves x 2 measures = 8 cells
+///   Sales(Region, Product, Measure) â€” 4 leaves x 2 measures = 8 cells
 ///     East/Widget/Sales = 100, East/Widget/Cost = 40
 ///     East/Gadget/Sales =  50, East/Gadget/Cost = 30   (East   Sales 150, Cost 70)
 ///     West/Widget/Sales = 200, West/Widget/Cost = 80
 ///     West/Gadget/Sales =  25, West/Gadget/Cost = 15   (West   Sales 225, Cost 95)
 ///                                                       grand total Sales = 375
 ///
-///   Markets(Region) — a second dataset with no measure dimension, for the
+///   Markets(Region) â€” a second dataset with no measure dimension, for the
 ///   non-pivoting shape.
 fn build_catalog() -> Catalog {
     let mut catalog = Catalog::new();
@@ -60,7 +60,7 @@ fn build_catalog() -> Catalog {
         // FIXTURE SELF-CHECK. The data-import path is under active development, and
         // this fixture is built with the same write API the loaders use. If a change
         // there stops a numeric value landing as a readable leaf cell, EVERY
-        // expectations-based test in this file would fail — and would look like a
+        // expectations-based test in this file would fail â€” and would look like a
         // wire-layer bug. Verify the fixture itself says what it claims, so the
         // failure points at the right layer.
         for (r, p, m, v) in rows {
@@ -133,7 +133,7 @@ fn keys(value: &Value) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// §4 capabilities
+// Â§4 capabilities
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -141,12 +141,13 @@ fn capabilities_section4_keys_and_honest_declarations() {
     let caps = wire::capabilities();
     let v = wire(&caps);
 
-    // The exact wire keys (§4). A rename here silently breaks the client's
+    // The exact wire keys (Â§4). A rename here silently breaks the client's
     // feature detection, which then *enables* features the engine lacks.
     assert_eq!(
         keys(&v),
         vec![
             "aggregations",
+            "authRequired",
             "countDistinctExact",
             "expressionFunctions",
             "filterOperators",
@@ -164,6 +165,7 @@ fn capabilities_section4_keys_and_honest_declarations() {
     assert_eq!(v["supportsLod"], json!(false), "LOD must not be claimed");
     assert_eq!(v["supportsJoin"], json!(true), "attribute joins are implemented");
     assert_eq!(v["supportsInlineDomain"], json!(true));
+    assert_eq!(v["authRequired"], json!(false), "the library default is anonymous; the server overrides it from its flags");
     // COUNTD is not implemented, so the engine must not claim an exact distinct count.
     assert_eq!(
         v["countDistinctExact"],
@@ -182,9 +184,9 @@ fn capabilities_section4_keys_and_honest_declarations() {
 /// directions: everything advertised is accepted, and nothing un-advertised is
 /// quietly accepted either.
 ///
-/// This is the honesty claim in §4 ("This drives the UI: aggregations absent from
+/// This is the honesty claim in Â§4 ("This drives the UI: aggregations absent from
 /// `aggregations` are disabled rather than failing at query time"). The engine is
-/// additive-only today, so this asserts `["SUM"]` — and it is written to keep
+/// additive-only today, so this asserts `["SUM"]` â€” and it is written to keep
 /// working when more are added: it never hardcodes the expected list, it only
 /// requires the advertisement and the implementation to agree.
 #[test]
@@ -257,7 +259,7 @@ fn capabilities_aggregations_match_what_actually_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// §1 describe
+// Â§1 describe
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -265,7 +267,7 @@ fn describe_section1_shape_and_measure_hint() {
     let catalog = build_catalog();
     let resp = wire::describe(&catalog, "Sales").expect("describe Sales");
 
-    // §1 keys, snake -> camel exactly.
+    // Â§1 keys, snake -> camel exactly.
     assert_eq!(
         keys(&wire(&resp)),
         vec![
@@ -321,7 +323,7 @@ fn describe_section1_shape_and_measure_hint() {
     );
 
     // The measure dimension is hinted `measure`; the others `dimension`. A HINT
-    // only (§1), but it must at least be self-consistent with dataType.
+    // only (Â§1), but it must at least be self-consistent with dataType.
     let meas = resp
         .columns
         .iter()
@@ -351,11 +353,11 @@ fn describe_section1_shape_and_measure_hint() {
     }
 }
 
-/// §1: the measure column's TYPE comes from what it holds, not from the fact that
+/// Â§1: the measure column's TYPE comes from what it holds, not from the fact that
 /// it is the measure dimension.
 ///
 /// An attribute cube (`CREATE ATTRIBUTE TABLE`) has a measure dimension whose cells
-/// are STRINGS — `RegionAttr.Attribute` holds `"Ava Thompson"`. The old code
+/// are STRINGS â€” `RegionAttr.Attribute` holds `"Ava Thompson"`. The old code
 /// reported every measure dimension as `number`/`real`/`measure`, so a client
 /// typed a text column as numeric and failed to render it.
 #[test]
@@ -419,7 +421,7 @@ fn describe_types_an_empty_measure_dimension_from_the_declared_kind() {
 /// A MEASURE-LESS cube advertises the implicit `value` measure.
 ///
 /// This is `Sales` in `examples/Plateau/seed.sql`:
-/// `CREATE TABLE Sales (Region STRING, Segment STRING, Category STRING)` — the
+/// `CREATE TABLE Sales (Region STRING, Segment STRING, Category STRING)` â€” the
 /// CSV's last column is the cell value, so there is no measure dimension. The query
 /// layer already answered such a cube with a `value` measure; `describe` did not
 /// advertise it, so the data pane showed only dimensions and there was nothing to
@@ -455,7 +457,7 @@ fn describe_a_measureless_cube_advertises_the_implicit_value_measure() {
 }
 
 /// A measure-less cube whose cells are TEXT advertises `value` as a string
-/// dimension, not a measure — the same honesty rule as an attribute measure
+/// dimension, not a measure â€” the same honesty rule as an attribute measure
 /// dimension: text is not summable.
 #[test]
 fn describe_a_measureless_text_cube_advertises_value_as_a_dimension() {
@@ -490,10 +492,10 @@ fn describe_unknown_dataset_is_404() {
 }
 
 // ---------------------------------------------------------------------------
-// §2 sample
+// Â§2 sample
 // ---------------------------------------------------------------------------
 
-/// §2: `rowCount` is the TOTAL row count, not `rows.length`. Plateau renders
+/// Â§2: `rowCount` is the TOTAL row count, not `rows.length`. Plateau renders
 /// "showing 3 of 8" from exactly this pair.
 #[test]
 fn sample_row_count_is_the_total_not_the_page_length() {
@@ -605,7 +607,7 @@ fn sample_without_limit_is_invalid_argument() {
         "Sales",
         &SampleQuery { limit: None, offset: None, columns: Vec::new() },
     )
-    .expect_err("limit is required by §2");
+    .expect_err("limit is required by Â§2");
     assert_eq!(err.code, "invalid_argument");
     assert_eq!(err.status(), 400);
 }
@@ -619,7 +621,7 @@ fn sample_unknown_dataset_is_404() {
     assert_eq!(err.status(), 404);
 }
 
-/// §2 shows `rows: [["East", 100], ["West", 40]]` — a dimension and a MEASURE
+/// Â§2 shows `rows: [["East", 100], ["West", 40]]` â€” a dimension and a MEASURE
 /// VALUE. A measure dimension's coordinate is a member NAME; the value is the
 /// stored cell, so the measure column must carry the cell.
 ///
@@ -639,7 +641,7 @@ fn sample_measure_column_carries_values_not_member_names() {
     let measure_col = resp.columns.iter().position(|c| c == "Measure").expect("Measure column");
 
     // Every measure cell is a JSON number, and each is one of the eight stored
-    // values — never the strings "Sales" / "Cost".
+    // values â€” never the strings "Sales" / "Cost".
     let mut values = Vec::new();
     for row in &resp.rows {
         let cell = &row[measure_col];
@@ -675,13 +677,13 @@ fn sample_measure_column_carries_values_not_member_names() {
 }
 
 // ---------------------------------------------------------------------------
-// §3 query
+// Â§3 query
 // ---------------------------------------------------------------------------
 
 /// Measure values are reported at bounded precision (15 significant digits).
 ///
-/// f64 summation accumulates noise in the last digits — the seeded catalogue's
-/// grand total came out as `26763427.430000003` — and that is what the client
+/// f64 summation accumulates noise in the last digits â€” the seeded catalogue's
+/// grand total came out as `26763427.430000003` â€” and that is what the client
 /// would render. Rounding to 15 significant digits removes the noise while keeping
 /// every digit a double can meaningfully carry.
 #[test]
@@ -723,7 +725,7 @@ fn query_measure_values_are_reported_at_bounded_precision() {
     );
 }
 
-/// **THE invariant the protocol singles out** (§3: "measureLabels is the one to
+/// **THE invariant the protocol singles out** (Â§3: "measureLabels is the one to
 /// get right ... indexed by measure position, not column position. Getting this
 /// wrong was a real bug in Plateau").
 ///
@@ -799,10 +801,10 @@ fn query_response_section3_keys_and_values() {
             "rows",
             "truncated",
         ],
-        "QueryResponse field names (§3)"
+        "QueryResponse field names (Â§3)"
     );
 
-    // §3 rows are NUMBERS for measures and strings for dimensions. A measure that
+    // Â§3 rows are NUMBERS for measures and strings for dimensions. A measure that
     // arrived as the string "150" would break the client's numeric formatting.
     assert_eq!(v["rows"], json!([["East", 150.0], ["West", 225.0]]));
     assert!(v["rows"][0][1].is_f64(), "measures must be JSON numbers");
@@ -825,7 +827,7 @@ fn query_response_section3_keys_and_values() {
     );
 }
 
-/// §3: "An empty `groupBy` with one measure is a **grand total** and must return
+/// Â§3: "An empty `groupBy` with one measure is a **grand total** and must return
 /// exactly one row."
 #[test]
 fn query_grand_total_without_group_by_is_exactly_one_row() {
@@ -861,14 +863,14 @@ fn query_on_a_cube_with_no_measure_dimension() {
 ///
 /// This is the shape `examples/Plateau/seed.sql` builds for
 /// `Sales(Region, Segment, Category)`, and the case that used to return
-/// `[["East"],["West"]]` — member names with no numbers, which a client can only
+/// `[["East"],["West"]]` â€” member names with no numbers, which a client can only
 /// read as an empty dataset. `sql.rs` already answered `SELECT Region, value ...`
 /// with a `value` column; the plan layer did not, so the two front doors disagreed.
 /// Now both produce a numeric `value` measure.
 #[test]
 fn query_a_measureless_cube_auto_adds_a_value_measure() {
     let mut catalog = build_catalog();
-    let mut p = request("Markets"); // Markets(Region) — no measure dimension
+    let mut p = request("Markets"); // Markets(Region) â€” no measure dimension
     by_region(&mut p); // group by Region, name no measures
 
     let resp = wire::query(&mut catalog, &p).expect("measure-less query");
@@ -931,7 +933,7 @@ fn query_a_measureless_cube_naming_value_as_a_measure_returns_per_group_numbers(
     assert_eq!(resp.columns, vec!["value"]);
 }
 
-/// §3 `domainFor`: the distinct values of a column arrive in the `domain` map.
+/// Â§3 `domainFor`: the distinct values of a column arrive in the `domain` map.
 #[test]
 fn query_domain_for_returns_the_domain_map() {
     let mut catalog = build_catalog();
@@ -974,8 +976,8 @@ fn query_unknown_dataset_is_404_and_version_mismatch_is_400() {
     assert!(err.message.contains("v1"), "message states what we speak: {}", err.message);
 }
 
-/// §3 `truncated` is "true when `limit` cut the result". A result exactly as long
-/// as the limit was NOT cut if the data happens to end there — otherwise a pager
+/// Â§3 `truncated` is "true when `limit` cut the result". A result exactly as long
+/// as the limit was NOT cut if the data happens to end there â€” otherwise a pager
 /// is told there is another page that does not exist.
 ///
 /// The pre-limit row count is threaded out of `apply_order_and_limit` via
@@ -1023,7 +1025,7 @@ fn query_truncated_is_true_only_when_rows_were_actually_cut() {
     assert!(!resp0.truncated);
 }
 
-/// §3 lists `SUM | AVG | MEDIAN | MIN | MAX | COUNT | COUNTD | STDEV | VAR | ATTR`
+/// Â§3 lists `SUM | AVG | MEDIAN | MIN | MAX | COUNT | COUNTD | STDEV | VAR | ATTR`
 /// and tells the engine to disable the rest via `capabilities.aggregations`.
 ///
 /// The engine now computes `SUM`, `AVG`, `COUNT`, `MIN`, `MAX` (see
@@ -1146,7 +1148,7 @@ fn a_measure_with_no_cells_in_a_group_is_null() {
     assert_eq!(resp3.rows[1][1], json!(1.0), "West/Cost has one cell");
 }
 
-/// §3 `orderBy.output` is an OUTPUT column name, and an unknown one must be
+/// Â§3 `orderBy.output` is an OUTPUT column name, and an unknown one must be
 /// `invalid_argument` rather than sorting by something else.
 #[test]
 fn query_order_by_uses_output_column_names_and_rejects_unknown_ones() {
@@ -1178,7 +1180,7 @@ fn query_order_by_uses_output_column_names_and_rejects_unknown_ones() {
 }
 
 // ---------------------------------------------------------------------------
-// §3 query + join (conformed dimension)
+// Â§3 query + join (conformed dimension)
 // ---------------------------------------------------------------------------
 
 /// A cube to join onto: `RegionAttr(Region, Attribute)`, an attribute cube whose
@@ -1453,7 +1455,7 @@ fn describe_and_domain_together_expose_the_joinable_attributes() {
     assert_eq!(sales.measure_dimension.as_deref(), Some("Measure"));
 }
 
-/// §3 `expressions`: a calculated field arrives as an AST and the engine evaluates it
+/// Â§3 `expressions`: a calculated field arrives as an AST and the engine evaluates it
 /// (engine::calc). Plateau parses the formula; the engine never sees the text.
 #[test]
 fn query_evaluates_a_calculated_field() {
@@ -1483,7 +1485,7 @@ fn query_evaluates_a_calculated_field() {
     assert!(resp.measure_names.contains(&"Margin".to_string()));
 }
 
-/// An operand with no cells makes the expression ABSENT (null), not zero — and `ZN` is
+/// An operand with no cells makes the expression ABSENT (null), not zero â€” and `ZN` is
 /// the explicit way to ask for zero instead.
 #[test]
 fn a_calculated_field_over_an_absent_measure_is_null() {
@@ -1528,7 +1530,7 @@ fn a_calculated_field_over_an_absent_measure_is_null() {
 }
 
 // ---------------------------------------------------------------------------
-// Error envelope and status mapping (§ "Errors")
+// Error envelope and status mapping (Â§ "Errors")
 // ---------------------------------------------------------------------------
 
 /// Every code the protocol lists must map to the status the reference client
@@ -1567,14 +1569,14 @@ fn error_envelope_has_exactly_the_error_and_code_keys() {
     let env = wire::ErrorResponse { error: e.message.clone(), code: e.code.to_string() };
 
     let v = wire(&env);
-    assert_eq!(keys(&v), vec!["code", "error"], "§Errors envelope keys");
+    assert_eq!(keys(&v), vec!["code", "error"], "Â§Errors envelope keys");
     assert_eq!(v["error"], json!("bad input"));
     assert_eq!(v["code"], json!("invalid_argument"));
     assert_eq!(format!("{e}"), "bad input (invalid_argument)");
 }
 
 /// A `PlanError` must reach the client with both the protocol code and a human
-/// message — the client distinguishes "my bug" from "engine fault" by `code`.
+/// message â€” the client distinguishes "my bug" from "engine fault" by `code`.
 #[test]
 fn plan_errors_convert_to_the_wire_envelope_with_their_code() {
     use olap_engine::engine::plan::PlanError;
@@ -1607,7 +1609,7 @@ fn plan_errors_convert_to_the_wire_envelope_with_their_code() {
 }
 
 // ---------------------------------------------------------------------------
-// Request deserialisation (§3 request shape)
+// Request deserialisation (Â§3 request shape)
 // ---------------------------------------------------------------------------
 
 /// The request field names are as normative as the response ones: a client sends
@@ -1615,7 +1617,7 @@ fn plan_errors_convert_to_the_wire_envelope_with_their_code() {
 /// drop a filter, which is far worse than an error.
 #[test]
 fn query_request_deserialises_the_spec_request_shape() {
-    // The exact body shape from ENGINE-PROTOCOL.md §3.
+    // The exact body shape from ENGINE-PROTOCOL.md Â§3.
     let body = json!({
         "dataset": "sales",
         "protocolVersion": 1,
