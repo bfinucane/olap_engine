@@ -166,6 +166,11 @@ pub struct SliceQuery {
     // so the same measure can appear under different labels. Absent => SUM, which
     // keeps every pre-existing caller working unchanged.
     pub aggregations: HashMap<String, Aggregation>,
+    // DIMENSION ACCESS (SECURITY-DESIGN.md S3): for each dimension, the leaf ids the caller
+    // may NOT see. Cells with such a coordinate are dropped BEFORE aggregation, so a total
+    // CHANGES instead of announcing that a member was hidden - the "no silent leak" rule.
+    // Empty means unrestricted; the transport fills this in, clients cannot.
+    pub denied_leaves: Vec<HashSet<u32>>,
 }
 
 /// A materialised result: column headers plus stringified rows.
@@ -282,7 +287,46 @@ impl Cube {
         Ok(())
     }
 
-            /// Member names of the MEASURE dimension, in display order.
+                    /// Resolves denied member names to the leaf ids they cover, one set per dimension.
+            ///
+            /// A denied member hides its whole SUBTREE: hiding a consolidation must not leave
+            /// its children readable through another axis. Unknown names are ignored here (the
+            /// transport validated them): a name that resolves to nothing cannot leak anything.
+            pub fn denied_leaf_ids(
+                &self,
+                denied: &HashMap<String, Vec<String>>,
+            ) -> Vec<HashSet<u32>> {
+                let mut per_dimension: Vec<HashSet<u32>> =
+                    vec![HashSet::new(); self.dimensions.len()];
+                if denied.is_empty() {
+                    return per_dimension;
+                }
+
+                for (index, dimension_name) in self.dimension_names.iter().enumerate() {
+                    let members: Vec<String> = denied
+                        .iter()
+                        .filter(|(dimension, _)| dimension.eq_ignore_ascii_case(dimension_name))
+                        .flat_map(|(_, members)| members.clone())
+                        .collect();
+                    if members.is_empty() {
+                        continue;
+                    }
+                    let dim = self.dimensions[index]
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for member in members {
+                        for leaf_id in dim.get_leaf_descendants_in(None, &member).keys() {
+                            per_dimension[index].insert(*leaf_id);
+                        }
+                        if let Some(id) = dim.get_id_in(None, &member) {
+                            per_dimension[index].insert(id);
+                        }
+                    }
+                }
+                per_dimension
+            }
+
+    /// Member names of the MEASURE dimension, in display order.
             ///
             /// Empty when the cube is measure-less (it has an implicit `value` instead) or
             /// when the measure dimension has no members yet. Both front ends use this to
@@ -672,6 +716,14 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             .and_then(|m| self.dimension_names.iter().position(|d| d == m));
 
                 for (coords, base_val) in raw_data {
+            // DIMENSION ACCESS: a cell whose coordinate is denied is dropped before it can
+            // contribute to ANY aggregation. Doing it here rather than in the scanner keeps
+            // SUM and AVG/MIN/MAX consistent: both see the same visible set of cells.
+            if query.denied_leaves.iter().enumerate().any(|(index, denied)| {
+                !denied.is_empty() && coords.get(index).is_some_and(|id| denied.contains(id))
+            }) {
+                continue;
+            }
             let raw_val = base_val.clone(); // Before any weighting: what MIN/AVG see.
             let mut final_val = base_val.clone(); // Can be String or Numeric
                         let mut row_key = Vec::new();

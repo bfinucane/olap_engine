@@ -40,9 +40,9 @@ use std::sync::Arc;
 use olap_engine::catalog::catalog::Catalog;
 use olap_engine::engine::plan::QueryRequest;
 use olap_engine::engine::wire::{
-    self, capabilities, datasets, describe, query, sample, ErrorResponse, SampleQuery, WireError,
+    self, capabilities, datasets, describe, query, ErrorResponse, SampleQuery, WireError,
 };
-use olap_engine::security::access::TableAccess;
+use olap_engine::security::access::{DimensionAccess, TableAccess};
 use olap_engine::security::session::{Session, SessionStore};
 use olap_engine::security::store::{default_path as default_security_path, SecurityFile};
 
@@ -594,6 +594,13 @@ fn route(
         shared,
         session.map(|s| s.roles.as_slice()).unwrap_or(&[]),
     );
+    // DIMENSION ACCESS (S3). Member-level denials are handled inside the aggregation path
+    // (so totals change); a dimension denied in FULL makes every cube using it unreadable.
+    let dimensions = DimensionAccess::for_roles(
+        shared,
+        session.map(|s| s.roles.as_slice()).unwrap_or(&[]),
+    );
+    let denied_members = dimensions.denied_members();
 
     // A cube the caller may not read is reported EXACTLY like a cube that does not exist:
     // admitting "forbidden" would confirm that a hidden dataset exists, which the design
@@ -624,8 +631,11 @@ fn route(
             return Err(method_not_allowed("GET"));
         }
         let mut resp = datasets(shared);
-        // A hidden cube must not even be advertised.
-        resp.datasets.retain(|name| access.can_read(name));
+        // A hidden cube must not even be advertised - whether it is denied directly or
+        // through a dimension the caller may not see at all.
+        resp.datasets.retain(|name| {
+            access.can_read(name) && !dimensions.hides_cube(shared, name)
+        });
         return Ok((200, serde_json::to_value(resp).unwrap()));
     }
 
@@ -672,7 +682,17 @@ fn route(
 
         let started = std::time::Instant::now();
         let mut catalog = (**shared).clone();
-        let output = olap_engine::engine::sql::execute_sql(&mut catalog, &body.sql)
+        for table in &referenced {
+            if dimensions.hides_cube(shared, table) {
+                return Err(hidden(table));
+            }
+        }
+
+        let output = olap_engine::engine::sql::execute_sql_with_denied(
+            &mut catalog,
+            &body.sql,
+            &denied_members,
+        )
             .map_err(|message| WireError {
                 code: "invalid_argument",
                 message,
@@ -716,8 +736,9 @@ fn route(
     };
 
     // Hides the cube from everyone who may not read it, including the sample and query
-    // sub-routes, before any work is done.
-    if !access.can_read(dataset) {
+    // sub-routes, before any work is done. Two reasons a cube is unreadable: the role is
+    // denied the cube itself, or it is denied a DIMENSION the cube uses.
+    if !access.can_read(dataset) || dimensions.hides_cube(shared, dataset) {
         return Err(hidden(dataset));
     }
 
@@ -740,7 +761,7 @@ fn route(
                 }
             }
             params.columns = columns;
-            let resp = sample(shared, dataset, &params)?;
+            let resp = wire::sample_with_denied(shared, dataset, &params, &denied_members)?;
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         // POST /v1/{dataset}/query
@@ -764,7 +785,9 @@ fn route(
                     ),
                 });
             }
-            let resp = query(shared, &plan)?;
+            let mut plan = plan;
+        plan.denied_members = denied_members.clone();
+        let resp = query(shared, &plan)?;
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         ("GET", _) | ("POST", _) => Err(WireError {

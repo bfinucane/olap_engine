@@ -145,7 +145,7 @@ feature.
 | S0 | **DONE** - system cubes (section 0), read-only and auto-refreshed | #Cubes/#Dimensions/#Hierarchies/#Members describe the catalogue; a write to a # cube is refused; the lists update after CREATE TABLE and after a new member; describe flags them isSystem; covered by catalog::system_cubes unit tests and serve_http decoding tests |
 | S1 | **DONE** — users, roles, `POST /v1/login`, bearer tokens | login returns a token; a request without one is `401` when auth is required; a bad password is `401` without saying which part failed |
 | S2 | **DONE** — table access | a role at `NONE` on a cube sees `unknown_dataset`; another role sees it |
-| S3 | dimension access with wildcard + overrides | a denied member is absent from rows *and* from totals; the wildcard covers the rest |
+| S3 | **DONE** — dimension access with wildcard + overrides | a denied member is absent from rows *and* from totals; the wildcard covers the rest |
 | S4 | write permissions | a `READ`-only role's write is refused; an `ACCEPT`-default write still works |
 | S5 | joins respect both sides | a join to a forbidden cube is absent; a join on a forbidden dimension yields absent attributes, not an error |
 | S6 | session pins a security snapshot | changing a rule invalidates sessions lazily, the way data versions do |
@@ -248,3 +248,44 @@ BEFORE execution if any of them is forbidden. A hidden cube is refused with the 
   directly rather than through the wire.
 - There is no `clear_rule`: the engine has no single-cell removal API, and an empty level reads
   as a malformed rule (fails closed). To restore access, write `WRITE` explicitly.
+
+---
+
+## 12. S3 implementation notes — dimension access
+
+**Rule store.** `#DimensionSecurity(#Role, #Dimension, #Member)` -> `NONE | READ | WRITE`,
+another CONTROL cube, written by an admin with SQL:
+
+```text
+INSERT INTO #DimensionSecurity VALUES ('reader', 'Region', 'East', 'NONE')
+INSERT INTO #DimensionSecurity VALUES ('reader', 'Region', '#ALL', 'NONE')
+```
+
+Only `NONE` denies. `READ`/`WRITE` rows are accepted and parsed but are grants under
+default-accept, so they change nothing today; accepting them keeps the rule table honest and
+leaves room for a future deny-by-default switch without a format change.
+
+**What a denial does: nothing visible.** The cells whose coordinate is denied are dropped
+BEFORE aggregation, in `query_slice`. That single chokepoint makes every front door agree:
+
+- `POST query` rows and aggregates exclude them (a total just gets smaller);
+- `domainFor` / member lists do not contain them;
+- `sample` filters them before offset/limit, and `rowCount` counts only visible cells;
+- SQL (`execute_sql_with_denied`) drops them too — the SQL path builds its own `SliceQuery`,
+  so it is wired explicitly rather than relying on the plan layer.
+
+Denying a CONSOLIDATED member hides its whole subtree: hiding a rollup must not leave its
+children readable through another axis.
+
+**Whole-dimension denial (`#ALL`)** hides every CUBE that uses the dimension
+(`unknown_dataset`, omitted from `/v1/datasets`). A cube cannot be read without one of its
+axes, so "the dimension is invisible" is the honest consequence, and it is stronger than
+silently emptying every aggregate.
+
+**Clients cannot move a restriction.** The denied set travels on `QueryRequest` as a
+`#[serde(skip)]` field filled by the transport. It is not part of the wire format in either
+direction, so a request can neither add nor displace a restriction.
+
+**Known limit.** `describe` still reports a column's cardinality from the whole dimension, so
+it can reveal that hidden members exist (not their names or values). Fixing it means making
+`describe` access-aware; recorded as a follow-up rather than half-done here.

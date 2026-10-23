@@ -63,6 +63,7 @@ fn plan(dataset: &str) -> QueryRequest {
         expressions: Default::default(),
         domain_for: Vec::new(),
         join: None,
+        denied_members: std::collections::HashMap::new(),
     }
 }
 

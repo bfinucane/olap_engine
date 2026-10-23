@@ -44,6 +44,9 @@ pub const COLUMNS: &str = "#Columns";
 /// read-only guard in `Cube::write` must not apply to it.
 pub const TABLE_SECURITY: &str = "#TableSecurity";
 
+/// The control cube holding dimension access: `(#Role, #Dimension, #Member)` -> level.
+pub const DIMENSION_SECURITY: &str = "#DimensionSecurity";
+
 /// True when a name is system-owned (`#` prefix).
 pub fn is_system(name: &str) -> bool {
     name.starts_with('#')
@@ -64,7 +67,7 @@ pub fn is_derived(name: &str) -> bool {
 
 /// True for the engine's writable control cubes (security data).
 pub fn is_control(name: &str) -> bool {
-    name.eq_ignore_ascii_case(TABLE_SECURITY)
+    name.eq_ignore_ascii_case(TABLE_SECURITY) || name.eq_ignore_ascii_case(DIMENSION_SECURITY)
 }
 /// One hierarchy's members and parent/child edges, captured before the catalogue is touched.
 struct HierarchyFacts {
@@ -159,6 +162,9 @@ pub fn rebuild(catalog: &mut Catalog) {
     // on every rebuild, and a rebuild runs after every command.
     if catalog.get_cube(TABLE_SECURITY).is_none() {
         catalog.add_cube(TABLE_SECURITY, &["#Role", "#Cube"], None, true);
+    }
+    if catalog.get_cube(DIMENSION_SECURITY).is_none() {
+        catalog.add_cube(DIMENSION_SECURITY, &["#Role", "#Dimension", "#Member"], None, true);
     }
 
     // otherwise the one table you need to read first is the one you cannot look up. It is

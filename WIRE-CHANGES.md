@@ -45,6 +45,26 @@ leaves unnamed) is now only used if it exists in the dimension's **default hiera
 multi-hierarchy dimension could have its first-created member in another hierarchy, which
 produced `Member 'Furniture' not found` on a perfectly ordinary query.
 
+### Dimension access: rows and totals change, nothing errors
+
+A role can be denied a MEMBER of a dimension (or the whole dimension with `#ALL`). Unlike
+table access there is no 404 — the data is simply not there:
+
+- `POST query`: rows for a denied member are absent, and every aggregate over it excludes its
+  cells. A grand total is smaller, not an error.
+- `sample`: the cells are filtered before `offset`/`limit`; `rowCount` counts visible cells.
+- `domainFor` / `measureNames`-style member lists: a denied member is not listed.
+- SQL (`POST /v1/sql`): the same statement sees the same reduced totals.
+- `#ALL` denial: every cube using that dimension answers `404 unknown_dataset` and is omitted
+  from `/v1/datasets`.
+- **`describe` is unchanged**: a column's `cardinality` still counts the whole dimension, so it
+  can reveal that hidden members exist (not their names). Treat it as a metadata hint, not a
+  permission boundary.
+- `#DimensionSecurity(#Role, #Dimension, #Member)` is a new admin-writable control cube, listed
+  in `#Columns` and `/v1/datasets`.
+
+A client needs no code change to be safe; it just receives smaller numbers. It should NOT try
+to detect the difference between "no data" and "no access" — by design there is none.
 ### Table access: hidden cubes look non-existent
 
 A role may be denied a cube (`#TableSecurity`). The wire makes that invisible rather than

@@ -14,7 +14,7 @@ use crate::engine::attribute_join;
 /// This gates the HTTP SQL console (`POST /v1/sql`). The console is read-only by
 /// design: the server binds a plain port with no authentication, so exposing
 /// CREATE/INSERT/DROP there would let any local process rewrite the catalogue. The
-/// CLI remains the place for writes. `execute_sql` itself is unrestricted â€” this is
+/// CLI remains the place for writes. `execute_sql` itself is unrestricted Ã¢â‚¬â€ this is
 /// the check in front of it, done on the parse tree rather than on string prefixes,
 /// so `SELECT` hidden in a comment or a second statement cannot slip past.
 pub fn ensure_read_only(sql: &str) -> Result<(), String> {
@@ -55,6 +55,20 @@ fn describe_statement(statement: &Statement) -> &'static str {
 
 // Changed return type from f64 to String to support textual success messages
 pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, String> {
+    execute_sql_with_denied(catalog, sql_query, &HashMap::new())
+}
+
+/// As `execute_sql`, but with DIMENSION ACCESS applied (SECURITY-DESIGN.md S3).
+///
+/// `denied` maps a dimension name to member names the caller may not see; their cells are
+/// dropped before aggregation, so totals change rather than the statement being refused -
+/// the same rule the plan layer follows. Plain `execute_sql` is the CLI's unrestricted
+/// entry point; the HTTP transport MUST call this one.
+pub fn execute_sql_with_denied(
+    catalog: &mut Catalog,
+    sql_query: &str,
+    denied: &HashMap<String, Vec<String>>,
+) -> Result<String, String> {
 
 	
     let mut parseable_sql = sql_query.trim().to_string();
@@ -164,7 +178,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                 let mut join_mode = attribute_join::JoinMode::Left;
                 // V1 implements ONE LEFT join. A second join used to be silently
                 // dropped (`relation.joins[0]` only), which returned columns of dashes
-                // with no error â€” the misleading kind of wrong answer.
+                // with no error Ã¢â‚¬â€ the misleading kind of wrong answer.
                 if relation.joins.len() > 1 {
                     return Err(format!(
                         "Only one JOIN is supported (found {}). Join one attribute cube at a \
@@ -181,7 +195,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                         // A bare `JOIN` parses as `Inner`, and INNER is what it means:
                         // rows whose key has no attribute row are DROPPED. It used to
                         // behave as LEFT, which returned rows the keyword said should not
-                        // exist — a silent wrong answer. LEFT JOIN is how you ask for the
+                        // exist â€” a silent wrong answer. LEFT JOIN is how you ask for the
                         // "attach if present" behaviour.
                         JoinOperator::Inner(c) => {
                             join_mode = attribute_join::JoinMode::Inner;
@@ -311,7 +325,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     // --- Aggregate function: SUM/AVG/COUNT/MIN/MAX over a measure ---
                     //
                     // Handled BEFORE the name-based branches, because
-                    // `proj.to_string()` is "AVG(Sales)" â€” not a column name â€” and
+                    // `proj.to_string()` is "AVG(Sales)" Ã¢â‚¬â€ not a column name Ã¢â‚¬â€ and
                     // taking it literally would report a confusing "Column
                     // 'AVG(Sales)' not found".
                     //
@@ -531,7 +545,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     // TABLES, and a table reads as "all rows unless you filter". Defaulting
                     // an unfiltered dimension silently reduced a discovery query to one
                     // arbitrary cell combination and returned 0 rows while the cube was
-                    // full — the opposite of what a listing is for.
+                    // full â€” the opposite of what a listing is for.
                     if !axes.contains(dim_name)
                         && !filters.contains_key(dim_name)
                         && !crate::catalog::system_cubes::is_system(&primary_cube.name)
@@ -571,6 +585,7 @@ pub fn execute_sql(catalog: &mut Catalog, sql_query: &str) -> Result<String, Str
                     axis_hierarchies,
                     column_dim_index,
                     aggregations,
+                    denied_leaves: primary_cube.denied_leaf_ids(denied),
                 };
                 
                 let mut result_set = primary_cube.query_slice(&slice_query)?;

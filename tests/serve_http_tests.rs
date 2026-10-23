@@ -439,7 +439,7 @@ fn get_datasets_lists_the_catalog_names_in_stored_casing_sorted() {
     // `isSystem` in describe is what a cube picker filters on); `#` sorts first.
     assert_eq!(
         resp.json()["datasets"],
-        serde_json::json!(["#Columns", "#Cubes", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "#TableSecurity", "Markets", "Sales"])
+        serde_json::json!(["#Columns", "#Cubes", "#DimensionSecurity", "#Dimensions", "#Edges", "#Hierarchies", "#Members", "#TableSecurity", "Markets", "Sales"])
     );
 
     // Every advertised name must actually resolve as a dataset (the round trip
@@ -1218,5 +1218,209 @@ fn a_second_ruleless_role_does_not_undo_a_restriction() {
         request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&token)).status,
         404,
         "the restriction in ANY held role binds"
+    );
+}
+// ---------------------------------------------------------------------------
+// S3: dimension access — totals change, nothing errors
+// ---------------------------------------------------------------------------
+
+/// Like `authenticated_server_with_rules`, plus dimension rules
+/// `(role, dimension, member, level)`.
+fn authenticated_server_with_dimension_rules(
+    users: &[(&str, &str, &[&str])],
+    table_rules: &[(&str, &str, &str)],
+    dimension_rules: &[(&str, &str, &str, &str)],
+) -> Server {
+    let (db_path, log_path) = unique_paths("dimdb");
+    write_fixture(&db_path);
+
+    {
+        let mut catalog = Catalog::load_from_disk(db_path.to_str().expect("utf8 path"))
+            .expect("load fixture");
+        for (role, cube, level) in table_rules {
+            let level = olap_engine::security::access::Level::parse(level)
+                .unwrap_or_else(|| panic!("bad level {level:?}"));
+            olap_engine::security::access::set_rule(&mut catalog, role, cube, level)
+                .expect("set table rule");
+        }
+        for (role, dimension, member, level) in dimension_rules {
+            let level = olap_engine::security::access::Level::parse(level)
+                .unwrap_or_else(|| panic!("bad level {level:?}"));
+            olap_engine::security::access::set_dimension_rule(
+                &mut catalog, role, dimension, member, level,
+            )
+            .expect("set dimension rule");
+        }
+        catalog.save_to_disk(db_path.to_str().expect("utf8 path")).expect("save rules");
+    }
+
+    let security_path = log_path.with_extension("security.json");
+    let mut file = olap_engine::security::store::SecurityFile::default();
+    for (name, password, roles) in users {
+        let roles: Vec<String> = roles.iter().map(|role| role.to_string()).collect();
+        file.upsert_user(name, password, &roles).expect("create user");
+    }
+    file.save(&security_path).expect("save security file");
+
+    spawn_server_with_security(&db_path, &log_path, true, Some(&security_path))
+}
+
+/// A denied member disappears from rows, from the domain, and from aggregates — on every
+/// front door (query, sample, SQL), and with NO error anywhere.
+#[test]
+fn a_denied_member_changes_totals_without_erroring() {
+    let srv = authenticated_server_with_dimension_rules(
+        &[("reader", "wonderland", &["reader"])],
+        &[],
+        &[("reader", "Region", "East", "NONE")],
+    );
+    let token = token_for(&srv, "reader", "wonderland");
+
+    // --- POST query: the row is gone, the rest stays ---
+    let query = r#"{"dataset":"Sales","groupBy":[{"name":"Region"}],
+                    "measures":[{"name":"Sales","aggregation":"SUM"}]}"#;
+    let resp = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/query", srv.base),
+        Some(query),
+        Some(&token),
+    );
+    assert_eq!(resp.status, 200, "a restriction must NOT be an error: {}", resp.body);
+    let body = resp.json();
+    let rows = body["rows"].as_array().cloned().unwrap_or_default();
+    for row in &rows {
+        assert_ne!(
+            row[0],
+            serde_json::json!("East"),
+            "a denied member must not appear: {rows:?}"
+        );
+    }
+    assert!(
+        rows.iter().any(|row| row[0] == serde_json::json!("West")),
+        "allowed members stay: {rows:?}"
+    );
+
+    // --- sample: cells with the denied coordinate are not paged out to the client ---
+    let sample = request_with_auth(
+        "GET",
+        &format!("{}/v1/Sales/sample?limit=100", srv.base),
+        None,
+        Some(&token),
+    );
+    assert_eq!(sample.status, 200, "{}", sample.body);
+    let sample_rows = sample.json()["rows"].as_array().cloned().unwrap_or_default();
+    for row in &sample_rows {
+        assert_ne!(row[0], serde_json::json!("East"), "sample leaked East: {sample_rows:?}");
+    }
+    assert!(
+        !sample_rows.is_empty(),
+        "the allowed rows must still be served: {sample_rows:?}"
+    );
+
+    // --- SQL: the same statement must not see it either ---
+    let sql = request_with_auth(
+        "POST",
+        &format!("{}/v1/sql", srv.base),
+        Some(r#"{"sql":"SELECT Region, value FROM Sales"}"#),
+        Some(&token),
+    );
+    assert_eq!(sql.status, 200, "{}", sql.body);
+    let output = sql.json()["output"].as_str().unwrap_or("").to_string();
+    assert!(output.contains("West"), "allowed rows in SQL output:\n{output}");
+    assert!(
+        !output.contains("East"),
+        "SQL must not reveal a denied member:\n{output}"
+    );
+}
+
+/// The denial applies to the DIMENSION, not to the chosen axis: grouping by Product must
+/// also drop the denied Region's cells.
+#[test]
+fn a_denied_member_is_hidden_through_other_axes() {
+    let srv = authenticated_server_with_dimension_rules(
+        &[("reader", "wonderland", &["reader"])],
+        &[],
+        &[("reader", "Region", "East", "NONE")],
+    );
+    let token = token_for(&srv, "reader", "wonderland");
+
+    let query = r#"{"dataset":"Sales","groupBy":[{"name":"Product"}],
+                    "measures":[{"name":"Sales","aggregation":"SUM"}]}"#;
+    let resp = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/query", srv.base),
+        Some(query),
+        Some(&token),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    // East contributes 150 to the Sales total; West contributes 225. With East hidden the
+    // Product totals must reflect only West's cells.
+    let rows = resp.json()["rows"].as_array().cloned().unwrap_or_default();
+    let total: f64 = rows
+        .iter()
+        .map(|row| row[1].as_f64().unwrap_or(0.0))
+        .sum();
+    assert!(
+        (total - 225.0).abs() < 1e-6,
+        "totals over the DENIED dimension must change: expected 225 from West only, got {total} ({rows:?})"
+    );
+}
+
+/// A dimension denied in FULL hides every cube that uses it - the cube is unreachable rather
+/// than silently empty.
+#[test]
+fn a_whole_dimension_denial_hides_the_cubes_that_use_it() {
+    let srv = authenticated_server_with_dimension_rules(
+        &[("reader", "wonderland", &["reader"])],
+        &[],
+        &[("reader", "Region", "#ALL", "NONE")],
+    );
+    let token = token_for(&srv, "reader", "wonderland");
+
+    // Sales uses Region -> hidden, on every route.
+    for path in ["/v1/Sales", "/v1/Sales/sample?limit=1"] {
+        let resp = request_with_auth("GET", &format!("{}{path}", srv.base), None, Some(&token));
+        assert_eq!(resp.status, 404, "{path}: {}", resp.body);
+        assert_eq!(resp.code(), "unknown_dataset", "{path}");
+    }
+    let sql = request_with_auth(
+        "POST",
+        &format!("{}/v1/sql", srv.base),
+        Some(r#"{"sql":"SELECT Region, value FROM Sales"}"#),
+        Some(&token),
+    );
+    assert_eq!(sql.status, 404, "SQL must not reach the cube: {}", sql.body);
+
+    // The dataset list does not advertise it.
+    let listed = request_with_auth("GET", &format!("{}/v1/datasets", srv.base), None, Some(&token));
+    let names = listed.json()["datasets"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !names.iter().any(|v| v == &serde_json::json!("Sales")),
+        "a cube behind a denied dimension must not be listed: {names:?}"
+    );
+}
+
+/// A caller with no dimension rules is unaffected: default ACCEPT.
+#[test]
+fn dimension_access_is_opt_in() {
+    let srv = authenticated_server_with_dimension_rules(
+        &[("analyst", "wonderland", &["analyst"])],
+        &[],
+        &[("other", "Region", "East", "NONE")],
+    );
+    let token = token_for(&srv, "analyst", "wonderland");
+    let query = r#"{"dataset":"Sales","groupBy":[{"name":"Region"}],
+                    "measures":[{"name":"Sales","aggregation":"SUM"}]}"#;
+    let resp = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/query", srv.base),
+        Some(query),
+        Some(&token),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let rows = resp.json()["rows"].as_array().cloned().unwrap_or_default();
+    assert!(
+        rows.iter().any(|row| row[0] == serde_json::json!("East")),
+        "another role's rule must not apply: {rows:?}"
     );
 }

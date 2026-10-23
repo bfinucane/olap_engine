@@ -84,6 +84,13 @@ pub struct QueryRequest {
     /// response's `domain` map alongside the rows (see ENGINE-PROTOCOL.md §3).
     #[serde(rename = "domainFor", default)]
     pub domain_for: Vec<String>,
+    /// DIMENSION ACCESS (SECURITY-DESIGN.md S3): member names the caller may not see, keyed
+    /// by dimension. Filled in by the transport, never by the client - `skip` means it is
+    /// absent from the wire format in BOTH directions, so a request cannot ask to be
+    /// restricted (harmless) nor move a restriction somewhere else (not harmless).
+    #[serde(skip)]
+    pub denied_members: HashMap<String, Vec<String>>,
+
     /// Optional attribute join on a conformed (shared) dimension. Uses the same
     /// routine as the SQL `JOIN ... USING (...)` path — see `engine::attribute_join`.
     #[serde(default)]
@@ -1054,6 +1061,7 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
         axis_hierarchies,
         column_dim_index,
         aggregations,
+        denied_leaves: cube.denied_leaf_ids(&plan.denied_members),
     })
 }
 

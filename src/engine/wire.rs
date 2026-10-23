@@ -573,6 +573,20 @@ pub fn sample(
     dataset: &str,
     params: &SampleQuery,
 ) -> Result<SampleResponse, WireError> {
+    sample_with_denied(catalog, dataset, params, &std::collections::HashMap::new())
+}
+
+/// As `sample`, but hides cells whose coordinates are denied (DIMENSION ACCESS, S3).
+///
+/// The rows are filtered BEFORE `offset`/`limit`, so a page is a page of VISIBLE rows; and
+/// `rowCount` counts visible cells, because a total that includes hidden cells is exactly
+/// the silent leak the design forbids.
+pub fn sample_with_denied(
+    catalog: &Catalog,
+    dataset: &str,
+    params: &SampleQuery,
+    denied: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<SampleResponse, WireError> {
     let cube = catalog.get_cube(dataset).ok_or_else(|| WireError {
         code: "unknown_dataset",
         message: format!("Dataset '{}' not found.", dataset),
@@ -618,7 +632,17 @@ pub fn sample(
         .as_ref()
         .and_then(|m| all_names.iter().position(|n| n == m));
 
-    let cells = cube.store.scan_subcube(&vec![None; dim_count]);
+    let mut cells = cube.store.scan_subcube(&vec![None; dim_count]);
+    if !denied.is_empty() {
+        let denied_leaves = cube.denied_leaf_ids(denied);
+        cells.retain(|(coords, _)| {
+            !coords.iter().enumerate().any(|(index, id)| {
+                denied_leaves
+                    .get(index)
+                    .is_some_and(|hidden| hidden.contains(id))
+            })
+        });
+    }
     let total = cells.len();
 
     let rows: Vec<Vec<Value>> = cells
