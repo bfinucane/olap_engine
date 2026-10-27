@@ -43,8 +43,12 @@ POST /v1/{dataset}/write
 - **`coords` is a `{dimension: member}` map**, not a positional tuple. Dimension keys are
   matched case-insensitively against the cube's dimensions; a missing, extra or empty
   coordinate is `invalid_argument` naming the expected dimensions.
-- **`value`** is a JSON number, or a string for attribute (non-aggregating) cubes. `null` and
-  booleans are refused.
+- **`value`** is a JSON number, or a string — but a STRING only into an ATTRIBUTE table
+  (`CREATE ATTRIBUTE TABLE`, `isAttributeTable: true`). A string in an aggregating cube is
+  `invalid_argument`: the accumulator treats a text cell as "last value wins", so a comment
+  written into a numeric measure would silently replace that group's total depending on scan
+  order. `null` and booleans are refused. A numeric value in an attribute table IS allowed
+  (some attributes are numeric), because attribute cubes never aggregate.
 - **`splash`** — see §3. Absent means `reject`.
 - **`createMissing`** — see §4. Absent means `false`.
 - **`version`** in the response is the cube's data version after the write. It is
@@ -135,6 +139,8 @@ POST /v1/save      (requires the 'admin' role when authentication is on)
   CONFIGURATION, changed through an admin SQL session (the CLI), not through the data API —
   `forbidden`. Without this, any role with default-accept write access could grant itself
   permissions. (Found while reviewing this document against the code; fixed and tested.)
+- **Text into an aggregating cube**: refused (§2). Text has a designated home, the attribute
+  table, and that is a modelled decision rather than a workaround for the accumulator.
 - Anything requiring a **hierarchy-qualified coordinate** (`Hierarchy:Member`): coordinates
   resolve in the dimension's DEFAULT hierarchy, like SQL `INSERT`. A consolidated member that
   exists only in another hierarchy cannot be addressed yet. Recorded limitation, not silent
@@ -188,7 +194,7 @@ Recorded so the reasoning survives:
 
 ## 13. Tests that pin this contract
 
-- `src/engine/write.rs` (15 unit tests): leaf and string writes, case-insensitive dimension
+- `src/engine/write.rs` (17 unit tests): leaf and string writes, case-insensitive dimension
   names, arity errors, strict vs `createMissing`, consolidated refusal, `replace` setting the
   rollup total, splash on a leaf, unknown splash mode, batch atomicity, derived-cube refusal,
   control-cube refusal, unknown dataset.

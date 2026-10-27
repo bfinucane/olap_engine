@@ -220,6 +220,18 @@ pub fn write_cells(
             }
         }
 
+        // TEXT ONLY BELONGS IN AN ATTRIBUTE TABLE. In an aggregating cube the accumulator
+        // treats a text cell as "last value wins" (Acc::Text), so a string written into a
+        // numeric measure silently replaces the group's total depending on scan order.
+        // That is data corruption the API must refuse rather than report later.
+        if matches!(value, CellValue::String(_)) && cube.is_aggregating {
+            return Err(WriteError::invalid(format!(
+                "cell {position}: text value in '{}', which aggregates numbers; text belongs \
+                 in an attribute table (CREATE ATTRIBUTE TABLE)",
+                cube.name
+            )));
+        }
+
         // Splashing is arithmetic: it needs a number.
         if consolidated && !matches!(value, CellValue::Numeric(_)) {
             return Err(WriteError::invalid(format!(
@@ -397,6 +409,47 @@ mod tests {
             cube.read_cell(&["East", "Owner"]),
             Some(CellValue::String("Alice".to_string()))
         );
+    }
+
+    /// Text into an AGGREGATING cube corrupts its totals (`Acc::Text` = last value wins), so
+    /// the write API refuses it; text belongs in an attribute table.
+    #[test]
+    fn text_is_refused_in_an_aggregating_cube() {
+        let catalog = catalog_with_members();
+        let err = write_one(
+            &catalog,
+            "Sales",
+            &[("Region", "East"), ("Product", "Widget"), ("Measure", "Sales")],
+            serde_json::json!("looks like a number"),
+            None,
+            false,
+        )
+        .expect_err("text in a measure cube must be refused");
+        assert_eq!(err.code, "invalid_argument");
+        assert!(err.message.contains("attribute table"), "{}", err.message);
+        assert_eq!(
+            read(&catalog, &["East", "Widget", "Sales"]),
+            None,
+            "nothing must be written"
+        );
+    }
+
+    /// A numeric value in an attribute table is allowed: some attributes are numeric, and
+    /// attribute cubes never aggregate, so nothing can be corrupted.
+    #[test]
+    fn a_numeric_value_is_allowed_in_an_attribute_table() {
+        let catalog = catalog_with_members();
+        write_one(
+            &catalog,
+            "Attr",
+            &[("Region", "East"), ("Attribute", "Owner")],
+            serde_json::json!(2024.0),
+            None,
+            false,
+        )
+        .expect("numeric attribute");
+        let cube = catalog.get_cube("Attr").expect("Attr");
+        assert_eq!(cube.read_cell(&["East", "Owner"]), Some(CellValue::Numeric(2024.0)));
     }
 
     #[test]

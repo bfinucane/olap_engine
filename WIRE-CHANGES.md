@@ -73,6 +73,15 @@ POST /v1/{dataset}/write
 **Coordinates are a `{dimension: member}` map** and resolve in the dimension's DEFAULT
 hierarchy (a consolidated member living only in another hierarchy cannot be addressed yet).
 
+**Text (`string` values) goes to ATTRIBUTE tables only** (`isAttributeTable: true`). A string
+written into an aggregating cube is `invalid_argument`, because the accumulator treats a text
+cell as "last value wins" and would silently replace that group's total. Numbers are allowed
+in attribute tables (some attributes are numeric) since those cubes never aggregate.
+
+**Derived system cubes and the security control cubes are refused**: derived cubes are
+rebuilt (so writes would vanish), and `#TableSecurity`/`#DimensionSecurity` are configuration
+changed through an admin SQL session, not through the cell API.
+
 **Behaviour change from security:** a query's attribute `join` is now access-checked against
 the joined cube (S5) — a role denied that cube gets `404 unknown_dataset` for the join.
 
