@@ -156,6 +156,17 @@ pub fn write_cells(
             cube.name
         )));
     }
+    // SECURITY CONTROL CUBES ARE NOT DATA. Writing `#TableSecurity` through this endpoint
+    // would let any role with default-accept write access grant itself permissions, so the
+    // endpoint refuses them outright. They are changed through an admin SQL session (the
+    // CLI), which is a different authority from "may write cells".
+    if crate::catalog::system_cubes::is_control(&cube.name) {
+        return Err(WriteError::forbidden(format!(
+            "'{}' is a security control cube: it is changed through an admin SQL session, \
+             not through the cell write API.",
+            cube.name
+        )));
+    }
     if request.cells.is_empty() {
         return Err(WriteError::invalid("the write batch is empty"));
     }
@@ -574,6 +585,36 @@ mod tests {
             None,
             "the valid cell must NOT have been written"
         );
+    }
+
+    /// The control cubes are engine CONFIGURATION: the data write API must not touch them, or
+    /// a role with default-accept write access could grant itself permissions.
+    #[test]
+    fn a_security_control_cube_is_not_writable_through_the_data_api() {
+        let mut catalog = catalog_with_members();
+        crate::catalog::system_cubes::rebuild(&mut catalog);
+        for cube in ["#TableSecurity", "#DimensionSecurity"] {
+            let err = match cube {
+                "#TableSecurity" => write_one(
+                    &catalog,
+                    cube,
+                    &[("#Role", "reader"), ("#Cube", "Sales")],
+                    serde_json::json!("WRITE"),
+                    None,
+                    true,
+                ),
+                _ => write_one(
+                    &catalog,
+                    cube,
+                    &[("#Role", "reader"), ("#Dimension", "Region"), ("#Member", "#ALL")],
+                    serde_json::json!("WRITE"),
+                    None,
+                    true,
+                ),
+            }
+            .expect_err("control cubes are not data");
+            assert_eq!(err.code, "forbidden", "{cube}: {}", err.message);
+        }
     }
 
     #[test]
