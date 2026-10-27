@@ -624,10 +624,26 @@ fn calculate_jit(
                 members.push(record.get(i).unwrap_or(""));
             }
 
-            // 2. Extract and parse the numeric value from the last column
+            // 2. Extract and parse the value from the last column
             let val_str = record.get(dim_count).unwrap_or("0");
             let value = match val_str.parse::<f64>() {
                 Ok(n) => CellValue::Numeric(n),
+                // TEXT IS REFUSED IN AN AGGREGATING CUBE. The write API already refuses it
+                // (a text cell folds as "last value wins" and would silently replace the
+                // group's total); a bulk import must not be the back door that lets the same
+                // corruption in. Attribute tables keep accepting text: that is what they are
+                // for, and they never aggregate.
+                Err(_) if self.is_aggregating => {
+                    return Err(format!(
+                        "row {}: value '{}' is not numeric, but cube '{}' aggregates numbers; \
+                         text belongs in an attribute table (CREATE ATTRIBUTE TABLE, or the \
+                         .import_attr command)",
+                        row_count + 1,
+                        val_str,
+                        self.name
+                    )
+                    .into());
+                }
                 Err(_) => CellValue::String(val_str.to_string()),
             };
 

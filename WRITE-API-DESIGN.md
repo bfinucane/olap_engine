@@ -140,7 +140,10 @@ POST /v1/save      (requires the 'admin' role when authentication is on)
   `forbidden`. Without this, any role with default-accept write access could grant itself
   permissions. (Found while reviewing this document against the code; fixed and tested.)
 - **Text into an aggregating cube**: refused (§2). Text has a designated home, the attribute
-  table, and that is a modelled decision rather than a workaround for the accumulator.
+  table, and that is a modelled decision rather than a workaround for the accumulator. The
+  CLI enforces the same rule for BOTH bulk importers: `.import` refuses a non-numeric value
+  in an aggregating cube (naming the row), and `.import_attr` refuses the cube outright,
+  because it is the string-valued importer and would otherwise write text unconditionally.
 - Anything requiring a **hierarchy-qualified coordinate** (`Hierarchy:Member`): coordinates
   resolve in the dimension's DEFAULT hierarchy, like SQL `INSERT`. A consolidated member that
   exists only in another hierarchy cannot be addressed yet. Recorded limitation, not silent

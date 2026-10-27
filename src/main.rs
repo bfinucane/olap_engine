@@ -19,17 +19,24 @@ struct CliArgs {
     golden: Option<String>,
     /// If set, (re)write the golden file with the current output instead of comparing.
     bless: bool,
+    /// The database file the REPL loads and saves â€” `--db`.
+    ///
+    /// Defaults to `database.bin` in the CURRENT DIRECTORY. The flag exists so a scratch
+    /// copy can be chosen WITHOUT changing directory, so the reference database cannot be
+    /// rewritten by accident.
+    db: String,
 }
 
 /// Minimal hand-rolled argument parser (no external crates).
 /// Recognized forms:
-///   olap_engine <script.sql> [--out <file>] [--golden <file>] [--bless]
+///   olap_engine [--db <file>] [<script.sql> [--out <file>] [--golden <file>] [--bless]]
 fn parse_args(argv: &[String]) -> CliArgs {
     let mut args = CliArgs {
         script: None,
         out: None,
         golden: None,
         bless: false,
+        db: "database.bin".to_string(),
     };
 
     let mut i = 0;
@@ -42,6 +49,9 @@ fn parse_args(argv: &[String]) -> CliArgs {
                 if i + 1 < argv.len() { args.golden = Some(argv[i + 1].clone()); i += 1; }
             }
             "--bless" => { args.bless = true; }
+            "--db" => {
+                if i + 1 < argv.len() { args.db = argv[i + 1].clone(); i += 1; }
+            }
             other => {
                 // First bare argument (not starting with '-') is the script path.
                 if args.script.is_none() && !other.starts_with('-') {
@@ -70,17 +80,18 @@ fn main() -> ExitCode {
 
     match &args.script {
         Some(script) => run_batch(script, &args),
-        None => { run_repl(); ExitCode::SUCCESS }
+        None => { run_repl(&args.db); ExitCode::SUCCESS }
     }
 }
 
 /// Interactive REPL (the default mode).
-fn run_repl() {
+/// Interactive REPL (the default mode). `db_file` is chosen with `--db`.
+fn run_repl(db_file: &str) {
     println!("======================================");
     println!("      Patria OLAP Engine v0.1.0       ");
     println!("======================================");
 
-        let db_file = "database.bin";
+    println!("Database file: {}", db_file);
     let mut catalog = if Path::new(db_file).exists() {
         println!("Loading existing database from '{}'...", db_file);
         match Catalog::load_from_disk(db_file) {
@@ -127,7 +138,7 @@ fn run_repl() {
 
                         // Otherwise, process the command! Output goes to stdout for the CLI.
         let mut out = String::new();
-        let _ = process_command(&mut catalog, line, &mut out);
+        let _ = process_command(&mut catalog, line, &mut out, db_file);
         print!("{}", out);
     }
 }
@@ -144,7 +155,7 @@ fn run_batch(script: &str, args: &CliArgs) -> ExitCode {
     olap_engine::catalog::system_cubes::rebuild(&mut catalog);
 
     let mut output = String::new();
-    let script_ok = run_script(&mut catalog, script, &mut output);
+    let script_ok = run_script(&mut catalog, script, &mut output, &args.db);
 
     // Determine what to write to the output file (default stdout).
     let file_text = strip_timing(&output);
@@ -250,7 +261,7 @@ fn tokenize(line: &str) -> Vec<String> {
 /// All human-readable output is appended to `out` instead of printed directly,
 /// so the same command pipeline can drive both the CLI and batch/script runs.
 /// Returns `false` if the command reported an error (so batch mode can set an exit code).
-fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool {
+fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path: &str) -> bool {
     let start_time = Instant::now(); // Start the stopwatch
     let mut ok = true;
 
@@ -263,6 +274,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                                 let _ = writeln!(out, "  .cubes                       - List all cubes in the catalog");
                 let _ = writeln!(out, "  .schema [cube]               - Columns of a cube (kind, type, cardinality); no arg lists cubes");
                 let _ = writeln!(out, "  .dimensions                  - List all dimensions and their hierarchies");
+                let _ = writeln!(out, "  Startup: --db <file>          - Use this database file instead of .\\\\database.bin");
                 let _ = writeln!(out, "  .create_hierarchy <dim> <h>  - Create a hierarchy inside a dimension");
                 let _ = writeln!(out, "  .import <file.csv> <cube>    - Import numeric data from CSV");
                 let _ = writeln!(out, "  .import_attr <file.csv> <cube> - Import STRING attributes (key..., attr, value)");
@@ -278,7 +290,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                 let _ = writeln!(out, "  .exit / .quit                - Save database and exit");
             }
                         ".save" => {
-                match catalog.save_to_disk("database.bin") {
+                match catalog.save_to_disk(db_path) {
                     Ok(()) => { let _ = writeln!(out, "Database saved."); }
                     Err(e) => {
                         let _ = writeln!(out, "Error: could not save database: {}", e);
@@ -412,9 +424,19 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
 			".import" => {
                 if parts.len() == 3 {
                                         if let Some(cube) = catalog.get_cube_mut(parts[2]) {
-                        match cube.import_csv(parts[1], true) {
-                            Ok(msg) => { let _ = writeln!(out, "{}", msg); }
-                            Err(_) => { let _ = writeln!(out, "Import failed for '{}'.", parts[1]); ok = false; }
+                        // File existence FIRST, so a missing file gives the deterministic
+                        // "Could not open" message the other import commands use, rather than
+                        // a locale-dependent OS error string.
+                        if !Path::new(parts[1]).exists() {
+                            let _ = writeln!(out, "Could not open '{}'.", parts[1]);
+                            ok = false;
+                        } else {
+                            match cube.import_csv(parts[1], true) {
+                                Ok(msg) => { let _ = writeln!(out, "{}", msg); }
+                                // The reason matters: a refused row (text in a numeric cube)
+                                // must tell the operator what to fix.
+                                Err(e) => { let _ = writeln!(out, "Import failed: {}", e); ok = false; }
+                            }
                         }
                     } else {
                         let _ = writeln!(out, "Cube not found.");
@@ -446,6 +468,18 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                         Ok(mut rdr) => {
                             match catalog.get_cube_mut(parts[2]) {
                                 Some(cube) => {
+                                    // TEXT INTO A NUMERIC CUBE would corrupt its totals (a
+                                    // text cell folds as "last value wins"), so this
+                                    // string-valued importer refuses a measure cube, exactly as
+                                    // the write API does.
+                                    if cube.is_aggregating {
+                                        let _ = writeln!(
+                                            out,
+                                            "Import failed: cube '{}' aggregates numbers and cannot take text; use an attribute table (CREATE ATTRIBUTE TABLE).",
+                                            parts[2]
+                                        );
+                                        ok = false;
+                                    } else {
                                     let d = cube.dimension_names.len();
                                     let mut count = 0;
                                     let mut failed = false;
@@ -490,6 +524,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
                                     if !failed {
                                         cube.clear_cache();
                                         let _ = writeln!(out, "Imported {} attribute row(s) into '{}'.", count, parts[2]);
+                                    }
                                     }
                                 }
                                 None => {
@@ -899,7 +934,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
 			
 									".run" => {
                 if parts.len() == 2 {
-                    ok = run_script(catalog, parts[1], out);
+                    ok = run_script(catalog, parts[1], out, db_path);
                 } else {
                     let _ = writeln!(out, "Usage: .run <filepath>");
                     ok = false;
@@ -930,7 +965,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String) -> bool 
 /// Reads a file line-by-line and feeds it into the engine.
 /// Output is appended to `out` (stdout for the CLI, or a buffer/file for tests).
 /// Returns `false` if the file could not be read or any command errored.
-fn run_script(catalog: &mut Catalog, filepath: &str, out: &mut String) -> bool {
+fn run_script(catalog: &mut Catalog, filepath: &str, out: &mut String, db_path: &str) -> bool {
     let file = match File::open(filepath) {
         Ok(f) => f,
         Err(e) => {
@@ -961,7 +996,7 @@ fn run_script(catalog: &mut Catalog, filepath: &str, out: &mut String) -> bool {
         }
 
         let _ = writeln!(out, "> {}", trimmed);
-        if !process_command(catalog, trimmed, out) {
+        if !process_command(catalog, trimmed, out, db_path) {
             all_ok = false;
         }
         line_count += 1;

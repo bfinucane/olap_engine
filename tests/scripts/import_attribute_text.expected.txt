@@ -1,0 +1,13 @@
+Running script 'import_attribute_text.sql'...
+> CREATE ATTRIBUTE TABLE AttrText (Region STRING, Attribute STRING)
+Cube 'AttrText' created with no explicit measure dimension.
+
+> .import tests/scripts/import_attribute_text.csv AttrText
+Successfully imported 1 rows into cube 'AttrText'.
+
+> SELECT Region, value FROM AttrText
+Region | value
+--------------------
+East | Alice
+
+

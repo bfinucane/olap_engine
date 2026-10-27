@@ -1,0 +1,10 @@
+Running script 'import_text_value.sql'...
+> CREATE TABLE Numeric (Region STRING, Amount MEASURE)
+Cube 'Numeric' created. Measure dimension: Amount
+
+> .import tests/scripts/import_text_value.csv Numeric
+Import failed: row 1: value 'not-a-number' is not numeric, but cube 'Numeric' aggregates numbers; text belongs in an attribute table (CREATE ATTRIBUTE TABLE, or the .import_attr command)
+
+> .import_attr tests/scripts/import_text_value.csv Numeric
+Import failed: cube 'Numeric' aggregates numbers and cannot take text; use an attribute table (CREATE ATTRIBUTE TABLE).
+

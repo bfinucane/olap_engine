@@ -46,6 +46,8 @@ const EXPECT_FAILURE: &[&str] = &[
     "delete_member",
     "join",
     "import_missing_file",
+    // Text values are refused in an aggregating cube (WRITE-API-DESIGN.md §2/§8).
+    "import_text_value",
     // Ends on the MEDIAN refusal on purpose: the fixture documents that an
     // unimplemented aggregation is a clear error, not a silent SUM.
     "aggregation_functions",

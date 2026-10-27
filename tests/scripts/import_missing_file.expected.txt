@@ -9,5 +9,5 @@ Could not open 'tests/scripts/does_not_exist.csv'.
 Could not open 'tests/scripts/also_missing.csv'.
 
 > .import tests/scripts/no_such_data.csv T
-Import failed for 'tests/scripts/no_such_data.csv'.
+Could not open 'tests/scripts/no_such_data.csv'.
 
