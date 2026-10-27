@@ -1424,3 +1424,260 @@ fn dimension_access_is_opt_in() {
         "another role's rule must not apply: {rows:?}"
     );
 }
+// ---------------------------------------------------------------------------
+// Writeback (WRITE-API-DESIGN.md): write, permissions, splash, save, join check
+// ---------------------------------------------------------------------------
+
+/// The fixture plus an attribute cube and a consolidation in the Region default hierarchy,
+/// so the write tests can exercise joins and splashing.
+fn write_rich_fixture(path: &PathBuf) {
+    write_fixture(path);
+
+    let mut catalog = Catalog::load_from_disk(path.to_str().expect("utf8 path"))
+        .expect("load fixture");
+    catalog.add_cube("RegionAttr", &["Region", "Attribute"], Some("Attribute"), false);
+    {
+        let cube = catalog.get_cube_mut("RegionAttr").expect("RegionAttr");
+        cube.write(&["East", "Owner"], CellValue::String("Alice".to_string()))
+            .expect("attr East");
+        cube.write(&["West", "Owner"], CellValue::String("Bob".to_string()))
+            .expect("attr West");
+    }
+    {
+        let dim = catalog.get_dimension("Region").expect("Region");
+        let mut dim = dim.write().expect("lock");
+        dim.add_component_in(None, "Total", "East", 1.0).expect("East under Total");
+        dim.add_component_in(None, "Total", "West", 1.0).expect("West under Total");
+    }
+    catalog.save_to_disk(path.to_str().expect("utf8 path")).expect("save");
+}
+
+/// A server on the rich fixture, behind auth, with optional table rules.
+fn rich_server(
+    users: &[(&str, &str, &[&str])],
+    table_rules: &[(&str, &str, &str)],
+) -> Server {
+    let (db_path, log_path) = unique_paths("writedb");
+    write_rich_fixture(&db_path);
+
+    if !table_rules.is_empty() {
+        let mut catalog = Catalog::load_from_disk(db_path.to_str().expect("utf8 path"))
+            .expect("load");
+        for (role, cube, level) in table_rules {
+            let level = olap_engine::security::access::Level::parse(level)
+                .unwrap_or_else(|| panic!("bad level {level:?}"));
+            olap_engine::security::access::set_rule(&mut catalog, role, cube, level)
+                .expect("table rule");
+        }
+        catalog.save_to_disk(db_path.to_str().expect("utf8 path")).expect("save rules");
+    }
+
+    let security_path = log_path.with_extension("security.json");
+    let mut file = olap_engine::security::store::SecurityFile::default();
+    for (name, password, roles) in users {
+        let roles: Vec<String> = roles.iter().map(|role| role.to_string()).collect();
+        file.upsert_user(name, password, &roles).expect("user");
+    }
+    file.save(&security_path).expect("security file");
+
+    spawn_server_with_security(&db_path, &log_path, true, Some(&security_path))
+}
+
+fn write_body(cells: &str, splash: Option<&str>, create_missing: bool) -> String {
+    format!(
+        "{{\"cells\":{cells}{}{}}}",
+        splash.map(|mode| format!(",\"splash\":\"{mode}\"")).unwrap_or_default(),
+        format!(",\"createMissing\":{create_missing}")
+    )
+}
+
+/// A write lands, is readable through the query API, and survives an explicit save.
+#[test]
+fn a_write_lands_and_persists_after_an_explicit_save() {
+    let srv = rich_server(&[("admin", "adminpw", &["admin"])], &[]);
+    let token = token_for(&srv, "admin", "adminpw");
+
+    let cells = r#"[{"coords":{"Region":"East","Product":"Widget","Measure":"Sales"},"value":999}]"#;
+    let resp = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/write", srv.base),
+        Some(&write_body(cells, None, false)),
+        Some(&token),
+    );
+    assert_eq!(resp.status, 200, "write failed: {}", resp.body);
+    assert_eq!(resp.json()["written"], serde_json::json!(1));
+
+    // Readable immediately: the write bumped the version, so no stale cache.
+    let query = r#"{"dataset":"Sales","groupBy":[{"name":"Product"}],
+                    "measures":[{"name":"Sales","aggregation":"SUM"}],
+                    "filters":[{"field":"Region","operator":"in","values":["East"]}]}"#;
+    let read = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/query", srv.base),
+        Some(query),
+        Some(&token),
+    );
+    assert_eq!(read.status, 200, "{}", read.body);
+    let rows = read.json()["rows"].as_array().cloned().unwrap_or_default();
+    let widget = rows
+        .iter()
+        .find(|row| row[0] == serde_json::json!("Widget"))
+        .expect("Widget row");
+    assert_eq!(widget[1], serde_json::json!(999.0), "the write must be visible: {rows:?}");
+
+    // NOT persisted yet: writes live in memory until an explicit save.
+    let before_save = Catalog::load_from_disk(srv.db_path.to_str().expect("utf8 path"))
+        .expect("reload")
+        .get_cube("Sales")
+        .expect("Sales")
+        .read_cell(&["East", "Widget", "Sales"]);
+    assert_eq!(
+        before_save,
+        Some(CellValue::Numeric(100.0)),
+        "without a save, the FILE must still hold the original value"
+    );
+
+    // Save, then the file holds the write.
+    let saved = request_with_auth(
+        "POST",
+        &format!("{}/v1/save", srv.base),
+        None,
+        Some(&token),
+    );
+    assert_eq!(saved.status, 200, "save failed: {}", saved.body);
+    let after_save = Catalog::load_from_disk(srv.db_path.to_str().expect("utf8 path"))
+        .expect("reload")
+        .get_cube("Sales")
+        .expect("Sales")
+        .read_cell(&["East", "Widget", "Sales"]);
+    assert_eq!(after_save, Some(CellValue::Numeric(999.0)));
+}
+
+/// A role with READ but not WRITE is refused loudly - 403, never a fake success.
+#[test]
+fn a_read_only_role_cannot_write() {
+    let srv = rich_server(
+        &[("reader", "wonderland", &["reader"])],
+        &[("reader", "Sales", "READ")],
+    );
+    let token = token_for(&srv, "reader", "wonderland");
+
+    // Reading still works.
+    assert_eq!(
+        request_with_auth("GET", &format!("{}/v1/Sales", srv.base), None, Some(&token)).status,
+        200
+    );
+
+    let cells = r#"[{"coords":{"Region":"East","Product":"Widget","Measure":"Sales"},"value":1}]"#;
+    let resp = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/write", srv.base),
+        Some(&write_body(cells, None, false)),
+        Some(&token),
+    );
+    assert_eq!(resp.status, 403, "{}", resp.body);
+    assert_eq!(resp.code(), "forbidden");
+}
+
+/// Strict member handling by default; the client opts into creation.
+#[test]
+fn creating_members_is_the_clients_choice() {
+    let srv = rich_server(&[("admin", "adminpw", &["admin"])], &[]);
+    let token = token_for(&srv, "admin", "adminpw");
+    let url = format!("{}/v1/Sales/write", srv.base);
+    // "Widgets" does not exist.
+    let cells = r#"[{"coords":{"Region":"East","Product":"Widgets","Measure":"Sales"},"value":1}]"#;
+
+    let strict = request_with_auth("POST", &url, Some(&write_body(cells, None, false)), Some(&token));
+    assert_eq!(strict.status, 400, "{}", strict.body);
+    assert_eq!(strict.code(), "unknown_member");
+
+    let permissive =
+        request_with_auth("POST", &url, Some(&write_body(cells, None, true)), Some(&token));
+    assert_eq!(permissive.status, 200, "{}", permissive.body);
+}
+
+/// A consolidated coordinate needs the client to say what it means; `replace` sets the total.
+#[test]
+fn writing_a_consolidated_cell_needs_an_explicit_splash() {
+    let srv = rich_server(&[("admin", "adminpw", &["admin"])], &[]);
+    let token = token_for(&srv, "admin", "adminpw");
+    let url = format!("{}/v1/Sales/write", srv.base);
+    let cells = r#"[{"coords":{"Region":"Total","Product":"Widget","Measure":"Sales"},"value":200}]"#;
+
+    let refused = request_with_auth("POST", &url, Some(&write_body(cells, None, false)), Some(&token));
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert_eq!(refused.code(), "consolidated_write");
+
+    let replaced = request_with_auth(
+        "POST",
+        &url,
+        Some(&write_body(cells, Some("replace"), false)),
+        Some(&token),
+    );
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+
+    // The rollup now reads 200 (100 from each leaf).
+    let query = r#"{"dataset":"Sales","groupBy":[{"name":"Product"}],
+                    "measures":[{"name":"Sales","aggregation":"SUM"}],
+                    "filters":[{"field":"Region","operator":"in","values":["Total"]}]}"#;
+    let read = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/query", srv.base),
+        Some(query),
+        Some(&token),
+    );
+    assert_eq!(read.status, 200, "{}", read.body);
+    let rows = read.json()["rows"].as_array().cloned().unwrap_or_default();
+    let widget = rows
+        .iter()
+        .find(|row| row[0] == serde_json::json!("Widget"))
+        .expect("Widget row");
+    assert_eq!(widget[1], serde_json::json!(200.0), "splash replace must set the total: {rows:?}");
+}
+
+/// S5: a join reaches a second cube, so the join target is access-checked too.
+#[test]
+fn a_join_cannot_reach_a_denied_cube() {
+    let srv = rich_server(
+        &[
+            ("admin", "adminpw", &["admin"]),
+            ("reader", "wonderland", &["reader"]),
+        ],
+        &[("reader", "RegionAttr", "NONE")],
+    );
+    let admin = token_for(&srv, "admin", "adminpw");
+    let reader = token_for(&srv, "reader", "wonderland");
+
+    let query = r#"{"dataset":"Sales","groupBy":[{"name":"Region"}],
+                    "measures":[{"name":"Sales","aggregation":"SUM"}],
+                    "join":{"cube":"RegionAttr","attributes":["Owner"]}}"#;
+    let url = format!("{}/v1/Sales/query", srv.base);
+
+    let allowed = request_with_auth("POST", &url, Some(query), Some(&admin));
+    assert_eq!(allowed.status, 200, "admin join: {}", allowed.body);
+    assert!(
+        allowed.body.contains("Owner"),
+        "the join must attach the attribute for an allowed role: {}",
+        allowed.body
+    );
+
+    let denied = request_with_auth("POST", &url, Some(query), Some(&reader));
+    assert_eq!(denied.status, 404, "a denied join target must look missing: {}", denied.body);
+    assert_eq!(denied.code(), "unknown_dataset");
+}
+
+/// Saving is a server-maintenance action: an ordinary role must not be able to do it.
+#[test]
+fn saving_requires_the_admin_role() {
+    let srv = rich_server(&[("reader", "wonderland", &["reader"])], &[]);
+    let token = token_for(&srv, "reader", "wonderland");
+    let resp = request_with_auth(
+        "POST",
+        &format!("{}/v1/save", srv.base),
+        None,
+        Some(&token),
+    );
+    assert_eq!(resp.status, 403, "{}", resp.body);
+    assert_eq!(resp.code(), "forbidden");
+}

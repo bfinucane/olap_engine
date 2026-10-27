@@ -45,6 +45,37 @@ leaves unnamed) is now only used if it exists in the dimension's **default hiera
 multi-hierarchy dimension could have its first-created member in another hierarchy, which
 produced `Member 'Furniture' not found` on a perfectly ordinary query.
 
+### Writeback: `POST /v1/{dataset}/write`, `POST /v1/save`, `capabilities.supportsWrite`
+
+The engine can now be written to. Every cell is validated before anything is applied, so a
+batch is atomic; `splash` and `createMissing` are the CLIENT's choices.
+
+```text
+POST /v1/{dataset}/write
+{"cells":[{"coords":{"Region":"East","Measure":"Sales"},"value":123.45}],
+ "splash":"reject", "createMissing":false}
+200 {"written":1,"version":43}
+```
+
+- `splash`: `reject` (default) refuses a write to a consolidated coordinate;
+  `replace`/`add` distribute it over the member's leaves by rollup weights. The engine never
+  picks a mode for you.
+- `createMissing` (default **false**): whether a member that does not exist may be created.
+  The server can additionally veto creation through dimension access (`#DimensionSecurity`).
+- Errors: `400 invalid_argument | unknown_member | consolidated_write`, `403 forbidden`,
+  `404 unknown_dataset`. **Writes are loud**: a refused write says so, unlike a read, where a
+  hidden cube answers 404 to avoid leaking structure.
+- `version` in the response is INFORMATIONAL. The contract is last-write-wins.
+- `POST /v1/save` persists the in-memory catalogue to disk (requires the `admin` role when
+  authentication is on). Without it, writes live in memory only.
+- `capabilities.supportsWrite` advertises the endpoint.
+
+**Coordinates are a `{dimension: member}` map** and resolve in the dimension's DEFAULT
+hierarchy (a consolidated member living only in another hierarchy cannot be addressed yet).
+
+**Behaviour change from security:** a query's attribute `join` is now access-checked against
+the joined cube (S5) — a role denied that cube gets `404 unknown_dataset` for the join.
+
 ### Dimension access: rows and totals change, nothing errors
 
 A role can be denied a MEMBER of a dimension (or the whole dimension with `#ALL`). Unlike

@@ -386,6 +386,13 @@ pub struct Capabilities {
     /// data access.
     #[serde(rename = "authRequired")]
     pub auth_required: bool,
+    /// Whether `POST /v1/{dataset}/write` is available (WRITE-API-DESIGN.md).
+    ///
+    /// A client feature-detects on this before offering an editable grid: an older engine
+    /// would answer the unknown route with `invalid_argument`, which is a confusing way to
+    /// discover that writeback is not supported.
+    #[serde(rename = "supportsWrite")]
+    pub supports_write: bool,
 }
 
 impl Default for Capabilities {
@@ -427,6 +434,7 @@ impl Default for Capabilities {
             // The library cannot know whether it is served behind auth; the binary
             // overrides this from its own flags.
             auth_required: false,
+            supports_write: true,
         }
     }
 }

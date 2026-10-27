@@ -1,4 +1,4 @@
-//! `serve` — the HTTP/JSON transport for ENGINE-PROTOCOL.md v1.
+//! `serve` â€” the HTTP/JSON transport for ENGINE-PROTOCOL.md v1.
 //! 
 //!
 //! WHY A HAND-ROLLED SERVER
@@ -17,7 +17,7 @@
 //!   POST /v1/{dataset}/query         -> query   (body is a QueryRequest)
 //!   POST /v1/login                   -> session token (PUBLIC: it is how you get one)
 //!
-//! AUTHENTICATION (SECURITY-DESIGN.md §5)
+//! AUTHENTICATION (SECURITY-DESIGN.md Â§5)
 //!   Every /v1 route except /v1/login requires `Authorization: Bearer <token>`.
 //!   Required by default; `--allow-anonymous` turns it off for development.
 //!   Users live in `security.json` beside the database, created with
@@ -39,10 +39,11 @@ use std::sync::Arc;
 
 use olap_engine::catalog::catalog::Catalog;
 use olap_engine::engine::plan::QueryRequest;
+use olap_engine::engine::write::WriteRequest;
 use olap_engine::engine::wire::{
     self, capabilities, datasets, describe, query, ErrorResponse, SampleQuery, WireError,
 };
-use olap_engine::security::access::{DimensionAccess, TableAccess};
+use olap_engine::security::access::{DimensionAccess, Level, TableAccess};
 use olap_engine::security::session::{Session, SessionStore};
 use olap_engine::security::store::{default_path as default_security_path, SecurityFile};
 
@@ -217,14 +218,18 @@ fn main() {
     }
     eprintln!("Load 'http://{}/v1' as the engine base URL in Plateau.", config.bind);
 
+    // Shared with connection threads: `POST /v1/save` writes this file.
+    let db_path = Arc::new(config.db.clone());
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let shared = Arc::clone(&shared);
                 let security = Arc::clone(&security);
+                let db_path = Arc::clone(&db_path);
                 let cors = config.cors;
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, shared, cors, security) {
+                    if let Err(e) = handle_connection(stream, shared, cors, security, &db_path) {
                         // A client that hangs up mid-response is normal; do not
                         // spam the log for it.
                         if e.kind() != std::io::ErrorKind::BrokenPipe {
@@ -401,7 +406,7 @@ fn load_catalog(db_path: &str) -> Catalog {
                 return c;
             }
             Err(e) => {
-                eprintln!("Could not load '{}': {} — starting empty.", db_path, e);
+                eprintln!("Could not load '{}': {} â€” starting empty.", db_path, e);
             }
         }
     } else {
@@ -444,6 +449,7 @@ fn handle_connection(
     shared: Arc<Catalog>,
     cors: bool,
     security: Arc<SecurityState>,
+    db_path: &str,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
@@ -559,7 +565,7 @@ fn handle_connection(
         }
     };
 
-    match route(&request, &shared, &security, session.as_ref()) {
+    match route(&request, &shared, &security, session.as_ref(), db_path) {
         Ok((status, value)) => {
             let text = value.to_string();
             write_json(&mut stream, status, &text, cors)?;
@@ -585,6 +591,7 @@ fn route(
     shared: &Arc<Catalog>,
     security: &SecurityState,
     session: Option<&Session>,
+    db_path: &str,
 ) -> Result<(u16, serde_json::Value), WireError> {
     // TABLE ACCESS (S2). Default ACCEPT: a role with no rule sees everything, and a rule
     // exists to RESTRICT. An unauthenticated request (development mode) carries no roles and
@@ -609,6 +616,10 @@ fn route(
         code: "unknown_dataset",
         message: format!("Dataset '{name}' not found."),
     };
+    let forbidden = |message: String| WireError {
+        code: "forbidden",
+        message,
+    };
     // Strip a trailing slash for uniform matching.
     let path = req.path.trim_end_matches('/');
 
@@ -623,7 +634,7 @@ fn route(
         return Ok((200, serde_json::to_value(caps).unwrap()));
     }
 
-    // GET /v1/datasets — the list of queryable dataset names. Checked BEFORE the
+    // GET /v1/datasets â€” the list of queryable dataset names. Checked BEFORE the
     // /v1/{dataset} split so "datasets" is never read as a dataset named
     // "datasets".
     if path == "/v1/datasets" {
@@ -639,7 +650,7 @@ fn route(
         return Ok((200, serde_json::to_value(resp).unwrap()));
     }
 
-    // POST /v1/sql — the read-only SQL console's endpoint.
+    // POST /v1/sql â€” the read-only SQL console's endpoint.
     //
     // Deliberately restricted to a single SELECT (see `sql::ensure_read_only`): the
     // port has no authentication, so a write path here would let anything on the
@@ -708,6 +719,35 @@ fn route(
         ));
     }
 
+    // POST /v1/save â€” PERSIST the in-memory catalogue to disk.
+    //
+    // Writes live in memory (the engine is an in-memory OLAP store); durability is an explicit
+    // act, which is what the user chose: no debounce, no surprise saves. Restricted to a role
+    // named 'admin' when authentication is on, because saving is a server-maintenance action,
+    // not a data edit.
+    if path == "/v1/save" {
+        if req.method != "POST" {
+            return Err(method_not_allowed("POST"));
+        }
+        let is_admin = !security.require_auth
+            || session
+                .map(|s| s.roles.iter().any(|role| role.eq_ignore_ascii_case("admin")))
+                .unwrap_or(false);
+        if !is_admin {
+            return Err(forbidden(
+                "Saving requires the 'admin' role.".to_string(),
+            ));
+        }
+        shared.save_to_disk(db_path).map_err(|e| WireError {
+            code: "save_failed",
+            message: format!("Could not save '{db_path}': {e}"),
+        })?;
+        return Ok((
+            200,
+            serde_json::json!({ "saved": true, "path": db_path }),
+        ));
+    }
+
     // POST (or anything but GET) to the page's own URL: same confusion, other way.
     if path == "/sql" {
         return Err(WireError {
@@ -738,7 +778,10 @@ fn route(
     // Hides the cube from everyone who may not read it, including the sample and query
     // sub-routes, before any work is done. Two reasons a cube is unreadable: the role is
     // denied the cube itself, or it is denied a DIMENSION the cube uses.
-    if !access.can_read(dataset) || dimensions.hides_cube(shared, dataset) {
+    //
+    // A WRITE is exempt: a refused write must be HONEST (403), not look like a missing cube.
+    let is_write = req.method == "POST" && operation == "write";
+    if !is_write && (!access.can_read(dataset) || dimensions.hides_cube(shared, dataset)) {
         return Err(hidden(dataset));
     }
 
@@ -786,8 +829,67 @@ fn route(
                 });
             }
             let mut plan = plan;
+            // ATTRIBUTE JOIN ACCESS (S5): a join reaches a SECOND cube. Without this
+            // check a role denied a cube could read its attributes through a join.
+            if let Some(join) = &plan.join {
+                if !access.can_read(&join.cube) || dimensions.hides_cube(shared, &join.cube) {
+                    return Err(hidden(&join.cube));
+                }
+            }
         plan.denied_members = denied_members.clone();
         let resp = query(shared, &plan)?;
+            Ok((200, serde_json::to_value(resp).unwrap()))
+        }
+        // POST /v1/{dataset}/write - batched cell writes (WRITE-API-DESIGN.md).
+        //
+        // SPLASH AND AUTOCREATE ARE THE CLIENT'S CHOICE: `splash` says what a consolidated
+        // coordinate write means; `createMissing` says whether a member may be created. The
+        // SERVER only vetoes, through the security cubes.
+        ("POST", "write") => {
+            if !access.can_read(dataset) || dimensions.hides_cube(shared, dataset) {
+                return Err(forbidden(format!("You may not write to '{dataset}'.")));
+            }
+            if access.level_for(dataset) < Level::Write {
+                return Err(forbidden(format!(
+                    "Your roles may read '{dataset}' but not write it."
+                )));
+            }
+
+            let request: WriteRequest =
+                serde_json::from_slice(&req.body).map_err(|e| WireError {
+                    code: "invalid_argument",
+                    message: format!("Malformed write body: {e}"),
+                })?;
+
+            // DIMENSION ACCESS applies to every coordinate: a member the role may not see
+            // cannot be written either. CREATING a member is governed by the whole-dimension
+            // level, because a per-member rule cannot exist for an absent member.
+            let create_missing = request.create_missing.unwrap_or(false);
+            for cell in &request.cells {
+                for (dimension, member) in &cell.coords {
+                    if dimensions.read_level_for(dimension, member) < Level::Read {
+                        return Err(forbidden(format!(
+                            "You may not write to '{dimension}' member '{member}'."
+                        )));
+                    }
+                    if dimensions.write_level_for(dimension, member) < Level::Write {
+                        return Err(forbidden(format!(
+                            "You may not change '{dimension}' member '{member}'."
+                        )));
+                    }
+                    if create_missing && !dimensions.can_create_member(dimension) {
+                        return Err(forbidden(format!(
+                            "You may not create members in dimension '{dimension}'."
+                        )));
+                    }
+                }
+            }
+
+            let resp = olap_engine::engine::write::write_cells(shared, dataset, &request)
+                .map_err(|e| WireError {
+                    code: e.code,
+                    message: e.message,
+                })?;
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         ("GET", _) | ("POST", _) => Err(WireError {

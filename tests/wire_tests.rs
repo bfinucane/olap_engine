@@ -157,6 +157,7 @@ fn capabilities_section4_keys_and_honest_declarations() {
             "supportsInlineDomain",
             "supportsJoin",
             "supportsLod",
+            "supportsWrite",
         ],
         "capabilities must use these camelCase keys exactly"
     );
@@ -166,6 +167,7 @@ fn capabilities_section4_keys_and_honest_declarations() {
     assert_eq!(v["supportsLod"], json!(false), "LOD must not be claimed");
     assert_eq!(v["supportsJoin"], json!(true), "attribute joins are implemented");
     assert_eq!(v["supportsInlineDomain"], json!(true));
+    assert_eq!(v["supportsWrite"], json!(true), "writeback is implemented");
     assert_eq!(v["authRequired"], json!(false), "the library default is anonymous; the server overrides it from its flags");
     // COUNTD is not implemented, so the engine must not claim an exact distinct count.
     assert_eq!(

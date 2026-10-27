@@ -171,3 +171,72 @@ Everything else MiniSheet needs (lists, OLAPVALUE, describe) already exists.
 
 Answer those and the endpoint is a contained slice: one route, one access check, a batch
 validator, a version token, a save policy — roughly the size of S2.
+
+---
+
+# IMPLEMENTED — decisions as the user gave them
+
+The five open questions above are answered and the endpoint is built. What changed:
+
+1. **Splash is the client's choice.** `"splash": "reject" | "replace" | "add"`; absent =
+   `reject`. The server performs the client's choice and never picks one. Verified: a
+   `replace` on a consolidated cell sets the rollup total (100 + 100 over two leaves).
+2. **Autocreate is the client's choice**, `createMissing` (default false), and the SERVER
+   additionally vetoes it through dimension access (S3): creating a member requires the
+   WHOLE-DIMENSION level to be `WRITE`, because a per-member rule cannot exist for a member
+   that does not exist yet. This is the "oversight" the user noted in TM1/Infor being
+   corrected rather than inherited.
+3. **Last write wins.** There is no `ifVersion`, no 409, no locking. The response carries
+   `version` for information only — it is not a precondition.
+4. **Persistence is an explicit act.** `POST /v1/save` writes the catalogue to disk; there is
+   no debounce and no save on shutdown, so nothing is persisted by surprise. Saving requires
+   the `admin` role when authentication is on.
+5. **Writing a consolidated cell IS splashing**, and the client controls the mode (§1).
+
+## The wire as built
+
+```text
+POST /v1/{dataset}/write
+{ "cells": [ { "coords": {"Region":"East","Product":"Widget","Measure":"Sales"},
+               "value": 123.45 } ],
+  "splash": "reject",          // optional: reject (default) | replace | add
+  "createMissing": false }     // optional, default false
+
+200 { "written": 1, "version": 43 }
+400 invalid_argument | unknown_member | consolidated_write
+403 forbidden
+404 unknown_dataset
+```
+
+`POST /v1/save` -> `200 {"saved": true, "path": "..."}`; `403` for a non-admin.
+
+`capabilities.supportsWrite` advertises the endpoint so a client can feature-detect instead
+of discovering writeback by getting `invalid_argument` on an unknown route.
+
+## Implementation notes an integrator needs
+
+- **Atomic batches.** Every cell is validated (arity, member existence, splash legality,
+  value type) before any cell is written, so a rejected batch changes nothing.
+- **Max 10,000 cells per request** (`write::MAX_CELLS_PER_REQUEST`), so a hostile request
+  cannot hold the store lock for an unbounded time.
+- **Coordinates resolve in the DEFAULT hierarchy**, like SQL `INSERT`. A consolidated member
+  that exists only in another hierarchy cannot be addressed yet (queries do support
+  `Hierarchy:Member`); this is a recorded limitation, not a silent behaviour.
+- **Rejected writes are HONEST**: 403 with `forbidden`, never the 404 used for hidden reads.
+  A write that cannot happen must not look like it did.
+- **A denied dimension member cannot be written**: writing into a cell the caller cannot see
+  would change data they cannot verify.
+- **Derived system cubes stay read-only**; the control cubes (`#TableSecurity`,
+  `#DimensionSecurity`) are NOT writable through this endpoint either — they are engine
+  configuration, written through SQL by an admin.
+- **No cache invalidation needed**: the write bumps the cube's version, and the version-tagged
+  cache is invalidated lazily on the next read.
+
+## Tests
+
+14 unit tests for the writer (leaf/string writes, case-insensitive dimension names, arity,
+strict vs autocreate, consolidated refusal, splash replace, splash on a leaf, unknown splash
+mode, batch atomicity, derived-cube refusal, unknown dataset) and 6 HTTP tests (write lands
+and persists only after save, READ-only role refused, autocreate is the client's choice,
+consolidated write needs splash and sets the total, a join cannot reach a denied cube, save
+requires admin).

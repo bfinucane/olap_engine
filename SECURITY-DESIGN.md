@@ -146,8 +146,8 @@ feature.
 | S1 | **DONE** — users, roles, `POST /v1/login`, bearer tokens | login returns a token; a request without one is `401` when auth is required; a bad password is `401` without saying which part failed |
 | S2 | **DONE** — table access | a role at `NONE` on a cube sees `unknown_dataset`; another role sees it |
 | S3 | **DONE** — dimension access with wildcard + overrides | a denied member is absent from rows *and* from totals; the wildcard covers the rest |
-| S4 | write permissions | a `READ`-only role's write is refused; an `ACCEPT`-default write still works |
-| S5 | joins respect both sides | a join to a forbidden cube is absent; a join on a forbidden dimension yields absent attributes, not an error |
+| S4 | **DONE** — write permissions (built with the write API) | a `READ`-only role's write is refused; an `ACCEPT`-default write still works |
+| S5 | **DONE** — joins respect both sides | a join to a forbidden cube is absent; a join on a forbidden dimension yields absent attributes, not an error |
 | S6 | session pins a security snapshot | changing a rule invalidates sessions lazily, the way data versions do |
 
 Each slice leaves the suite green. S0 is independent and useful on its own Ã¢â‚¬â€ it is also

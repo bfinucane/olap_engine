@@ -184,6 +184,11 @@ impl WireError {
             // A bug in the client.
             "invalid_argument" | "unsupported_aggregation" | "unsupported_filter"
             | "unsupported_expression" | "version_mismatch" => 400,
+            // A WRITE refused on purpose. Reads hide a denied cube behind 404 so structure
+            // does not leak; a write must be honest, because a fake success is worse than
+            // admitting the denial.
+            "forbidden" => 403,
+            "unknown_member" | "consolidated_write" => 400,
             "unknown_dataset" => 404,
             // The engine's fault.
             _ => 500,

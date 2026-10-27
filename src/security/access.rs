@@ -1,4 +1,4 @@
-//! Table access: which cubes a session's roles may see (SECURITY-DESIGN.md §3, S2).
+//! Table access: which cubes a session's roles may see (SECURITY-DESIGN.md Â§3, S2).
 //!
 //! WHERE THE RULES LIVE
 //!   In the `#TableSecurity` CONTROL cube, `(#Role, #Cube) -> READ | WRITE | NONE`. It is an
@@ -11,7 +11,7 @@
 //!
 //!   The engine adds that cube at load and rebuild time (without overwriting it).
 //!
-//! DEFAULT IS ACCEPT (the user's Infor-style decision, SECURITY-DESIGN.md §1). A cube with no
+//! DEFAULT IS ACCEPT (the user's Infor-style decision, SECURITY-DESIGN.md Â§1). A cube with no
 //! rule is fully accessible. A rule exists to RESTRICT.
 //!
 //! WHAT THAT MEANS FOR SEVERAL ROLES
@@ -286,15 +286,17 @@ pub const ALL_MEMBERS: &str = "#ALL";
 
 /// Effective dimension access for one session.
 ///
-/// Only `NONE` denies. Under default-accept, `READ`/`WRITE` rows are grants and change
-/// nothing; they are accepted and recorded so a role can be given an explicit level without
-/// the engine having to special-case it.
+/// LEVELS, not just denials: a member rule can be `NONE`, `READ` or `WRITE`, and a whole
+/// dimension can be restricted with the `#ALL` member. Reads need `READ` or better; writes
+/// need `WRITE`; CREATING a member needs the whole-dimension level to be `WRITE`, because a
+/// per-member rule cannot exist for a member that does not exist yet. That last rule is how
+/// S3 governs autocreate, as the user specified.
 #[derive(Debug, Clone, Default)]
 pub struct DimensionAccess {
-    /// dimension (lowercased) -> denied member names (lowercased)
-    denied: HashMap<String, Vec<String>>,
-    /// dimensions the role may not see AT ALL (lowercased)
-    whole: Vec<String>,
+    /// (dimension, member), both lowercased -> most restrictive level.
+    members: std::collections::HashMap<(String, String), Level>,
+    /// dimension, lowercased -> level for the WHOLE dimension (`#ALL` row).
+    whole: std::collections::HashMap<String, Level>,
 }
 
 impl DimensionAccess {
@@ -303,6 +305,9 @@ impl DimensionAccess {
     }
 
     /// Builds the policy for the roles a session holds.
+    ///
+    /// Most restrictive rule wins across held roles, for the same reason as table access:
+    /// with default-accept, a permissive role would otherwise erase every restriction.
     pub fn for_roles(catalog: &Catalog, roles: &[String]) -> Self {
         if roles.is_empty() {
             return Self::open();
@@ -311,8 +316,9 @@ impl DimensionAccess {
             return Self::open();
         };
 
-        let mut denied: HashMap<String, Vec<String>> = HashMap::new();
-        let mut whole: Vec<String> = Vec::new();
+        let mut members: std::collections::HashMap<(String, String), Level> =
+            std::collections::HashMap::new();
+        let mut whole: std::collections::HashMap<String, Level> = std::collections::HashMap::new();
 
         for (coords, value) in cube.store.scan_subcube(&vec![None; cube.dimensions.len()]) {
             let field = |index: usize| {
@@ -326,42 +332,47 @@ impl DimensionAccess {
             if !roles.iter().any(|held| held.eq_ignore_ascii_case(&role)) {
                 continue;
             }
-            if Level::parse(&value.to_string()) != Some(Level::Forbidden) {
-                continue;
-            }
+            // An unreadable level in an ACL entry must fail CLOSED.
+            let level = Level::parse(&value.to_string()).unwrap_or(Level::Forbidden);
 
             let dimension_key = dimension.to_ascii_lowercase();
             if member.eq_ignore_ascii_case(ALL_MEMBERS) {
-                if !whole.contains(&dimension_key) {
-                    whole.push(dimension_key);
-                }
-            } else {
-                denied
+                whole
                     .entry(dimension_key)
-                    .or_default()
-                    .push(member.to_ascii_lowercase());
+                    .and_modify(|existing| *existing = (*existing).min(level))
+                    .or_insert(level);
+            } else {
+                members
+                    .entry((dimension_key, member.to_ascii_lowercase()))
+                    .and_modify(|existing| *existing = (*existing).min(level))
+                    .or_insert(level);
             }
         }
 
-        Self { denied, whole }
+        Self { members, whole }
     }
 
     /// Dimensions denied in full.
-    pub fn whole_dimensions(&self) -> &[String] {
-        &self.whole
+    pub fn whole_dimensions(&self) -> Vec<String> {
+        self.whole
+            .iter()
+            .filter(|(_, level)| **level == Level::Forbidden)
+            .map(|(dimension, _)| dimension.clone())
+            .collect()
     }
 
     /// True when this policy makes a CUBE unreadable because one of its dimensions is denied
     /// in full.
     pub fn hides_cube(&self, catalog: &Catalog, cube_name: &str) -> bool {
-        if self.whole.is_empty() {
+        let denied = self.whole_dimensions();
+        if denied.is_empty() {
             return false;
         }
         let Some(cube) = catalog.get_cube(cube_name) else {
             return false;
         };
         cube.dimension_names.iter().any(|dim| {
-            self.whole
+            denied
                 .iter()
                 .any(|denied_dim| denied_dim.eq_ignore_ascii_case(dim))
         })
@@ -371,23 +382,60 @@ impl DimensionAccess {
     ///
     /// Whole-dimension denials are NOT included here: they are handled by hiding the cube,
     /// so there is no cube left to filter.
-    pub fn denied_members(&self) -> HashMap<String, Vec<String>> {
-        self.denied
-            .iter()
-            .map(|(dimension, members)| (dimension.clone(), members.clone()))
-            .collect()
+    pub fn denied_members(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut denied: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for ((dimension, member), level) in &self.members {
+            if *level == Level::Forbidden {
+                denied.entry(dimension.clone()).or_default().push(member.clone());
+            }
+        }
+        denied
+    }
+
+    /// The level for reading one member: the most specific rule, else the whole-dimension
+    /// rule, else ACCEPT.
+    pub fn read_level_for(&self, dimension: &str, member: &str) -> Level {
+        let dimension_key = dimension.to_ascii_lowercase();
+        if let Some(level) = self
+            .members
+            .get(&(dimension_key.clone(), member.to_ascii_lowercase()))
+        {
+            return *level;
+        }
+        self.whole.get(&dimension_key).copied().unwrap_or(Level::Write)
+    }
+
+    /// The level for WRITING one member. Same rule as reading today: a rule says what the
+    /// role may do, and only `WRITE` permits a change.
+    pub fn write_level_for(&self, dimension: &str, member: &str) -> Level {
+        self.read_level_for(dimension, member)
+    }
+
+    /// Whether the role may CREATE a member in this dimension.
+    ///
+    /// Governed by the whole-dimension (`#ALL`) rule: a per-member rule cannot apply to a
+    /// member that does not exist yet. Absent rule = ACCEPT.
+    pub fn can_create_member(&self, dimension: &str) -> bool {
+        self.whole
+            .get(&dimension.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(Level::Write)
+            >= Level::Write
     }
 
     pub fn is_empty(&self) -> bool {
-        self.denied.is_empty() && self.whole.is_empty()
+        self.members.is_empty() && self.whole.is_empty()
     }
 
     pub fn denied_count(&self) -> usize {
-        self.denied.values().map(Vec::len).sum()
+        self.members
+            .values()
+            .filter(|level| **level == Level::Forbidden)
+            .count()
     }
 }
 
-/// Writes one dimension rule into the control cube (the admin path; SQL `INSERT` is equivalent).
 pub fn set_dimension_rule(
     catalog: &mut Catalog,
     role: &str,
@@ -436,11 +484,17 @@ mod dimension_tests {
     }
 
     #[test]
-    fn a_read_rule_does_not_deny() {
+    fn a_read_rule_does_not_deny_but_caps_writes() {
         let mut catalog = catalog_with_dimension_security();
         set_dimension_rule(&mut catalog, "reader", "Region", "East", Level::Read).expect("rule");
         let access = DimensionAccess::for_roles(&catalog, &["reader".to_string()]);
-        assert!(access.is_empty(), "READ is a grant, not a denial");
+
+        // It denies nothing...
+        assert!(access.denied_members().is_empty(), "READ is a grant, not a denial");
+        assert_eq!(access.read_level_for("Region", "East"), Level::Read);
+        // ...but it does not permit a write either.
+        assert_eq!(access.write_level_for("Region", "East"), Level::Read);
+        assert_eq!(access.denied_count(), 0);
     }
 
     #[test]
