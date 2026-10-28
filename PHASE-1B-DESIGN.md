@@ -1,13 +1,22 @@
 # Phase 1b — versioned (MVCC) storage engine
 
-**Status:** proposal, for review. No code written.
+**Status: IMPLEMENTED M1–M3; M4 DEFERRED — re-assess.** The store is now the
+version-addressed trie described here (`src/storage/version_store.rs`; `SparseStore`
+snapshots are `Arc`-shared), the version-tagged cache replaced the four global clears, and
+the server holds `Arc<Catalog>`. M4 (structural dimension changes versioned) was deferred;
+its "no concurrent mutation surface" premise is now only partly true because the HTTP write
+endpoint can create members — re-check it before quoting it. The measurement gate in §7 is
+the accepted record.
 **Roadmap scope:** `ROADMAP.md` Phase 1b. Its definition of done: *a long read continues on
 its version while a concurrent write commits a new one; readers never see a torn state;
 retired versions are reclaimed; churn is measured and bounded.*
 
 ---
 
-## 1. What exists today
+## 1. What existed before 1b (design-time snapshot)
+
+This table records the starting point the design was written against, not the current
+code; §8 lists what landed.
 
 | Thing | Where | Relevant fact |
 |---|---|---|
@@ -122,10 +131,11 @@ writes the current root.
 
 - `GET` routes take `snapshot()` and never block.
 - `POST /v1/{ds}/query` likewise; it no longer needs `&mut Catalog`.
-- Writes (none exposed over HTTP yet — there is no write endpoint) take the write lock.
+- Writes take the write lock; writeback now exposes them over HTTP
+  (`POST /v1/{dataset}/write`, still last-write-wins per batch).
 - The `Mutex` around the catalog goes away entirely, which is the point of the phase.
 
-This is also where the "one coarse lock" complaint in `ROADMAP.md`'s baseline section is
+This is also where the "one coarse lock" complaint in `ROADMAP.md`'s current-state section is
 actually fixed.
 
 ## 7. Measurement — the roadmap's gate, before committing
@@ -224,21 +234,23 @@ Infor cared about), not micro-tuning.
 | M1b | the §7 gate, measured on the new store | **done** — failed at first, then re-derived and accepted (§7) |
 | M2 | `VersionStore` in `Cube`: version id, snapshot reads, version-tagged cache replacing the four `clear()` calls | **done** — `tests/versioning_tests.rs` (5): version advances per write; a snapshot read survives a later write; the cache is reused within a version and dropped after a write; a stale-tagged put is refused; a cloned cube writes independently |
 | M3 | server drops the catalog `Mutex` | **done** — `serve.rs` holds `Arc<Catalog>`, the plan/wire read paths take `&Catalog`, and `tests/concurrency_tests.rs` (rewritten: its old "absence" test said to replace it when 1b landed) proves one writer over 400 versions against 4 concurrent readers with no torn read, plus a pinned snapshot surviving a writer; `serve_http_tests::concurrent_requests_are_all_served_consistently` fires 8×10 describe+query requests |
-| M4 | structural dimension changes clone the dimension and bump the version | **DEFERRED (2026-10)** — it protects a pinned reader from a *concurrent* hierarchy edit, and nothing can edit a hierarchy concurrently today: the server has no mutation endpoint and the CLI mutates single-threaded. The part with value now landed separately: structural changes bump every cube's version, so a cached aggregate cannot survive a `.rollup` (`versioning_tests::a_structural_change_invalidates_cached_aggregations`). Revisit when a write/mutation surface exists. |
+| M4 | structural dimension changes clone the dimension and bump the version | **DEFERRED (2026-10) — re-assess.** It protects a pinned reader from a *concurrent* hierarchy edit. Hierarchy STRUCTURE (`rollup`/`detach`/`order`) is still CLI-only and single-threaded, so that race is not reachable yet; but the server NOW has a mutation endpoint, and `createMissing: true` creates members while readers are active, so the original "no mutation surface" premise is only partly true. The part with value now landed separately: structural changes bump every cube's version, so a cached aggregate cannot survive a `.rollup` (`versioning_tests::a_structural_change_invalidates_cached_aggregations`). Revisit when a structural write surface exists. |
 
 Each milestone leaves the suite green. M3 is where the coarse lock actually went away; M2
 only made the read path capable of not needing it.
 
-**What M3 did and did not prove.** The engine has no HTTP write endpoint, so the
-reader/writer race is exercised in-process against the same `VersionStore`
-(`concurrency_tests.rs`), and the HTTP test proves the transport serves concurrent requests
-consistently with no deadlock. A concurrent writer over the wire would need a write endpoint,
-which is a protocol decision, not an engine one.
+**What M3 did and did not prove.** The reader/writer race is exercised in-process against
+the same `VersionStore` (`concurrency_tests.rs`), and the HTTP test proves the transport
+serves concurrent requests consistently with no deadlock. Writeback now exists, so a
+concurrent writer over the wire IS possible: it is last-write-wins by contract
+(`WRITE-API-DESIGN.md` §5) and there is no multi-writer serialisation/transaction test yet —
+S4's contract and `tests/serve_http_tests.rs` cover permission and persistence, not a
+concurrency proof.
 
 M2 also removed the last correctness caveat of the old design: the four
 `query_cache.clear()` calls (and the "correct only under a single writer" note in
 `ROADMAP.md`) are gone, replaced by lazy invalidation. M3 removed the lock that
-`ROADMAP.md`'s baseline section called "coarse and uneven".
+`ROADMAP.md`'s old baseline section called "coarse and uneven".
 
 
 
@@ -246,7 +258,8 @@ M2 also removed the last correctness caveat of the old design: the four
 ## 9. Risks and open questions
 
 1. **Per-node `Arc` overhead.** Every node gains an 8-byte pointer plus refcount traffic.
-   Acceptable at 3–4 dimensions; measured in M4.
+   Acceptable at 3–4 dimensions; measured in §7 (accepted: 2.7 KB / 2.8 µs per write,
+   scans +33%/+20%).
 2. **Deep hierarchies.** Path copy is O(depth); a 20-level ragged hierarchy copies 20 nodes
    per write. Ragged `import_lvl` trees are the realistic worst case — include one in the bench.
 3. **Long-pinned readers** hold memory. Needs an operational story (a max version age, or a
@@ -259,9 +272,8 @@ M2 also removed the last correctness caveat of the old design: the four
 6. **Save while writing.** `save_to_disk(&self)` must snapshot once and serialise that
    snapshot, or a concurrent write could produce a file that never existed.
 
-## 10. What I would do first
+## 10. What was done first (the plan as written)
 
-M1 + M4's harness together: introduce `Version`/`snapshot` without changing the write path,
-and write the allocator-counting bench against the **current** store to establish the
-baseline numbers. That is small, reversible, and gives the gate something to compare
-against before any storage rewrite is on the table.
+This is the plan as written; it was followed as M0 → M1 → M1b → M2 → M3 in §8. The
+allocator-counting bench went in first against the old store, which is why the gate in §7
+had a real baseline to compare against before the rewrite.

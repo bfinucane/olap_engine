@@ -26,27 +26,38 @@ earlier structural work exists.
 
 ---
 
-## Where we are today (baseline / constraints)
+## Where we are today (checked against the code, 2026-10-28)
 
-These are the concrete facts the plan is built around — not aspirational.
+These are the concrete facts the plan is built around — not aspirational. This
+section is a snapshot, not a changelog: `git log` is the truth and
+`WIRE-CHANGES.md` is the client-facing record.
 
-* **Single-process, in-memory.** `Catalog` lives in one process. The interactive
-  REPL owns it; batch mode builds a fresh one per run.
-* **Whole-file, all-or-nothing persistence.** `save_to_disk` /
-  `load_from_disk` serialize the *entire* catalog with `bincode`. Saves use
-  `expect(...)` (panic on failure) and rewrite the whole file on `.save` /
-  `.exit`.
-* **Coarse and uneven concurrency.** `Dimension` is shared via
-  `Arc<RwLock<Dimension>>`, but `Cube` is owned **by value** inside
-  `Catalog` (`cubes: HashMap<String, Cube>`), and `query_slice` / `write` take
-  `&mut self` on the cube. In practice there is **no safe multi-threaded
-  mutation** today.
-* **Cache invalidation is global and ad hoc.** `query_cache` is cleared on every
-  write (`self.query_cache.clear()`). This is correct only under strictly
-  single-threaded, single-writer assumptions.
-* **No users, sessions, or access control.** Everything runs as one implicit
-  user.
-* **SQL is the only query surface.** No calculated members and no MDX.
+* **Single-process, in-memory, versioned.** `Catalog` lives in one process and
+  owns the data. Storage is an immutable Patricia trie with copy-on-write
+  writes: `Cube` holds a `VersionStore`, a write publishes a new version, and a
+  reader's snapshot is an O(1) root pointer (Phase 1b M1–M3).
+* **Durable, atomic persistence.** `save_to_disk` writes a self-identifying
+  magic+version envelope to a unique sibling temp file, `fsync`s it, then
+  renames over the target; failures are typed `PersistError`s, not panics
+  (Phase 1a). Saving is explicit (`.save`/`.exit`, `POST /v1/save`).
+* **Server + client split, including writeback.** `olap_engine serve` owns the
+  catalogue and answers protocol v1 over HTTP: reads (`/v1/datasets`, query,
+  sample, describe, SQL console) and writes (`POST /v1/{dataset}/write`,
+  `POST /v1/save`). Reads take a snapshot and do not block a writer; the
+  catalog-wide `Mutex` is gone (M3). Writeback is last-write-wins with
+  per-batch validation before any cell is written (WRITE-API-DESIGN.md).
+* **Users, roles and access limits exist.** Authentication is required by
+  default (bearer tokens); table access (`#TableSecurity`), dimension/member
+  access (`#DimensionSecurity`), write permission and join-side checks are
+  enforced (SECURITY-DESIGN.md S1–S5). S6 (sessions pin a security snapshot)
+  and a few recorded limits remain open.
+* **Two query front doors.** SQL (`SELECT`/`WHERE`/`JOIN`/`LIMIT`/`OFFSET`/
+  `ORDER BY`; grouping comes from the selected dimensions — a `GROUP BY` clause
+  is not read) and the native plan/wire protocol (dimensions, measures, filters,
+  `orderBy`, `limit`, attribute joins). Calculated fields are evaluated from the
+  client's AST over aggregates `SUM/AVG/COUNT/MIN/MAX` plus arithmetic,
+  comparisons, `IF`, `ZN`, `IFNULL` (CALCULATIONS-DESIGN.md). MDX and calculated
+  dimension members do not exist.
 
 ---
 
@@ -162,7 +173,11 @@ or more clients; the in-process/batch path keeps working for tests.
    against an embedded catalog.
 3. **Transaction boundary.** Define an explicit write transaction (commit all
    cube writes + cache invalidation + durable persistence, or roll back), on top
-   of the 1b version store.
+   of the 1b version store. **Landed narrowly with writeback:** a batch is
+   fully validated before any cell is written, writes are last-write-wins, and
+   durability is an explicit `POST /v1/save`. Cross-request transactions and
+   optimistic locking (`ifVersion`/409) are deliberately absent — see
+   `WRITE-API-DESIGN.md` §5/§10.
 
 **Definition of done.** A server serves reads and writes from multiple clients
 without data races or cache corruption; the golden-test harness still passes
@@ -275,31 +290,52 @@ This is a multi-phase project of its own, not "a next step."
   version-tagged cache. The four global `query_cache.clear()` calls are gone.
 * **M3** the server's catalog-wide `Mutex` is gone. Reads take a snapshot and never
   block a writer; `Cube` is `Sync`.
-* **M4** (structural dimension changes versioned) is **deferred**. It protects a pinned
-  reader from a concurrent hierarchy edit, and no mutation surface exists that could
-  perform one concurrently — the server has no write endpoint, and the CLI mutates
-  single-threaded. The part of M4 that has value today landed anyway: structural
-  changes now bump every cube's version, so a cached aggregate cannot survive a
-  `.rollup` (`versioning_tests::a_structural_change_invalidates_cached_aggregations`).
+* **M4** (structural dimension changes versioned) is **deferred — re-assess, not
+  fixed.** The original reason ("no concurrent mutation surface") is now only
+  partly true: the HTTP write endpoint exists, and `createMissing: true` creates
+  members while readers are active (`cube.write` → `Dimension::add_leaf`). What
+  is still CLI-only is hierarchy *structure* (`rollup`/`detach`/`order`), which
+  is the race M4 was designed to close, so it is not urgent — but the premise
+  must be re-checked before it is quoted again. The part of M4 with value today
+  landed anyway: structural changes bump every cube's version, so a cached
+  aggregate cannot survive a `.rollup`
+  (`versioning_tests::a_structural_change_invalidates_cached_aggregations`).
 
 The measure-before-committing gate was honoured: `bench_mvcc` measured the old store
 first, the first gate FAILED, and the cost was re-derived and **accepted explicitly**
 (writes 2.7 KB / 2.8 µs, scans +33%/+20%) on the property that matters — per-write cost
 is bounded by fan-out, not by cube size. Details in `PHASE-1B-DESIGN.md`.
 
-**The open work is no longer 1b.** In rough order of value:
+**Open work** (verified against the code, 2026-10-28; ranked by user-visible value
+per unit of risk, because some items are blocked on a Plateau-facing protocol
+decision rather than on engine code):
 
-1. **COUNTD / MEDIAN / STDEV / VAR** — unadvertised, so honest; `countDistinctExact` is
-   `false` because there is no exact distinct count.
-2. **Dense (period) average** — "average per month" must divide by periods, not by
-   non-empty cells. Design and open questions in `AGGREGATIONS-DESIGN.md` §8–8b
-   (per-dimension denominator rules).
-3. **SQL `ORDER BY`** — the `order` fixture is in `EXPECT_FAILURE`; `LIMIT`/`OFFSET` work.
-4. **A write endpoint over HTTP** — needed before concurrent writers, and the reason M4
-   can wait.
-5. **LOD expressions** — `supportsLod` is `false`; LOD is a second query, not an expression.
-6. **Richer calculated fields** — the evaluator handles arithmetic, comparisons, `IF`,
-   `ZN`, `IFNULL` and aggregates; string/date functions and `CASE` are not implemented.
+1. **COUNTD** — MISSING, M. Exact distinct count is the next slice: the protocol
+   vocabulary already lists it, so only `capabilities.aggregations` and
+   `countDistinctExact` change for the client. One set-valued accumulator on the
+   existing leaf scan; no dependency.
+2. **Temporal bucketing (`datePart` / DATE_TRUNC)** — MISSING, L. `groupBy[].datePart`
+   is a protocol field and Plateau already sends it, but the engine refuses it
+   ("no temporal bucketing yet"). Needs a date/truncation model, so it is
+   Plateau-facing design work before it is code.
+3. **MEDIAN / STDEV / VAR** — MISSING, M. Same non-additive accumulator family as
+   COUNTD: STDEV/VAR fit a streaming (Welford) accumulator; MEDIAN needs the
+   values per group. Do after COUNTD, sharing its plumbing.
+4. **Measure-scope filters / Top-N** — MISSING, M–L. Refused with a typed error
+   today, and `capabilities.filterOperators` says so honestly; needs a
+   post-aggregation pass that interacts with ordering and `limit`.
+5. **Dense (period) average** — design only, L, **blocked on a protocol decision**:
+   `AGGREGATIONS-DESIGN.md` §8–8b leaves the aggregation name vs per-dimension
+   denominator shape undecided, and it needs a period axis (see item 2).
+6. **LOD expressions** — MISSING by design, L, low value: `supportsLod` is
+   `false` and Plateau already computes LOD client-side, so engine support is a
+   convenience, not a gap users hit today.
+
+Also verified, not ranked above: SQL `GROUP BY`/`HAVING` clauses are parsed but
+not read by the SQL front end (grouping derives from the projection) — the same
+silent-ignore class that `ORDER BY` was fixed for. Calculated fields implement the
+v1 set only (`ZN`/`IFNULL`; aggregates `SUM/AVG/COUNT/MIN/MAX`); string and date
+functions, the `ROUND` family and `CASE` are not implemented.
 
 Client-facing changes are tracked in `WIRE-CHANGES.md`, which is the file the Plateau
 session reads first.
@@ -311,11 +347,11 @@ session reads first.
 | Phase | Theme | Depends on | Status |
 |------:|---------------------------------------|------------|-------------|
 | 1a | Durable persistence (atomic save) | — | **Done** |
-| 1b | Versioned/MVCC storage engine | 1a | **M1–M3 done**; M4 deferred — it protects a race that needs a mutation surface which does not exist yet |
-| 1c | Protocol + server/client split | 1a, 1b | **Done for reads**: protocol v1, HTTP server, Plateau client. No write endpoint, deliberately |
-| 2 | Users, security, access limits | 1c | Not started |
-| 3 | Calculations | 1c, 2 | **In part**: SUM/AVG/COUNT/MIN/MAX, calculated fields over the client's AST, `ZN`/`IFNULL`. Open: COUNTD, MEDIAN, STDEV, VAR, dense average, LOD |
+| 1b | Versioned/MVCC storage engine | 1a | **M1–M3 done**; M4 deferred — **re-assess**: the HTTP write endpoint can create members concurrently, so the "no mutation surface" premise is only partly true (hierarchy structure is still CLI-only) |
+| 1c | Protocol + server/client split | 1a, 1b | **Done for reads and writes**: protocol v1, HTTP server and Plateau client, plus writeback (`POST /v1/{dataset}/write`, `POST /v1/save`, `supportsWrite: true`). Batch-validated, last-write-wins; no cross-request transactions or `ifVersion` (deliberate) |
+| 2 | Users, security, access limits | 1c | **S1–S5 done** (users/roles/tokens, table, dimension, write and join access). Open: S6 (sessions pin a security snapshot) and the recorded S2/S3 limits (`describe` cardinality, no `clear_rule`) |
+| 3 | Calculations | 1c, 2 | **In part**: SUM/AVG/COUNT/MIN/MAX, calculated fields over the client's AST (`ZN`/`IFNULL`). Open: COUNTD, MEDIAN/STDEV/VAR, dense average, LOD; SQL `ORDER BY` now sorts |
 | 4 | Multidimensional syntax (MDX) | 1c, 2, 3 | Not started |
 
-Statuses here lag the code when a phase lands mid-session; `WIRE-CHANGES.md` is the
+Statuses were checked against the code on 2026-10-28; `WIRE-CHANGES.md` is the
 client-facing record, and `git log` is the truth.

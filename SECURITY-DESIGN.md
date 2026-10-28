@@ -1,9 +1,14 @@
-# Security Ã¢â‚¬â€ design proposal
+# Security Ã¢â‚¬â€ design and implementation
 
-**Status:** proposal, for decisions. No code written.
+**Status: IMPLEMENTED S0–S5; S6 open.** Code lives in `src/security/` (`store.rs`
+users/roles in `security.json`, `hash.rs` PBKDF2 + tokens, `session.rs`, `access.rs`
+permission resolution) and is enforced in `src/bin/serve.rs` (login/bearer 401,
+table/dimension/write/join checks) and in `query_slice` via `cube::denied_leaf_ids`.
+This document is the design record, the implementation deviations (§9–§12), and the
+limits that remain open.
 **Model:** Infor-style, per the user's description (users, roles, three kinds of access,
 default ACCEPT). TM1 is referenced only where its naming helps; Infor is authoritative.
-**Prerequisite:** Ã‚Â§0 (system cubes), which must land before any of this.
+**Prerequisite:** §0 (system cubes), built first as required (S0).
 
 ---
 
@@ -14,7 +19,7 @@ current on their own. Without them, a front end cannot list what exists Ã¢â�
 "lists" problem the user hit in MiniSheet Ã¢â‚¬â€ and security has nothing to hang its
 dictionaries on.
 
-Proposed system cubes, named with a `#` prefix Ã¢â‚¬â€ the Infor convention, chosen by the user
+Implemented system cubes, named with a `#` prefix Ã¢â‚¬â€ the Infor convention, chosen by the user
 over TM1's `}`:
 
 | Cube | Gives |
@@ -28,8 +33,8 @@ over TM1's `}`:
 
 **The `#` has one consequence worth stating**, because it is invisible until it bites:
 in a URL, `#` begins the fragment, so a client addressing `/v1/%23Cubes` must
-percent-encode it. The engine's router currently skips percent-decoding, so it does not
-yet accept the encoded form Ã¢â‚¬â€ it must decode the dataset segment before matching. In SQL
+percent-encode it. The engine now percent-decodes the request path, so `GET /v1/%23Cubes`
+works (and a raw `#` would too if a client could send one). In SQL
 there is no such problem: `SELECT Cube FROM #Cubes` parses unquoted (the quoted form does
 not, which is true of this dialect generally, not specific to `#`).
 
@@ -57,8 +62,8 @@ are ordinary dimensions whose members are created as rules are written.
 
 **Users Ã¢â€ â€™ Roles.** Groups are deliberately postponed (user's decision): they are a role
 alias, and adding them later does not change the permission algebra. A user may hold
-several roles; the effective permission is the **union** across roles, then narrowed by the
-dimension and table rules (Ã‚Â§3).
+several roles; with default ACCEPT the implemented rule is the most restrictive **explicit**
+rule wins (see §11), so adding a role can only narrow; the dimension and table rules are (Ã‚Â§3).
 
 **Default: ACCEPT.** A cube, dimension or member with no rule is visible at full access.
 This is Infor's behaviour, chosen by the user. Its cost is stated honestly: a *newly added*
@@ -69,11 +74,15 @@ other way Ã¢â‚¬â€ new members are invisible until granted. Neither is
 
 | Cube | Keyed by | Value |
 |---|---|---|
-| `#Users` | `User` | (existence; credentials live in the catalogue, not in a cube Ã¢â‚¬â€ see Ã‚Â§5) |
+| `#Users` | `User` | (NOT BUILT: identity lives in `security.json`, not in a cube Ã¢â‚¬â€ see Ã‚Â§5) |
 | `#Roles` | `Role` | (existence) |
 | `#UserRoles` | `User, Role` | 1 |
 | `#TableSecurity` | `Role, Cube` | `READ` \| `WRITE` \| `NONE` |
 | `#DimensionSecurity` | `Role, Dimension, Member` | `READ` \| `WRITE` \| `NONE` |
+
+`#Users`, `#Roles` and `#UserRoles` were designed but not built: identity lives in
+`security.json` (§9.2), and only `#TableSecurity`/`#DimensionSecurity` exist as control
+cubes today.
 
 `Member` accepts the wildcard `#ALL` for "the whole dimension", so a role is not forced to
 enumerate 5,000 members to restrict one. A specific member row overrides the wildcard.
@@ -123,17 +132,20 @@ there is no silence that is safe.
 
 ## 5. Identity and transport
 
-* `POST /v1/login {user, password}` Ã¢â€ â€™ `{token, expiresAt}`; passwords hashed with `argon2`
-  and stored **in the catalogue**, not in a cube (a cube is queryable; hashes must not be).
+* `POST /v1/login {user, password}` Ã¢â€ â€™ `{token, expiresAt}`; passwords hashed with
+  PBKDF2-HMAC-SHA256 (argon2 was unavailable offline, §9.1)
+  and stored in `security.json` beside the catalogue, never in a cube (a cube is queryable;
+  hashes must not be).
 * Every request carries `Authorization: Bearer <token>`.
-* Tokens are random, stored hashed in memory, and expire; a restart forces re-login.
+* Tokens are 32 random bytes as hex; the in-memory session table is keyed by the token and
+  holds user, roles and expiry; a restart forces re-login. Tokens are never persisted.
 * **SSO is deferred but designed for**: it is only a second way to *acquire* a session Ã¢â‚¬â€ a
   trusted `X-Remote-User` header accepted when the server was started with a trust flag.
   Enforcement is identical, so it can be added without touching Ã‚Â§3.
 
-## 6. Open / required (decision pending)
+## 6. Auth mode (decided)
 
-**Recommendation: required by default**, with `--allow-anonymous` for development. The
+**Decided and implemented: required by default**, with `--allow-anonymous` for development. The
 alternative Ã¢â‚¬â€ open while no users exist Ã¢â‚¬â€ is friendlier but makes "forgot to configure it"
 indistinguishable from "deliberately open", which is the wrong default for a security
 feature.
@@ -148,20 +160,24 @@ feature.
 | S3 | **DONE** — dimension access with wildcard + overrides | a denied member is absent from rows *and* from totals; the wildcard covers the rest |
 | S4 | **DONE** — write permissions (built with the write API) | a `READ`-only role's write is refused; an `ACCEPT`-default write still works |
 | S5 | **DONE** — joins respect both sides | a join to a forbidden cube is absent; a join on a forbidden dimension yields absent attributes, not an error |
-| S6 | session pins a security snapshot | changing a rule invalidates sessions lazily, the way data versions do |
+| S6 | **OPEN** — session pins a security snapshot | changing a rule invalidates sessions lazily, the way data versions do |
 
 Each slice leaves the suite green. S0 is independent and useful on its own Ã¢â‚¬â€ it is also
 what MiniSheet needs for lists, with or without security.
 
-## 8. Decisions still open
+## 8. Decisions taken and still open
 
-1. **Auth mode**: required (recommended) or open until the first user exists?
-2. **Bootstrap**: how does the first admin get created Ã¢â‚¬â€ a CLI flag (`--add-user admin
-   --role admin`) or a generated password printed once at first start?
-3. **Wildcard spelling** for "whole dimension": `#ALL` inside `Member`, or a separate
-   `#DimensionSecurity(Role, Dimension)` row?
-4. **System cube visibility**: hidden from `describe`/`datasets` for non-admins, or listed
-   with `isSystem: true` and left to the client to filter?
+1. **Auth mode — DECIDED: required by default** (implemented; `--allow-anonymous` is the
+   development opt-out).
+2. **Bootstrap — DECIDED: `--add-user <name> --role <role>`**; the alternative considered was Ã¢â‚¬â€ a CLI flag (`--add-user admin
+   --role admin`) or a generated password printed once at first start? **DECIDED: the
+   `--add-user` flag is implemented; the generated-password option was rejected as less
+   discoverable.**
+3. **Wildcard spelling — DECIDED: `#ALL` inside `Member`**, with a specific member row
+   overriding it (implemented, §12). The alternative was a separate
+   `#DimensionSecurity(Role, Dimension)` row.
+4. **System cube visibility — DECIDED: listed with `isSystem: true`** and left to the client
+   to filter (implemented, §0).
 5. **Read-only roles and the SQL console**: the console runs as whoever logs in; should a
    `READ`-only role even see it, given it only issues SELECTs?
 
@@ -185,7 +201,7 @@ not know about. They are recorded rather than silently absorbed.
    `database.bin` fail to load (or, worse, misread). Credentials must also not live in a
    cube, because cubes are queryable. So users, roles and password verifiers sit beside the
    database in a small JSON file: readable and repairable by hand, absent file = no users.
-   The `#` security CUBES will still hold permissions (S2), as designed.
+   The `#` security CUBES hold the permissions (S2); identity does not live in a cube.
 
 3. **Authentication is required by default and the server fails CLOSED.** With no users
    defined it refuses to start and prints the exact `--add-user` command, rather than
@@ -201,11 +217,14 @@ read-only test; the rule becomes:
 
 * **derived** system cubes (`#Cubes`, `#Dimensions`, `#Hierarchies`, `#Members`, `#Edges`,
   `#Columns`) — rebuilt from the catalogue, read-only;
-* **control** cubes (`#TableSecurity`, `#DimensionSecurity`, ...) — admin-writable, and
-  write access to them is reserved for an admin session once enforcement lands.
+* **control** cubes (`#TableSecurity`, `#DimensionSecurity`, ...) — admin-writable through a
+  CLI session; the HTTP write endpoint refuses them outright, so a data-plane role cannot
+  grant itself permissions.
 
-Until then the HTTP server has no write endpoint at all, so control cubes are writable only
-from the CLI that owns the catalogue.
+The HTTP write endpoint exists now (writeback), and it is not a way in: a derived cube is
+refused (`invalid_argument`) and a control cube is refused (`forbidden`). Control cubes are
+changed from the CLI that owns the catalogue, and write access to cell data is enforced by
+S4 (§11).
 
 ---
 
@@ -240,8 +259,10 @@ BEFORE execution if any of them is forbidden. A hidden cube is refused with the 
 `unknown_dataset` answer.
 
 **Known limits, deliberate.**
-- `WRITE` is recorded and parsed but not yet enforced: the HTTP server has no write endpoint.
-  Write enforcement belongs to S4.
+- `WRITE` is recorded and parsed, and S4 (built with the write endpoint) enforces it: a
+  `READ`-only role's write is refused with `403`, a member-level `READ` rule caps writes,
+  and creating a member additionally needs the whole-dimension `WRITE` level
+  (WRITE-API-DESIGN.md §6).
 - `#TableSecurity` itself is readable by default (it is just a cube). An admin can hide it
   with a rule of its own: `INSERT INTO #TableSecurity VALUES ('reader', '#TableSecurity',
   'NONE')` — enforcement still works, because the server reads the cube from the catalogue

@@ -1,9 +1,10 @@
-# Calculated fields — design proposal
+# Calculated fields — design and implementation
 
-**Status:** proposal, for decisions. No code written.
-**Today:** the plan layer accepts `expressions` and `Measure.expr`, then refuses them:
-`calculated field 'X' (evaluator not implemented yet)`. `capabilities.expressionFunctions`
-is empty and `supportsLod` is false — both honest, and both stay honest here.
+**Status: IMPLEMENTED (v1).** The plan layer evaluates `expressions` and `Measure.expr`
+(`src/engine/calc.rs`, wired in `src/engine/plan.rs`). `capabilities.expressionFunctions`
+is exactly `["ZN","IFNULL"]` and `supportsLod` is `false` — both honest. The aggregates a
+formula may use are `SUM/AVG/COUNT/MIN/MAX`; anything else is `unsupported_expression`
+naming what is supported. This document is the design record plus the semantics v1 fixed.
 
 ---
 
@@ -39,9 +40,10 @@ variance, cost ratio, any `IF`-driven bucket.
 
 **Not in v1** (each stays `unsupported_expression`, never a silent zero): `CASE`, string
 functions, date functions, `ROUND`-family, and LOD. LOD is a separate query, not an
-expression — see §6.
+expression — see §6. The non-additive aggregations (`COUNTD`, `MEDIAN`, `STDEV`, `VAR`)
+are not usable inside a formula either: only the five aggregates above are.
 
-## 3. Decisions needed
+## 3. Decisions (taken and implemented as recommended)
 
 ### Decision 1 — division by zero
 
@@ -91,11 +93,11 @@ Cost: one pass for the slots plus O(rows) evaluation. No extra scan, no cache ch
 
 ## 5. Honesty in capabilities
 
-`expressionFunctions` currently advertises nothing, which is correct until something runs.
-When v1 lands it should list exactly the functions implemented — `ZN`, `IFNULL`, and the
-aggregate names already covered — and nothing else. `supportsLod` stays `false` until LOD
-is genuinely evaluated; the module docs in `plan.rs` already explain why faking it is worse
-than refusing it.
+`expressionFunctions` advertises exactly what runs: `["ZN","IFNULL"]` (the aggregates are
+listed separately in `capabilities.aggregations`). `supportsLod` stays `false` until LOD is
+genuinely evaluated; the module docs in `plan.rs` explain why faking it is worse than
+refusing it. Adding a name to `calc.rs::FUNCTIONS` without implementing it is the one way to
+break this promise — the wire test pins the list.
 
 ## 6. LOD is not an expression
 
@@ -112,16 +114,18 @@ exists). It stays refused, and a separate design owns it.
 - An unsupported function → `unsupported_expression` naming it and listing the supported
   set (the failure mode to avoid is a silent zero).
 - A field that is not a measure → error, not `null`.
-- The same calculated field in SQL (`SELECT SUM(Profit)/SUM(Sales) FROM ...`) once SQL
-  routes through the same evaluator — otherwise the two front doors drift, which is the
-  exact defect this project keeps finding.
+- The same calculated field in SQL — **NOT DONE.** SQL does not evaluate formula ASTs: it
+  only computes the five aggregates and refuses anything outside the implemented set. SQL
+  and the plan layer therefore do not share a formula evaluator, which is the drift this
+  project keeps finding; it stays recorded here rather than assumed done.
 
-## 8. Open question for the user
+## 8. Formula text: decision (Plateau keeps the parser)
 
-Where should the **formula text** live? Plateau owns the parser today. Two coherent
-answers:
+This was the open question; **the implemented answer is option 1**: Plateau parses the
+user's text and sends the AST, and the engine only evaluates it. The alternatives are
+recorded for the future:
 
-1. **Plateau keeps parsing** (recommended for now): it sends the AST; the engine evaluates.
+1. **Plateau keeps parsing — CHOSEN and implemented:** it sends the AST; the engine evaluates.
    One parser, one evaluator, no duplication. A formula console then belongs in Plateau,
    which is also where users would expect it.
 2. **The engine parses** (Phase 3 "replace the front end"): the engine grows a Rust parser
