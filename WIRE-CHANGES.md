@@ -16,7 +16,12 @@ normative**; a client that keeps it MUST replace it with a pin to contract v1 an
 treat it as authority. The engine session does not edit client trees — contract changes
 are requested through `contract/handoffs/` (e.g. `001-plateau-contract-v1.md`) and applied
 by the client session.
-**State:** engine HEAD **`ae5e2c9`** (2026-10-28, 9 commits local, unpushed); contract v1;
+**Contract pin:** **contract v1** (`protocolVersion 1`), reviewed and accepted by the
+engine/database session at engine commit **`d6b02e0`** (2026-10-28). Evidence at that pin:
+engine suite **265/265**, contract conformance **49 passed / 0 failed / 1 skipped**, exit 0 —
+recorded in `contract/handoffs/004-engine-database-contract-v1.md`. A later engine commit does
+not move the pin; a wire change opens a contract-change request first.
+**State:** engine HEAD in this tree (2026-10-28; local commits unpushed); contract v1;
 engine conformance green at **49 passed / 0 failed / 1 skipped**. Engine-side join notes
 live in `JOIN-HANDOVER.md` (read-only context, not normative).
 
