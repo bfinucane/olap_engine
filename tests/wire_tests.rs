@@ -169,11 +169,11 @@ fn capabilities_section4_keys_and_honest_declarations() {
     assert_eq!(v["supportsInlineDomain"], json!(true));
     assert_eq!(v["supportsWrite"], json!(true), "writeback is implemented");
     assert_eq!(v["authRequired"], json!(false), "the library default is anonymous; the server overrides it from its flags");
-    // COUNTD is not implemented, so the engine must not claim an exact distinct count.
+    // COUNTD IS implemented and exact, so the engine is entitled to claim exactness.
     assert_eq!(
         v["countDistinctExact"],
-        json!(false),
-        "COUNTD does not exist, so an exact distinct count cannot be claimed"
+        json!(true),
+        "COUNTD is computed exactly (one set of base values per group), so it may be labeled exact"
     );
     assert_eq!(v["maxRows"], json!(100_000));
     assert_eq!(
@@ -206,6 +206,8 @@ fn capabilities_aggregations_match_what_actually_runs() {
         ("COUNT", 1.0),
         ("MIN", 200.0),
         ("MAX", 200.0),
+        // One leaf, so one distinct value.
+        ("COUNTD", 1.0),
     ];
     for agg in &caps.aggregations {
         let mut p = request("Sales");
@@ -239,7 +241,7 @@ fn capabilities_aggregations_match_what_actually_runs() {
 
     // The converse: every aggregation the protocol names but this engine does not
     // advertise must be REFUSED, never silently answered.
-    for agg in ["MEDIAN", "COUNTD", "STDEV", "VAR", "ATTR"] {
+    for agg in ["MEDIAN", "STDEV", "VAR", "ATTR"] {
         assert!(
             !caps.aggregations.iter().any(|a| a == agg),
             "{agg} is not implemented, so it must not be advertised"
@@ -256,7 +258,7 @@ fn capabilities_aggregations_match_what_actually_runs() {
     // it, and `Aggregation::implemented()` is the single place both read from.
     assert_eq!(
         caps.aggregations,
-        vec!["SUM", "AVG", "COUNT", "MIN", "MAX"],
+        vec!["SUM", "AVG", "COUNT", "MIN", "MAX", "COUNTD"],
         "capabilities must advertise exactly what runs"
     );
 }
@@ -1201,7 +1203,7 @@ fn query_truncated_is_true_only_when_rows_were_actually_cut() {
 /// Ãƒâ€šÃ‚Â§3 lists `SUM | AVG | MEDIAN | MIN | MAX | COUNT | COUNTD | STDEV | VAR | ATTR`
 /// and tells the engine to disable the rest via `capabilities.aggregations`.
 ///
-/// The engine now computes `SUM`, `AVG`, `COUNT`, `MIN`, `MAX` (see
+/// The engine now computes `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `COUNTD` (see
 /// AGGREGATIONS-DESIGN.md). This test pins what each of them actually returns over
 /// the SAME four cells, which is the only way to catch an aggregation that answers
 /// with a sum under the wrong label:
@@ -1222,6 +1224,8 @@ fn query_computes_the_advertised_aggregations_and_refuses_the_rest() {
         ("AVG", 93.75),
         ("MIN", 25.0),
         ("MAX", 200.0),
+        // [100, 50, 200, 25]: all four values are distinct.
+        ("COUNTD", 4.0),
     ] {
         let mut p = request("Sales");
         p.measures.push(
@@ -1245,7 +1249,7 @@ fn query_computes_the_advertised_aggregations_and_refuses_the_rest() {
     assert_eq!(resp.rows[0][0], json!(375.0), "absent aggregation means SUM");
 
     // Everything the engine cannot honestly compute is refused, before any work.
-    for agg in ["COUNTD", "MEDIAN", "STDEV", "VAR", "ATTR", "NOT_A_REAL_AGGREGATION"] {
+    for agg in ["MEDIAN", "STDEV", "VAR", "ATTR", "NOT_A_REAL_AGGREGATION"] {
         let mut p = request("Sales");
         measure(&mut p, "Sales", agg);
         let err = wire::query(&mut catalog, &p)
@@ -1263,7 +1267,7 @@ fn query_computes_the_advertised_aggregations_and_refuses_the_rest() {
     // And the advertisement agrees with that refusal, exactly.
     assert_eq!(
         wire::capabilities().aggregations,
-        vec!["SUM", "AVG", "COUNT", "MIN", "MAX"],
+        vec!["SUM", "AVG", "COUNT", "MIN", "MAX", "COUNTD"],
         "capabilities must advertise exactly what runs"
     );
 }

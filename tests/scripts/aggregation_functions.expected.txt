@@ -105,5 +105,5 @@ Cost
 
 
 > SELECT MEDIAN(Sales) FROM Sales WHERE Geography = 'Europe'
-Error: 'MEDIAN' is not a supported aggregation (implemented: SUM, AVG, COUNT, MIN, MAX).
+Error: 'MEDIAN' is not a supported aggregation (implemented: SUM, AVG, COUNT, MIN, MAX, COUNTD).
 

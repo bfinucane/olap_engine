@@ -165,6 +165,63 @@ fn in_filter_keeps_listed_members() {
     assert_eq!(rows, vec![vec!["France".to_string(), "150".to_string()]]);
 }
 
+/// COUNTD flows through the plan path too: the same exact distinct count the other
+/// front doors compute, and `capabilities.countDistinctExact` says it is exact.
+#[test]
+fn countd_is_computed_exactly_through_the_plan_path() {
+    let mut catalog = build_catalog();
+    let mut p = plan("Sales");
+    p.group_by.push(GroupBy { name: "Geography".into(), date_part: None });
+    p.measures.push(Measure {
+        name: "Revenue".into(),
+        aggregation: Some("COUNTD".into()),
+        expr: None,
+    });
+
+    let (headers, rows) = rows(execute_plan(&mut catalog, &p).expect("plan should succeed"));
+    assert_eq!(headers, vec!["Geography", "Revenue"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["France".to_string(), "2".to_string()],
+            vec!["Germany".to_string(), "2".to_string()],
+        ],
+        "France 100/50 and Germany 200/25 are each two distinct base values"
+    );
+
+    let caps = Capabilities::default();
+    assert!(caps.count_distinct_exact, "COUNTD is exact, so claim exactly that");
+    assert!(
+        caps.aggregations.contains(&"COUNTD".to_string()),
+        "the advertised list must include what runs"
+    );
+}
+
+/// COUNTD stays REFUSED inside a calculated-field formula: the evaluator's aggregate list
+/// is SUM/AVG/COUNT/MIN/MAX, and `calc.rs` is deliberately unchanged. The refusal must
+/// name COUNTD and list what IS supported - never return a wrong number.
+#[test]
+fn countd_inside_a_calculated_field_is_refused_by_name() {
+    let mut catalog = build_catalog();
+    let mut p = plan("Sales");
+    p.group_by.push(GroupBy { name: "Geography".into(), date_part: None });
+    p.measures.push(Measure {
+        name: "DistinctRevenue".into(),
+        aggregation: None,
+        expr: Some(ExprRef::Ast(Box::new(AstNode::Call {
+            name: "COUNTD".into(),
+            args: vec![AstNode::Field { name: "Revenue".into() }],
+        }))),
+    });
+
+    let err = execute_plan(&mut catalog, &p).expect_err("COUNTD in a formula must be refused");
+    assert!(matches!(err, PlanError::UnsupportedExpression(_)), "got {err:?}");
+    assert_eq!(err.code(), "unsupported_expression");
+    let msg = err.to_string();
+    assert!(msg.contains("COUNTD"), "the refusal must name the function: {msg}");
+    assert!(msg.contains("SUM"), "and list what is supported: {msg}");
+}
+
 /// `notEquals` is the NEGATION of `equals`: the slice's member filter is inclusive, so
 /// the plan layer feeds it every member but the excluded one (ENGINE-PROTOCOL.md §3
 /// "filters"). This is the operator `capabilities.filterOperators` advertises.

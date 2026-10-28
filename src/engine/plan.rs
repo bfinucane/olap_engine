@@ -353,7 +353,8 @@ pub struct Capabilities {
     pub protocol_version: u32,
     /// Aggregations this engine implements. The UI disables the rest.
     pub aggregations: Vec<String>,
-    /// Whether COUNTD is exact. When false, the UI labels it an estimate.
+    /// Whether COUNTD is exact. TRUE: COUNTD is computed exactly (one set of base leaf
+    /// values per group, see `Aggregation::CountDistinct`), so the UI may label it exact.
     #[serde(rename = "countDistinctExact")]
     pub count_distinct_exact: bool,
     /// Filter operators this engine accepts. Plateau disables the rest rather
@@ -403,23 +404,20 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            // ADDITIVE AGGREGATION ONLY, deliberately.
-            //
-            // The storage model is Infor-OLAP: a measure is stored per leaf
-            // coordinate and a consolidation is a weighted sum, so SUM is the
-            // aggregation the engine actually implements. `execute_plan` refuses
-            // anything else with `unsupported_aggregation` rather than silently
-            // Advertise exactly what `Aggregation` can compute, in both directions:
-            // `execute_plan` refuses anything outside this list rather than returning
-            // a sum under a different label.
+            // ADVERTISE EXACTLY WHAT `Aggregation` CAN COMPUTE, in both directions:
+            // `execute_plan` refuses anything outside this list rather than returning a
+            // sum under a different label. The list itself lives in
+            // `Aggregation::implemented()` - one source for the advertisement and the
+            // refusal message, so they cannot disagree.
             //
             // Semantics (AGGREGATIONS-DESIGN.md §4): empty cells are never counted;
             // non-additive aggregations use the BASE leaf value and ignore rollup
-            // weights, so on a ragged hierarchy `AVG != SUM / COUNT` by design.
+            // weights, so on a ragged hierarchy `AVG != SUM / COUNT` by design. COUNTD
+            // follows the same rule: it counts DISTINCT BASE values and ignores weights.
             aggregations: crate::cube::aggregation::Aggregation::implemented(),
-            // COUNTD is NOT implemented, so the engine must not claim an exact distinct
-            // count. `false` means "do not label it exact" in the client.
-            count_distinct_exact: false,
+            // COUNTD IS implemented and exact: an exact set of base leaf values per
+            // group, never an estimate. `true` means "label it exact" in the client.
+            count_distinct_exact: true,
             // What the engine actually honours today (dimension scope only).
             filter_operators: ["in", "equals", "notEquals"]
                 .into_iter()

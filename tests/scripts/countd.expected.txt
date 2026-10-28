@@ -1,0 +1,107 @@
+Running script 'countd.sql'...
+> CREATE TABLE Sales (Geography STRING, Measure MEASURE)
+Cube 'Sales' created. Measure dimension: Measure
+
+> INSERT INTO Sales VALUES ('England', 'Sales', 100)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('France', 'Sales', 100)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('Germany', 'Sales', 200)
+Upserted 1 row(s) into 'Sales'.
+
+> INSERT INTO Sales VALUES ('England', 'Cost', 40)
+Upserted 1 row(s) into 'Sales'.
+
+> .rollup Geography Europe England 1.0
+Rollup added.
+
+> .rollup Geography Europe France 1.0
+Rollup added.
+
+> .create_hierarchy Geography Weighted
+Hierarchy 'Weighted' created in dimension 'Geography'.
+
+> .rollup Weighted Half England 0.5
+Rollup added.
+
+> SELECT COUNT(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+2
+
+
+> SELECT COUNTD(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+1
+
+
+> SELECT SUM(Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+200
+
+
+> SELECT SUM(Sales) FROM Sales WHERE Weighted = 'Half'
+Sales
+----------
+50
+
+
+> SELECT COUNTD(Sales) FROM Sales WHERE Weighted = 'Half'
+Sales
+----------
+1
+
+
+> SELECT COUNT(Cost) FROM Sales WHERE Geography = 'Europe'
+Cost
+----------
+1
+
+
+> SELECT COUNTD(Cost) FROM Sales WHERE Geography = 'Europe'
+Cost
+----------
+1
+
+
+> SELECT COUNTD(Cost) FROM Sales WHERE Geography = 'Germany'
+Cost
+----------
+-
+
+
+> SELECT COUNT(DISTINCT Sales) FROM Sales WHERE Geography = 'Europe'
+Sales
+----------
+1
+
+
+> CREATE ATTRIBUTE TABLE RegionAttr (Region STRING, Store STRING, Attribute MEASURE)
+Cube 'RegionAttr' created. Measure dimension: Attribute
+
+> INSERT INTO RegionAttr VALUES ('East', 'S1', 'Manager', 'Ava')
+Upserted 1 row(s) into 'RegionAttr'.
+
+> INSERT INTO RegionAttr VALUES ('East', 'S2', 'Manager', 'Ava')
+Upserted 1 row(s) into 'RegionAttr'.
+
+> INSERT INTO RegionAttr VALUES ('East', 'S3', 'Manager', 'Dan')
+Upserted 1 row(s) into 'RegionAttr'.
+
+> INSERT INTO RegionAttr VALUES ('East', 'S4', 'Manager', 'dan')
+Upserted 1 row(s) into 'RegionAttr'.
+
+> INSERT INTO RegionAttr VALUES ('West', 'S1', 'Manager', 'Dan')
+Upserted 1 row(s) into 'RegionAttr'.
+
+> SELECT Region, COUNTD(Manager) FROM RegionAttr WHERE Store IN ('S1', 'S2', 'S3', 'S4')
+Region | Manager
+--------------------
+East | 3
+West | 1
+
+

@@ -332,7 +332,7 @@ pub fn execute_sql_with_denied(
                                 let p_m_dim = primary_cube.measure_dimension.clone();
 
                 for proj in &select.projection {
-                    // --- Aggregate function: SUM/AVG/COUNT/MIN/MAX over a measure ---
+                    // --- Aggregate function over a measure ---
                     //
                     // Handled BEFORE the name-based branches, because
                     // `proj.to_string()` is "AVG(Sales)" Ã¢â‚¬â€ not a column name Ã¢â‚¬â€ and
@@ -345,18 +345,39 @@ pub fn execute_sql_with_denied(
                     // aggregations of the same measure in one statement would collide;
                     // that needs a column-mapping feature, not a silent one.
                     if let SelectItem::UnnamedExpr(Expr::Function(func)) = proj {
-                        // An unimplemented aggregation is reported AS SUCH, not as a
-                        // missing column: `MEDIAN(Sales)` is a real request the engine
-                        // cannot answer, and "Column 'MEDIAN(Sales)' not found" sends the
-                        // reader looking in the wrong place.
-                        let Some(aggregation) =
-                            crate::cube::aggregation::Aggregation::parse(&func.name.to_string())
-                        else {
-                            return Err(format!(
-                                "'{}' is not a supported aggregation (implemented: {}).",
-                                func.name,
-                                crate::cube::aggregation::Aggregation::implemented().join(", ")
-                            ));
+                        // `COUNT(DISTINCT x)` is the standard SQL spelling of COUNTD:
+                        // sqlparser records the duplicate treatment as `func.distinct`.
+                        // Map it to the exact distinct count, because plain COUNT over
+                        // the same cells is a different, plausible-looking number. Any
+                        // OTHER aggregate given DISTINCT cannot be honoured, so refuse
+                        // it loudly instead of silently dropping the DISTINCT.
+                        let display_name = func.name.to_string();
+                        let aggregation = if func.distinct {
+                            if !display_name.eq_ignore_ascii_case("COUNT") {
+                                return Err(format!(
+                                    "{} with DISTINCT is not supported: only \
+                                     COUNT(DISTINCT ...) is mapped (to COUNTD). Use \
+                                     COUNTD(...) for an exact distinct count instead of \
+                                     {}(DISTINCT ...).",
+                                    display_name, display_name
+                                ));
+                            }
+                            crate::cube::aggregation::Aggregation::CountDistinct
+                        } else {
+                            // An unimplemented aggregation is reported AS SUCH, not as a
+                            // missing column: `MEDIAN(Sales)` is a real request the engine
+                            // cannot answer, and "Column 'MEDIAN(Sales)' not found" sends
+                            // the reader looking in the wrong place.
+                            let Some(aggregation) =
+                                crate::cube::aggregation::Aggregation::parse(&display_name)
+                            else {
+                                return Err(format!(
+                                    "'{}' is not a supported aggregation (implemented: {}).",
+                                    func.name,
+                                    crate::cube::aggregation::Aggregation::implemented().join(", ")
+                                ));
+                            };
+                            aggregation
                         };
                         // sqlparser 0.43 wraps the argument: FunctionArg::Unnamed(
                         // FunctionArgExpr::Expr(_)). Accept a bare or qualified column.
@@ -1240,6 +1261,96 @@ mod tests {
         let err = apply_order_by(&mut r, &order_of("SELECT 1 ORDER BY 3").expect("keys"))
             .expect_err("out of range");
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    /// Three cells, two of them holding the SAME value: COUNT = 3, COUNTD = 2.
+    fn distinct_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("T", &["Region", "Product", "M"], Some("M"), true);
+        {
+            let cube = catalog.get_cube_mut("T").expect("T");
+            for (region, product, value) in [
+                ("East", "A", 100.0),
+                ("West", "A", 100.0),
+                // Same region as the cell above, but a different COORDINATE: a second cell
+                // holding a different value. (Two writes to one coordinate would overwrite.)
+                ("West", "B", 200.0),
+            ] {
+                cube.write(&[region, product, "Sales"], CellValue::Numeric(value))
+                    .expect("write");
+            }
+        }
+        catalog
+    }
+
+    /// The formatted value of a one-row result (its last non-empty line).
+    fn scalar_of(result: &str) -> &str {
+        result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .next_back()
+            .unwrap_or("")
+    }
+
+    /// `COUNT(DISTINCT x)` is the standard SQL spelling of COUNTD: it must be mapped to
+    /// the exact distinct count, never to plain COUNT (which counts cells and is a
+    /// plausible-looking wrong number).
+    #[test]
+    fn count_distinct_is_countd_not_plain_count() {
+        let mut catalog = distinct_catalog();
+
+        // The WHERE keeps the SQL layer from defaulting unfiltered dimensions to their
+        // first member, which would reduce the query to a single cell.
+        let scope = "WHERE Region IN ('East', 'West') AND Product IN ('A', 'B')";
+        let plain = execute_sql(
+            &mut catalog,
+            &format!("SELECT COUNT(Sales) FROM T {scope}"),
+        )
+        .expect("plain count");
+        let distinct = execute_sql(
+            &mut catalog,
+            &format!("SELECT COUNT(DISTINCT Sales) FROM T {scope}"),
+        )
+        .expect("distinct");
+        let countd = execute_sql(
+            &mut catalog,
+            &format!("SELECT COUNTD(Sales) FROM T {scope}"),
+        )
+        .expect("countd");
+
+        // COUNT counts CELLS; COUNT(DISTINCT ...) and COUNTD count VALUES.
+        assert_eq!(scalar_of(&plain), "3", "COUNT counts cells:\n{plain}");
+        assert_eq!(
+            scalar_of(&distinct),
+            "2",
+            "COUNT(DISTINCT ...) counts distinct values:\n{distinct}"
+        );
+        assert_eq!(
+            scalar_of(&distinct),
+            scalar_of(&countd),
+            "COUNT(DISTINCT x) and COUNTD(x) must agree:\n{distinct}\n{countd}"
+        );
+    }
+
+    /// A DISTINCT demand on any other aggregate cannot be honoured: it must be refused
+    /// loudly, never silently computed without the DISTINCT.
+    #[test]
+    fn distinct_on_other_aggregations_is_refused_loudly() {
+        let mut catalog = distinct_catalog();
+        for sql in [
+            "SELECT SUM(DISTINCT Sales) FROM T",
+            "SELECT AVG(DISTINCT Sales) FROM T",
+            "SELECT MIN(DISTINCT Sales) FROM T",
+            "SELECT MAX(DISTINCT Sales) FROM T",
+            "SELECT MEDIAN(DISTINCT Sales) FROM T",
+            "SELECT COUNTD(DISTINCT Sales) FROM T",
+        ] {
+            let err = execute_sql(&mut catalog, sql).expect_err(sql);
+            assert!(
+                err.contains("DISTINCT"),
+                "{sql}: the refusal must name DISTINCT: {err}"
+            );
+        }
     }
 }
 

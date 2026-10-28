@@ -67,6 +67,54 @@ fn build_leaf_product(
     }
 }
 
+/// The distinct BASE leaf values a COUNTD group has seen.
+///
+/// This is the ONE aggregation whose state is not constant-size per group, so an `Acc`
+/// becomes this variant only when the measure's requested aggregation IS COUNTD. SUM /
+/// AVG / COUNT / MIN / MAX keep their fixed four-number state (see `for_aggregation`).
+#[derive(Default)]
+struct DistinctSet {
+    /// Numeric values as normalised IEEE-754 bits. Normalising means `-0.0` folds onto
+    /// `0.0` (they compare equal, so counting them as two would be wrong) and every NaN
+    /// payload folds onto one canonical pattern (a `NaN != NaN` set would otherwise
+    /// count one NaN once per cell instead of once).
+    numbers: HashSet<u64>,
+    /// Text values, compared EXACTLY and case-sensitively. A numeric cell and a text
+    /// cell never compare equal: they are different storage types.
+    text: HashSet<String>,
+}
+
+impl DistinctSet {
+    fn insert(&mut self, raw: &CellValue) {
+        match raw {
+            CellValue::Numeric(n) => {
+                self.numbers.insert(distinct_bits(*n));
+            }
+            CellValue::String(s) => {
+                self.text.insert(s.clone());
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.numbers.len() + self.text.len()
+    }
+}
+
+/// The exact-equality key for a numeric cell: `-0.0 == 0.0`, every NaN equal.
+///
+/// The value was already computed exactly; this normalisation is only about equality,
+/// not about rounding. `±inf` keep their (distinct) bit patterns.
+fn distinct_bits(n: f64) -> u64 {
+    if n == 0.0 {
+        0 // +0.0 and -0.0
+    } else if n.is_nan() {
+        f64::NAN.to_bits() // every NaN payload
+    } else {
+        n.to_bits()
+    }
+}
+
 /// Per-(group, measure) accumulator.
 ///
 /// It keeps BOTH the weighted sum and the raw values, because SUM and the non-additive
@@ -81,6 +129,8 @@ enum Acc {
         max: f64,
     },
     Text(String),
+    /// COUNTD only - the set exists exactly when the requested aggregation is COUNTD.
+    Distinct(DistinctSet),
 }
 
 impl Default for Acc {
@@ -96,7 +146,25 @@ impl Default for Acc {
 }
 
 impl Acc {
+    /// Starts an accumulator suited to the REQUESTED aggregation.
+    ///
+    /// Only COUNTD pays for a per-group set; every other aggregation keeps the fixed-size
+    /// `Num` state, which is the O(1) guarantee that let COUNTD be added without
+    /// regressing the others.
+    fn for_aggregation(aggregation: Aggregation) -> Self {
+        match aggregation {
+            Aggregation::CountDistinct => Acc::Distinct(DistinctSet::default()),
+            _ => Acc::default(),
+        }
+    }
+
     fn add(&mut self, raw: &CellValue, weighted: &CellValue) {
+        // COUNTD keeps the RAW value itself, before any weighting: a weight says how much
+        // a leaf contributes to a rollup, not what value it holds.
+        if let Acc::Distinct(set) = self {
+            set.insert(raw);
+            return;
+        }
         match raw {
             CellValue::Numeric(r) => {
                 // `weighted` is the value after every dimension's weight was applied.
@@ -116,6 +184,8 @@ impl Acc {
                     Acc::Text(_) => {
                         *self = Acc::Num { weighted: w, raw_sum: *r, count: 1, min: *r, max: *r }
                     }
+                    // Handled by the early return above.
+                    Acc::Distinct(_) => unreachable!("COUNTD accumulates in the early return"),
                 }
             }
             // There is no math on text: the last value wins, as before.
@@ -131,6 +201,15 @@ impl Acc {
     fn finish(&self, aggregation: Aggregation) -> String {
         match self {
             Acc::Text(s) => s.clone(),
+            Acc::Distinct(set) => {
+                // A group only exists because a cell created it, so this is non-empty in
+                // practice; the guard mirrors the `count == 0` arm above.
+                if set.len() == 0 {
+                    "-".to_string()
+                } else {
+                    set.len().to_string()
+                }
+            }
             Acc::Num { weighted, raw_sum, count, min, max } => {
                 if *count == 0 {
                     return "-".to_string();
@@ -141,6 +220,9 @@ impl Acc {
                     Aggregation::Avg => raw_sum / *count as f64,
                     Aggregation::Min => *min,
                     Aggregation::Max => *max,
+                    // CountDistinct never lives in a Num accumulator; mirror SUM rather
+                    // than inventing a number if that invariant is ever broken.
+                    Aggregation::CountDistinct => *weighted,
                 };
                 value.to_string()
             }
@@ -774,10 +856,17 @@ pub fn query_slice(&self, query: &SliceQuery) -> Result<ResultSet, String> {
             }
 
             // Accumulate: numbers fold, strings overwrite (there is no math on text).
+            // The accumulator's SHAPE follows the requested aggregation, so only COUNTD
+            // allocates a per-group set (see `Acc::for_aggregation`).
+            let aggregation = query
+                .aggregations
+                .get(&current_measure_name)
+                .copied()
+                .unwrap_or(Aggregation::Sum);
             let measure_map = grouped_results.entry(row_key).or_default();
             measure_map
                 .entry(current_measure_name)
-                .or_default()
+                .or_insert_with(|| Acc::for_aggregation(aggregation))
                 .add(&raw_val, &final_val);
         }
 
