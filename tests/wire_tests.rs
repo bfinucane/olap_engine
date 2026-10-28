@@ -261,8 +261,99 @@ fn capabilities_aggregations_match_what_actually_runs() {
     );
 }
 
+/// Every operator in `capabilities.filterOperators` must actually EVALUATE, and the
+/// advertisement must be exact in both directions (ENGINE-PROTOCOL.md §4, "Advertise
+/// only what you implement"). Mirrors `capabilities_aggregations_match_what_actually_runs`.
+///
+/// The engine evaluates dimension-scope `in` / `equals` / `notEquals`; every other
+/// operator must be REFUSED with `unsupported_filter`, never silently accepted (which
+/// would answer a request the client believes was applied).
+#[test]
+fn query_every_advertised_filter_operator_evaluates() {
+    let mut catalog = build_catalog();
+    let caps = wire::capabilities();
+
+    assert_eq!(
+        caps.filter_operators,
+        vec![
+            "in".to_string(),
+            "equals".to_string(),
+            "notEquals".to_string()
+        ],
+        "advertise exactly the filter operators that run"
+    );
+
+    // Fixture: Product = Widget keeps East Sales 100 / West Sales 200; notEquals keeps
+    // the Gadget rows instead (East 50 / West 25). Driving the full wire path means an
+    // advertised-but-refused operator fails HERE, not in Plateau's filter dialog.
+    for operator in &caps.filter_operators {
+        let filter = match operator.as_str() {
+            "in" => json!({"field": "Product", "scope": "dimension", "operator": "in",
+                           "values": ["Widget"]}),
+            "equals" => json!({"field": "Product", "scope": "dimension", "operator": "equals",
+                               "value": "Widget"}),
+            "notEquals" => json!({"field": "Product", "scope": "dimension",
+                                  "operator": "notEquals", "value": "Widget"}),
+            other => panic!("advertised filter operator '{other}' has no expectation recorded"),
+        };
+        let mut p = request("Sales");
+        by_region(&mut p);
+        measure(&mut p, "Sales", "SUM");
+        p.filters.push(serde_json::from_value(filter).expect("Filter"));
+
+        let resp = wire::query(&mut catalog, &p).unwrap_or_else(|e| {
+            panic!("advertised filter operator '{operator}' was refused: {e:?}")
+        });
+        let expected_west = if operator == "notEquals" { 25.0 } else { 200.0 };
+        let west = resp
+            .rows
+            .iter()
+            .find(|r| r.first() == Some(&json!("West")))
+            .unwrap_or_else(|| panic!("no West row for '{operator}': {:?}", resp.rows));
+        assert_eq!(
+            west[1].as_f64(),
+            Some(expected_west),
+            "advertised operator '{operator}' must actually filter Product"
+        );
+    }
+
+    // The converse: the protocol's other dimension-scope operators are NOT advertised
+    // and must be refused with `unsupported_filter`, never silently accepted.
+    for operator in [
+        "notIn",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "between",
+        "contains",
+        "startsWith",
+        "endsWith",
+        "isNull",
+        "notNull",
+    ] {
+        assert!(
+            !caps.filter_operators.iter().any(|a| a == operator),
+            "{operator} is not implemented, so it must not be advertised"
+        );
+        let mut p = request("Sales");
+        by_region(&mut p);
+        measure(&mut p, "Sales", "SUM");
+        p.filters.push(
+            serde_json::from_value(json!({
+                "field": "Product", "scope": "dimension", "operator": operator
+            }))
+            .expect("Filter"),
+        );
+        let err = wire::query(&mut catalog, &p)
+            .err()
+            .unwrap_or_else(|| panic!("{operator} is not advertised, so it must be refused"));
+        assert_eq!(err.code, "unsupported_filter", "{operator}: {err:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Ãƒâ€šÃ‚Â§1 describe
+// §1 describe
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -959,6 +1050,85 @@ fn query_domain_for_returns_the_domain_map() {
     p2.domain_for.push("Nope".into());
     let err = wire::query(&mut catalog, &p2).expect_err("unknown domainFor column");
     assert_eq!(err.code, "invalid_argument");
+}
+
+/// §3 `domainFor` is honoured WITH the rows, not only by a group-less request.
+///
+/// This is Plateau's real call (tableau-clone/src/server/dataSource.ts:583-594):
+/// `groupBy: [{name: field}], measures: [], domainFor: [field]`. The populated-domain
+/// branch used to require BOTH `groupBy` and `measures` to be empty, so this returned
+/// `domain: {}` and every filter dialog showed an empty control.
+#[test]
+fn query_domain_for_is_honoured_when_group_by_is_present() {
+    let mut catalog = build_catalog();
+
+    // The group-less form, whose member lists every other shape must reproduce.
+    let mut pure = request("Sales");
+    pure.domain_for.extend(["Region".into(), "Product".into()]);
+    let full = wire::query(&mut catalog, &pure)
+        .expect("pure domain request")
+        .domain;
+    assert_eq!(
+        full.get("Region"),
+        Some(&vec!["East".to_string(), "West".to_string()])
+    );
+    assert_eq!(
+        full.get("Product"),
+        Some(&vec!["Widget".to_string(), "Gadget".to_string()])
+    );
+
+    // (a) Plateau's exact shape: groupBy, NO measures, domainFor.
+    let mut plateau = request("Sales");
+    by_region(&mut plateau);
+    plateau.domain_for.push("Region".into());
+    let resp = wire::query(&mut catalog, &plateau).expect("Plateau's domainFor shape");
+    assert_eq!(
+        resp.domain.get("Region"),
+        full.get("Region"),
+        "domainFor must be honoured when groupBy is present"
+    );
+    assert_eq!(resp.columns, vec!["Region"], "the grouping is still returned");
+    // The ROWS are whatever the grouping computes - Plateau's dataSource reads only
+    // `response.domain[field]` here. (With no measures requested the pivot currently
+    // repeats each group once per measure member; that is pre-existing row behaviour,
+    // not part of the `domainFor` contract, so this asserts shape, not multiplicity.)
+    assert!(
+        !resp.rows.is_empty() && resp.rows.iter().all(|row| row.len() == 1),
+        "one generated dimension column per row: {:?}",
+        resp.rows
+    );
+    assert!(
+        resp.rows.iter().all(|row| row[0] == json!("East") || row[0] == json!("West")),
+        "only real Region members: {:?}",
+        resp.rows
+    );
+
+    // (b) groupBy + measures + domainFor: the domain arrives alongside the numbers.
+    let mut grouped = request("Sales");
+    by_region(&mut grouped);
+    measure(&mut grouped, "Sales", "SUM");
+    grouped.domain_for.push("Region".into());
+    let resp = wire::query(&mut catalog, &grouped).expect("grouped query with domainFor");
+    assert_eq!(resp.domain.get("Region"), full.get("Region"));
+    assert_eq!(
+        resp.rows,
+        vec![
+            vec![json!("East"), json!(150.0)],
+            vec![json!("West"), json!(225.0)],
+        ],
+        "the aggregated rows are unchanged by the domain request"
+    );
+
+    // Two domainFor fields at once: each is the list the group-less form returns.
+    let mut two = request("Sales");
+    by_region(&mut two);
+    measure(&mut two, "Sales", "SUM");
+    two.domain_for.extend(["Region".into(), "Product".into()]);
+    let resp = wire::query(&mut catalog, &two).expect("two domains requested");
+    assert_eq!(
+        resp.domain, full,
+        "every requested field is returned, exactly as the pure-domain form does"
+    );
 }
 
 #[test]

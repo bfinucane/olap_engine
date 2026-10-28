@@ -34,15 +34,19 @@
 //!     filters, `INCLUDE`/`EXCLUDE` AFTER; that asymmetry is invisible in the
 //!     output, so a wrong implementation returns numbers that look reasonable.
 //!     We therefore set `supportsLod: false` and let the client compute them.
-//!   * measure-scope `top`/`bottom` ranking.
-//!   * expression evaluation (the AST is accepted and shape-checked, but the
-//!     evaluator is a later step).
+//!   * measure-scope `top`/`bottom` ranking (and measure-scope filters generally).
+//!
+//! IMPLEMENTED, so deliberately absent from that list:
+//!   * expression evaluation - `engine::calc`, applied in
+//!     `apply_calculated_fields`; `capabilities.expressionFunctions` is its list.
+//!   * dimension-scope filtering - `in` / `equals` / `notEquals`, the last being
+//!     the complement of `equals` over the dimension's own members.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::catalog::Catalog;
-use crate::cube::cube::{ResultSet, SliceQuery};
+use crate::cube::cube::{Cube, ResultSet, SliceQuery};
 
 /// The plan wire format version this engine understands. Kept in lockstep with
 /// the client's `protocolVersion`; a mismatch is `version_mismatch`, never a
@@ -423,7 +427,8 @@ impl Default for Capabilities {
                 .collect(),
             // LOD is NOT implemented; the client must compute it (see docs).
             supports_lod: false,
-            // No expression evaluator yet, so no function names are advertised.
+            // The evaluator EXISTS (`engine::calc`), and this is exactly the set of plain
+            // functions it runs - advertise the implementation, never an aspiration.
             expression_functions: crate::engine::calc::FUNCTIONS.iter().map(|f| f.to_string()).collect(),
             // `domainFor` is honoured (folded into the response).
             supports_inline_domain: true,
@@ -532,8 +537,8 @@ pub fn execute_plan(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult
         }
     }
     for m in &plan.measures {
-        // A calculated field, however expressed, is unsupported until the
-        // evaluator exists; check the LOD case first for a precise message.
+        // A calculated field is EVALUATED (`engine::calc`) unless it is an LOD, so check
+        // the LOD case first: the refusal must name the unsupported construct precisely.
         if let Some(ExprRef::Ast(node)) = &m.expr
             && contains_lod(node)
         {
@@ -1010,7 +1015,7 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
     for flt in &plan.filters {
         match flt.scope {
             FilterScope::Dimension => {
-                let vals = filter_values(flt)?;
+                let vals = filter_values(cube, flt)?;
                 filters.entry(flt.field.clone()).or_default().extend(vals);
             }
             FilterScope::Measure => {
@@ -1075,10 +1080,12 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
 
 /// Extracts the engine-facing filter values for a dimension-scope filter.
 ///
-/// The engine's `SliceQuery.filters` is a name -> set-of-members map, which
-/// expresses `equals` and `in`. Operators it cannot yet express are refused
-/// with `unsupported_filter` rather than dropped.
-fn filter_values(flt: &Filter) -> Result<Vec<String>, PlanError> {
+/// The engine's `SliceQuery.filters` is an INCLUSIVE name -> set-of-members map: a
+/// dimension is scanned only for the members listed. That expresses `equals` and `in`
+/// directly; `notEquals` is expressed as the complement over the dimension's own
+/// members - the negation of `equals` (ENGINE-PROTOCOL.md §3 "filters"). Operators this
+/// plumbing cannot express are refused with `unsupported_filter` rather than dropped.
+fn filter_values(cube: &Cube, flt: &Filter) -> Result<Vec<String>, PlanError> {
     match flt.operator {
         FilterOp::Equals => {
             let v = flt.value.clone().ok_or_else(|| {
@@ -1098,11 +1105,107 @@ fn filter_values(flt: &Filter) -> Result<Vec<String>, PlanError> {
             }
             Ok(flt.values.clone())
         }
+        FilterOp::NotEquals => not_equals_values(cube, flt),
         other => Err(PlanError::UnsupportedFilter(format!(
             "operator '{}' on '{}'",
             operator_name(other),
             flt.field
         ))),
+    }
+}
+
+/// Dimension-scope `notEquals`: every member of the dimension EXCEPT the excluded one,
+/// as the inclusive member filter the slice understands.
+///
+/// Negation needs the dimension's member set, so the field must name a dimension OF
+/// THIS CUBE. A hierarchy reference is refused by name: the slice keys filters by
+/// DIMENSION, so such a filter would be silently ignored - and "silently ignored" is
+/// the one answer a filter must never give.
+///
+/// Only LEAF members are emitted. A consolidation re-admits the leaves beneath it, and
+/// a leaf may be reachable from more than one member, so emitting consolidations could
+/// re-admit an excluded leaf. Leaves partition the stored cells exactly.
+fn not_equals_values(cube: &Cube, flt: &Filter) -> Result<Vec<String>, PlanError> {
+    let excluded = flt.value.clone().ok_or_else(|| {
+        PlanError::InvalidArgument(format!(
+            "operator 'notEquals' on '{}' needs a 'value'",
+            flt.field
+        ))
+    })?;
+    let idx = cube
+        .dimension_names
+        .iter()
+        .position(|n| n == &flt.field)
+        .ok_or_else(|| {
+            PlanError::UnsupportedFilter(format!(
+                "operator 'notEquals' on '{}' (only a dimension of '{}' can be negated; \
+                 hierarchy-scoped filters are not supported)",
+                flt.field, cube.name
+            ))
+        })?;
+
+    // A filter value may be hierarchy-qualified `Hierarchy:Member`, the same spelling
+    // the slice's own filter resolution accepts.
+    let (hier, member) = split_qualified_filter_value(&excluded);
+
+    let dim_arc = &cube.dimensions[idx];
+    let mut dim = dim_arc
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let excluded_leaves: HashSet<u32> = dim
+        .get_leaf_descendants_in(hier, member)
+        .into_keys()
+        .collect();
+    if excluded_leaves.is_empty() {
+        return Err(PlanError::InvalidArgument(format!(
+            "operator 'notEquals' on '{}': member '{}' not found",
+            flt.field, excluded
+        )));
+    }
+
+    let mut all_leaves: HashSet<u32> = HashSet::new();
+    let mut kept: Vec<String> = Vec::new();
+    for name in dim.member_order_names_in(hier) {
+        let leaves = dim.get_leaf_descendants_in(hier, &name);
+        // A LEAF stands for exactly one stored coordinate; anything else expands, and is
+        // skipped so no excluded leaf can sneak back in through a consolidation.
+        let is_leaf = leaves.len() == 1
+            && dim
+                .get_id_in(hier, &name)
+                .is_some_and(|id| leaves.contains_key(&id));
+        all_leaves.extend(leaves.keys().copied());
+        if is_leaf && !leaves.keys().any(|id| excluded_leaves.contains(id)) {
+            kept.push(name);
+        }
+    }
+
+    // SAFETY NET: if some stored leaf is not addressable through the member list, the
+    // complement above cannot be expressed as an inclusive filter. Refuse rather than
+    // answer with a list that silently drops rows.
+    if all_leaves.len() != dim.leaf_count() {
+        return Err(PlanError::UnsupportedFilter(format!(
+            "operator 'notEquals' on '{}': the dimension has {} leaf members but only {} \
+             are addressable in hierarchy '{}'",
+            flt.field,
+            dim.leaf_count(),
+            all_leaves.len(),
+            hier.unwrap_or_else(|| dim.default_hierarchy_name()),
+        )));
+    }
+
+    // An empty list is meaningful (the excluded member was the only one): it is how the
+    // inclusive filter says "keep no rows", which is the correct answer to `notEquals`
+    // over a one-member dimension.
+    Ok(kept)
+}
+
+/// Splits a hierarchy-qualified filter value `Hierarchy:Member` the way the slice's
+/// filter resolution does (`cube::split_qualified` is private to the cube module).
+fn split_qualified_filter_value(value: &str) -> (Option<&str>, &str) {
+    match value.split_once(':') {
+        Some((hier, member)) if !hier.is_empty() && !member.is_empty() => (Some(hier), member),
+        _ => (None, value),
     }
 }
 
@@ -1196,12 +1299,25 @@ fn apply_order_and_limit(
     Ok(result)
 }
 
-/// Answers a pure domain query: the distinct member values of each requested
-/// column, in display order. This is what a filter-picker UI asks for.
-fn domain_query(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult, PlanError> {
+/// The distinct member values of each `domainFor` column, in display order.
+///
+/// Shared by the pure-domain path (`domain_query`) and the row-returning query path:
+/// ENGINE-PROTOCOL.md §3 says these lists come back **with** the result, so a query
+/// that also groups must answer them too. Both forms read this one function, so their
+/// lists cannot drift apart.
+///
+/// DIMENSION ACCESS: a denied member must not leak through a picker list (it does not
+/// leak through rows — `query_slice` drops its cells). A member is omitted when ANY of
+/// its leaves is denied, which also hides the member's subtree, exactly as denying a
+/// consolidation hides its children on every other path.
+pub fn domain_map(
+    catalog: &Catalog,
+    plan: &QueryRequest,
+) -> Result<HashMap<String, Vec<String>>, PlanError> {
     let cube = catalog
         .get_cube(&plan.dataset)
         .ok_or_else(|| PlanError::UnknownDataset(plan.dataset.clone()))?;
+    let denied = cube.denied_leaf_ids(&plan.denied_members);
 
     let mut domains: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -1226,11 +1342,25 @@ fn domain_query(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult, Pl
         // so it needs the write lock - exactly as the `.order` REPL command does.
         let mut dim = cube.dimensions[idx].write().unwrap();
         let hier_ref = hier.as_deref();
-        let names = dim.member_order_names_in(hier_ref);
+        let mut names = dim.member_order_names_in(hier_ref);
+        if !denied[idx].is_empty() {
+            let denied_here = &denied[idx];
+            names.retain(|name| {
+                dim.get_leaf_descendants_in(hier_ref, name)
+                    .keys()
+                    .all(|leaf| !denied_here.contains(leaf))
+            });
+        }
         domains.insert(col.clone(), names);
     }
 
-    Ok(PlanResult::Domains(domains))
+    Ok(domains)
+}
+
+/// Answers a pure domain query: the distinct member values of each requested
+/// column, in display order. This is what a filter-picker UI asks for.
+fn domain_query(catalog: &Catalog, plan: &QueryRequest) -> Result<PlanResult, PlanError> {
+    Ok(PlanResult::Domains(domain_map(catalog, plan)?))
 }
 
 /// Renders a result set (or domain answer) as the engine's ASCII table, reusing

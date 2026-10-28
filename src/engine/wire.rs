@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use crate::catalog::catalog::Catalog;
 use crate::cube::node::CellValue;
 use crate::engine::plan::{
-    execute_plan, expand_implicit_value, Capabilities, PlanError, PlanResult, QueryRequest,
-    PROTOCOL_VERSION,
+    domain_map, execute_plan, expand_implicit_value, Capabilities, PlanError, PlanResult,
+    QueryRequest, PROTOCOL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -265,7 +265,17 @@ pub fn query(catalog: &Catalog, plan: &QueryRequest) -> Result<QueryResponse, Wi
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     match result {
-        PlanResult::Rows(rs) => Ok(build_query_response(rs, plan, elapsed_ms)),
+        PlanResult::Rows(rs) => {
+            let mut response = build_query_response(rs, plan, elapsed_ms);
+            // `domainFor` is honoured WITH the rows, not only by the group-less path: a
+            // grouped query still owes the client the member lists it asked for
+            // (ENGINE-PROTOCOL.md §3 "domainFor"). `domain_map` is the very function the
+            // pure-domain answer uses, so the two shapes cannot disagree.
+            if !plan.domain_for.is_empty() {
+                response.domain = domain_map(catalog, plan)?;
+            }
+            Ok(response)
+        }
         PlanResult::Domains(domains) => {
             // A pure domain request: no rows, just the domain map. The shape is
             // still a `QueryResponse`, so the client can parse it uniformly.
@@ -406,6 +416,8 @@ fn build_query_response(
         dimension_names,
         measure_names,
         measure_labels,
+        // Filled by `query` when the request asked for `domainFor`: the domain is a
+        // full-member computation, not part of the row result this builder receives.
         domain: HashMap::new(),
         elapsed_ms,
         truncated,

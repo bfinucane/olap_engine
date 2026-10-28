@@ -165,6 +165,37 @@ fn in_filter_keeps_listed_members() {
     assert_eq!(rows, vec![vec!["France".to_string(), "150".to_string()]]);
 }
 
+/// `notEquals` is the NEGATION of `equals`: the slice's member filter is inclusive, so
+/// the plan layer feeds it every member but the excluded one (ENGINE-PROTOCOL.md §3
+/// "filters"). This is the operator `capabilities.filterOperators` advertises.
+#[test]
+fn not_equals_filter_keeps_everything_but_the_listed_member() {
+    let mut catalog = build_catalog();
+    let mut p = plan("Sales");
+    p.group_by.push(GroupBy { name: "Geography".into(), date_part: None });
+    p.measures.push(bare_measure("Revenue"));
+    p.filters.push(Filter {
+        id: None,
+        field: "Geography".into(),
+        scope: FilterScope::Dimension,
+        operator: FilterOp::NotEquals,
+        values: vec![],
+        value: Some("France".into()),
+        min: None,
+        max: None,
+        limit: None,
+        include_nulls: false,
+    });
+
+    let (_, rows) = rows(execute_plan(&mut catalog, &p).expect("plan should succeed"));
+
+    assert_eq!(
+        rows,
+        vec![vec!["Germany".to_string(), "225".to_string()]],
+        "everything except France"
+    );
+}
+
 #[test]
 fn order_by_desc_then_limit() {
     let mut catalog = build_catalog();
