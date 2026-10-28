@@ -3,23 +3,33 @@
 //!
 //! WHY A HAND-ROLLED SERVER
 //!   The engine has no async runtime and no web-crate dependency, and adding one
-//!   is a large, slow step. The protocol is tiny (four routes, no streaming, no
-//!   keep-alive requirements), so a blocking `std::net::TcpListener` with a
-//!   thread per connection is enough to get Plateau talking to the engine
-//!   today. The ONLY normative thing is the JSON (the protocol explicitly leaves
-//!   the transport unspecified), so this file is deliberately swappable.
+//!   is a large, slow step. The protocol surface is small (a handful of routes,
+//!   no streaming, no keep-alive requirements), so a blocking
+//!   `std::net::TcpListener` with a thread per connection is enough to get
+//!   Plateau talking to the engine today. The ONLY normative thing is the JSON
+//!   (the protocol explicitly leaves the transport unspecified), so this file is
+//!   deliberately swappable.
 //!
-//! ROUTES (ENGINE-PROTOCOL.md "Transport")
-//!   GET  /v1/capabilities            -> capabilities
+//! ROUTES
+//!   The client contract is ENGINE-PROTOCOL.md "Transport"; the writeback routes are
+//!   documented (paste-ready) in `WIRE-CHANGES.md`.
+//!   GET  /v1/capabilities            -> capabilities (PUBLIC: feature-detect)
 //!   GET  /v1/datasets                -> the list of dataset names
 //!   GET  /v1/{dataset}               -> describe
 //!   GET  /v1/{dataset}/sample?limit=N&offset=M[&columns=a,b]  -> sample
 //!   POST /v1/{dataset}/query         -> query   (body is a QueryRequest)
+//!   POST /v1/{dataset}/write         -> batched cell writes (body is a WriteRequest)
+//!   POST /v1/save                    -> persist the in-memory catalogue to disk
 //!   POST /v1/login                   -> session token (PUBLIC: it is how you get one)
+//!   GET  /sql, POST /v1/sql          -> read-only SQL console; engine tooling, NOT
+//!                                       part of the Plateau contract
 //!
 //! AUTHENTICATION (SECURITY-DESIGN.md Â§5)
-//!   Every /v1 route except /v1/login requires `Authorization: Bearer <token>`.
-//!   Required by default; `--allow-anonymous` turns it off for development.
+//!   Every route except `POST /v1/login` and `GET /v1/capabilities` requires
+//!   `Authorization: Bearer <token>`. Capabilities is deliberately public: it is how
+//!   a client discovers `authRequired` before it has a token. `GET /sql` (the console
+//!   page, not the JSON endpoint) is served before the auth gate as engine tooling.
+//!   Auth is required by default; `--allow-anonymous` turns it off for development.
 //!   Users live in `security.json` beside the database, created with
 //!   `serve.exe --add-user <name> --role <role>`.
 //!
@@ -194,10 +204,11 @@ fn main() {
 
     let catalog = load_catalog(&config.db);
     // No catalog-wide lock (Phase 1b M3). Reads take an O(1) snapshot of a cube's
-    // `VersionStore` and never need the write path; the engine exposes no write
-    // endpoint over HTTP, so the only writer is the REPL/import that owns the
-    // catalog outright. A `Mutex<Catalog>` here would serialise every request
-    // behind one lock for no correctness benefit.
+    // `VersionStore`; writes arrive through `POST /v1/{dataset}/write` and mutate in
+    // place through the same `Cube::write` path the REPL/import use (interior
+    // mutability on the dimensions, a lock inside each store). `POST /v1/save` is the
+    // only route that touches the FILE. A `Mutex<Catalog>` here would serialise every
+    // request behind one lock for no correctness benefit.
     let shared = Arc::new(catalog);
 
     let listener = match TcpListener::bind(&config.bind) {
@@ -428,17 +439,91 @@ struct Request {
 }
 
 impl Request {
-    /// The `k=v` params, split on `&`. Values here are simple names, so
-    /// percent-decoding is skipped (a later step).
-    fn params(&self) -> Vec<(String, String)> {
+    /// The `k=v` params, split on `&`, with every VALUE percent-decoded.
+    ///
+    /// Decoding lives here and only here, so all parameters (`limit`, `offset`,
+    /// `columns`, and any future text value) follow one rule:
+    ///
+    ///   * `+` becomes a space — `URLSearchParams` writes a space as `+`, which is
+    ///     what Plateau's client sends (`columns=Row+ID`);
+    ///   * `%XX` becomes the byte with hex value `XX`, hex case-insensitive;
+    ///   * a `%` not followed by two hex digits (or bytes that do not form UTF-8) is
+    ///     `invalid_argument`: a clean 400, never a panic and never a silently
+    ///     different column name.
+    ///
+    /// Keys are NOT decoded: they are this server's small fixed vocabulary, not data.
+    fn params(&self) -> Result<Vec<(String, String)>, WireError> {
         self.query
             .split('&')
             .filter(|s| !s.is_empty())
             .map(|pair| match pair.split_once('=') {
-                Some((k, v)) => (k.to_string(), v.to_string()),
-                None => (pair.to_string(), String::new()),
+                Some((key, value)) => {
+                    Ok((key.to_string(), decode_query_value(key, value)?))
+                }
+                None => Ok((pair.to_string(), String::new())),
             })
             .collect()
+    }
+}
+
+/// Percent-decodes one query-string VALUE (not the path, and not the key).
+///
+/// `+` means space here (application/x-www-form-urlencoded); the raw path decoder
+/// below keeps its own rule because a path's `+` is a literal plus.
+///
+/// A malformed escape is refused as `invalid_argument` rather than guessed at: a
+/// silently wrong column name that happens to exist is worse than an error, and a
+/// panic would drop the connection with no envelope at all.
+fn decode_query_value(key: &str, value: &str) -> Result<String, WireError> {
+    let invalid = || WireError {
+        code: "invalid_argument",
+        message: format!(
+            "Malformed percent-encoding in query parameter '{key}': '{value}'. \
+             Expected %XX hex escapes (or '+' for a space)."
+        ),
+    };
+
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                // Read two BYTES, then validate them as hex. Doing it byte-wise keeps
+                // this safe even when the value also contains raw multi-byte UTF-8.
+                let decoded = match (bytes.get(i + 1).copied(), bytes.get(i + 2).copied()) {
+                    (Some(high), Some(low)) => {
+                        hex_digit(high).zip(hex_digit(low)).map(|(h, l)| (h << 4) | l)
+                    }
+                    _ => None,
+                };
+                let Some(byte) = decoded else {
+                    return Err(invalid());
+                };
+                out.push(byte);
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).map_err(|_| invalid())
+}
+
+/// The value of one ASCII hex digit, in either case.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -652,9 +737,10 @@ fn route(
 
     // POST /v1/sql â€” the read-only SQL console's endpoint.
     //
-    // Deliberately restricted to a single SELECT (see `sql::ensure_read_only`): the
-    // port has no authentication, so a write path here would let anything on the
-    // machine rewrite the catalogue. The CLI keeps that power.
+    // Deliberately restricted to a single SELECT (see `sql::ensure_read_only`): a
+    // general statement would be a second, unchecked write path competing with the
+    // explicit, permission-checked cell API (`POST /v1/{dataset}/write`) and its
+    // `POST /v1/save`. The CLI keeps the power to change the model.
     if path == "/v1/sql" {
         if req.method != "POST" {
             // A browser hitting this URL is almost certainly looking for the console
@@ -795,7 +881,7 @@ fn route(
         ("GET", "sample") => {
             let mut params = SampleQuery::default();
             let mut columns: Vec<String> = Vec::new();
-            for (k, v) in req.params() {
+            for (k, v) in req.params()? {
                 match k.as_str() {
                     "limit" => params.limit = v.parse().ok(),
                     "offset" => params.offset = v.parse().ok(),

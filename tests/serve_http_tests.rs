@@ -486,6 +486,120 @@ fn get_sample_honours_limit_offset_and_columns() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Query-string percent-decoding (`sample?columns=…`)
+//
+// A column name is DATA, and a client URL-encodes data: `URLSearchParams` writes
+// "Row ID" as `Row+ID`, `encodeURIComponent` writes it as `Row%20ID`. The server
+// used to take query values literally, so `columns=Row+ID` named a column called
+// "Row+ID" that does not exist and answered 400. Plateau sends these requests, so
+// the two encodings MUST name the same column, and a malformed escape must be a
+// clean 400 rather than a panic or a silently different name.
+// ---------------------------------------------------------------------------
+
+/// A cube whose column names are the ones a client has to URL-encode.
+///
+/// "Row ID" is the multi-word column name the protocol's own `describe` example
+/// uses, so it is the right probe: it needs an encoding in every client.
+fn write_spaced_column_fixture(path: &PathBuf) {
+    let mut catalog = Catalog::new();
+    catalog.add_cube("Spaced", &["Region", "Row ID"], None, true);
+    {
+        let cube = catalog.get_cube_mut("Spaced").expect("Spaced cube");
+        cube.write(&["East", "r-1"], CellValue::Numeric(7.0)).expect("write r-1");
+        cube.write(&["West", "r-2"], CellValue::Numeric(9.0)).expect("write r-2");
+    }
+    catalog.save_to_disk(path.to_str().expect("utf-8 path")).expect("save spaced fixture");
+}
+
+/// A server holding `Spaced`, proved ready by a describe of THAT cube (not just by
+/// a bound socket), so a decode failure cannot be mistaken for a startup failure.
+fn server_with_spaced_columns() -> Server {
+    let (db_path, log_path) = unique_paths("spaced");
+    write_spaced_column_fixture(&db_path);
+    let server = spawn_server(&db_path, &log_path, false);
+    if get_json(&server.base, "/v1/Spaced").is_none() {
+        let stderr = read_log(&server.log_path);
+        drop(server);
+        panic!("server bound but did not answer GET /v1/Spaced.\nserver stderr:\n{stderr}");
+    }
+    server
+}
+
+/// Every encoding a real client produces for `columns=Row ID` resolves to the one
+/// column named exactly "Row ID". Covers `+` (form-style), `%20` (URI-style) and
+/// hex case-insensitivity (`%52` = 'R', `%72` = 'r'; the column lookup is
+/// case-insensitive, so both must work).
+#[test]
+fn sample_columns_percent_decode_plus_and_escaped_forms() {
+    let srv = server_with_spaced_columns();
+    let b = &srv.base;
+
+    for encoded in ["Row+ID", "Row%20ID", "%52ow+ID", "%72ow%20ID"] {
+        let resp = get(&format!("{b}/v1/Spaced/sample?limit=5&columns={encoded}"));
+        assert_eq!(resp.status, 200, "columns={encoded}: {}", resp.body);
+        let v = resp.json();
+        assert_eq!(v["columns"], serde_json::json!(["Row ID"]), "columns={encoded}");
+        assert_eq!(v["rowCount"], serde_json::json!(2), "columns={encoded}");
+        let rows = v["rows"].as_array().expect("rows is an array");
+        assert_eq!(rows.len(), 2, "columns={encoded}");
+        // Row ORDER inside a sample is not part of the contract (the store is a hash
+        // map), so assert the decoded projection, not a position.
+        let ids: Vec<&str> = rows.iter().filter_map(|row| row[0].as_str()).collect();
+        assert!(
+            ids.contains(&"r-1") && ids.contains(&"r-2"),
+            "columns={encoded}: both rows must carry the decoded column: {rows:?}"
+        );
+    }
+
+    // The decode is applied to EVERY value, not just columns: an encoded offset is
+    // still an offset (and `%31` is how a client may escape a digit).
+    let windowed = get(&format!("{b}/v1/Spaced/sample?limit=5&offset=%31&columns=Row+ID"));
+    assert_eq!(windowed.status, 200, "{}", windowed.body);
+    let rows = windowed.json()["rows"].as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "offset=%31 must decode to 1: {rows:?}");
+    assert!(
+        matches!(rows[0][0].as_str(), Some("r-1" | "r-2")),
+        "decoded offset must return the remaining row: {rows:?}"
+    );
+
+    // A LITERAL plus is `%2B`, never a space: decoding must not conflate the two.
+    // "Row+ID" is not a column here, so this is the unknown-column error.
+    let literal_plus = get(&format!("{b}/v1/Spaced/sample?limit=5&columns=Row%2BID"));
+    assert_eq!(literal_plus.status, 400, "{}", literal_plus.body);
+    assert_eq!(literal_plus.code(), "invalid_argument");
+    assert!(
+        literal_plus.json()["error"].as_str().unwrap_or("").contains("Row+ID"),
+        "the literal plus must survive decoding: {}",
+        literal_plus.body
+    );
+}
+
+/// A malformed escape is `invalid_argument` — a clean envelope, not a panic and not
+/// a silently truncated/garbled name. Covers a non-hex pair, a truncated escape, a
+/// lone `%`, and `%FF`, which is valid hex but not valid UTF-8.
+#[test]
+fn malformed_percent_encoding_in_a_query_value_is_a_clean_400() {
+    let srv = server_with_spaced_columns();
+    let b = &srv.base;
+
+    for bad in ["Row%ZZ", "Row%2", "Row%", "%FF"] {
+        let resp = get(&format!("{b}/v1/Spaced/sample?limit=5&columns={bad}"));
+        assert_eq!(resp.status, 400, "columns={bad}: {}", resp.body);
+        assert_eq!(resp.code(), "invalid_argument", "columns={bad}: {}", resp.body);
+        assert!(
+            resp.json()["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "columns={bad}: the envelope must carry a message: {}",
+            resp.body
+        );
+    }
+
+    // No panic, no wedged connection handling: ordinary requests still work after
+    // four refusals on the same process.
+    assert_eq!(get(&format!("{b}/v1/capabilities")).status, 200);
+    assert_eq!(get(&format!("{b}/v1/Spaced/sample?limit=1")).status, 200);
+}
+
 #[test]
 fn post_query_returns_the_full_query_response() {
     let srv = server();
@@ -716,8 +830,9 @@ fn server_serves_the_catalog_persisted_by_save_to_disk() {
 ///
 /// This is a concurrency test over the TRANSPORT, not a throughput benchmark: it exists
 /// to prove there is no deadlock and no shared-state corruption once the coarse lock is
-/// gone. (The engine exposes no write endpoint, so the reader/writer race itself is
-/// covered in `concurrency_tests.rs`, against the same `VersionStore`.)
+/// gone. (These requests are all READS; the write endpoint has its own tests, and the
+/// reader/writer race itself is covered in `concurrency_tests.rs`, against the same
+/// `VersionStore`.)
 #[test]
 fn concurrent_requests_are_all_served_consistently() {
     let srv = server();
