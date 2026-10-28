@@ -253,6 +253,101 @@ fn not_equals_filter_keeps_everything_but_the_listed_member() {
     );
 }
 
+/// PROTOCOL §5.6 MUST / §11.9 (owner ruling D2): a dimension-scope filter whose `field` is
+/// not an exact dimension of the dataset is a loud typed error, never a silently dropped
+/// predicate. Matching is exact and case-sensitive - clients send `describe` casing.
+#[test]
+fn filter_on_an_unknown_field_is_refused_loudly() {
+    let mut catalog = build_catalog();
+
+    for operator in [FilterOp::In, FilterOp::Equals, FilterOp::NotEquals] {
+        let mut p = plan("Sales");
+        p.group_by.push(GroupBy { name: "Geography".into(), date_part: None });
+        p.measures.push(bare_measure("Revenue"));
+        let (values, value) = if operator == FilterOp::In {
+            (vec!["France".into()], None)
+        } else {
+            (vec![], Some("France".into()))
+        };
+        p.filters.push(Filter {
+            id: None,
+            field: "Nope".into(),
+            scope: FilterScope::Dimension,
+            operator,
+            values,
+            value,
+            min: None,
+            max: None,
+            limit: None,
+            include_nulls: false,
+        });
+
+        let err = execute_plan(&mut catalog, &p)
+            .expect_err("a filter on a non-dimension field must be refused");
+        assert!(matches!(err, PlanError::InvalidArgument(_)), "{operator:?}: got {err:?}");
+        assert_eq!(err.code(), "invalid_argument", "{operator:?}");
+        let message = err.to_string();
+        assert!(message.contains("Nope"), "message names the field: {message}");
+        assert!(message.contains("Sales"), "message names the dataset: {message}");
+    }
+
+    // A valid filter (exact describe casing) still applies.
+    let mut p = plan("Sales");
+    p.group_by.push(GroupBy { name: "Geography".into(), date_part: None });
+    p.measures.push(bare_measure("Revenue"));
+    p.filters.push(Filter {
+        id: None,
+        field: "Geography".into(),
+        scope: FilterScope::Dimension,
+        operator: FilterOp::Equals,
+        values: vec![],
+        value: Some("France".into()),
+        min: None,
+        max: None,
+        limit: None,
+        include_nulls: false,
+    });
+    let (_, rows) = rows(execute_plan(&mut catalog, &p).expect("a valid filter still runs"));
+    assert_eq!(rows, vec![vec!["France".to_string(), "150".to_string()]]);
+}
+
+/// A hierarchy name is not a dimension: the slice keys filters by DIMENSION name, so the
+/// engine refuses the field with `unsupported_filter` instead of silently ignoring it.
+#[test]
+fn filter_on_a_hierarchy_name_is_refused_as_unsupported_filter() {
+    let mut catalog = build_catalog();
+    catalog.create_hierarchy("Geography", "Ops").expect("create Ops");
+    {
+        let dim = catalog.get_dimension("Geography").expect("dimension");
+        let mut d = dim.write().unwrap();
+        d.add_component_in(Some("Ops"), "EMEA", "France", 1.0).expect("link France");
+        d.add_component_in(Some("Ops"), "EMEA", "Germany", 1.0).expect("link Germany");
+    }
+
+    let mut p = plan("Sales");
+    p.group_by.push(GroupBy { name: "Geography".into(), date_part: None });
+    p.measures.push(bare_measure("Revenue"));
+    p.filters.push(Filter {
+        id: None,
+        field: "Ops".into(),
+        scope: FilterScope::Dimension,
+        operator: FilterOp::Equals,
+        values: vec![],
+        value: Some("EMEA".into()),
+        min: None,
+        max: None,
+        limit: None,
+        include_nulls: false,
+    });
+
+    let err = execute_plan(&mut catalog, &p).expect_err("a hierarchy field must be refused");
+    assert!(matches!(err, PlanError::UnsupportedFilter(_)), "got {err:?}");
+    assert_eq!(err.code(), "unsupported_filter");
+    let message = err.to_string();
+    assert!(message.contains("Ops"), "message names the field: {message}");
+    assert!(message.contains("Geography"), "message names the owning dimension: {message}");
+}
+
 #[test]
 fn order_by_desc_then_limit() {
     let mut catalog = build_catalog();

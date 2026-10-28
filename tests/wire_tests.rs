@@ -354,6 +354,60 @@ fn query_every_advertised_filter_operator_evaluates() {
     }
 }
 
+/// PROTOCOL §5.6 MUST / §11.9 (owner ruling D2): a dimension-scope filter whose `field`
+/// is not an exact dimension of the dataset is `400 invalid_argument`, naming the field
+/// and dataset. It must NOT be mistaken for an unknown dataset or an unsupported operator,
+/// and it must never be silently dropped. Matching is exact/case-sensitive.
+#[test]
+fn query_filter_on_a_non_dimension_field_is_400_invalid_argument() {
+    let mut catalog = build_catalog();
+
+    let bad_filters: Vec<Value> = vec![
+        json!({"field": "Nope", "scope": "dimension", "operator": "equals", "value": "East"}),
+        json!({"field": "Nope", "scope": "dimension", "operator": "in", "values": ["East"]}),
+        json!({"field": "Nope", "scope": "dimension", "operator": "notEquals", "value": "East"}),
+        // Case-sensitive: "region" is not "Region".
+        json!({"field": "region", "scope": "dimension", "operator": "equals", "value": "East"}),
+    ];
+    for filter in bad_filters {
+        let mut p = request("Sales");
+        by_region(&mut p);
+        measure(&mut p, "Sales", "SUM");
+        p.filters.push(serde_json::from_value(filter.clone()).expect("Filter"));
+
+        let err = wire::query(&mut catalog, &p)
+            .expect_err("a filter on a non-dimension field must be refused");
+        assert_eq!(err.code, "invalid_argument", "{filter}: {err:?}");
+        assert_eq!(err.status(), 400, "{filter}");
+        assert_ne!(err.code, "unknown_dataset", "{filter}");
+        assert_ne!(err.code, "unsupported_filter", "{filter}");
+        assert!(
+            err.message.contains("Nope") || err.message.contains("region"),
+            "{filter}: the message must name the field: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Sales"),
+            "{filter}: the message must name the dataset: {}",
+            err.message
+        );
+    }
+
+    // A valid filter still filters: of the two regions only East survives.
+    let mut p = request("Sales");
+    by_region(&mut p);
+    measure(&mut p, "Sales", "SUM");
+    p.filters.push(
+        serde_json::from_value(json!({
+            "field": "Region", "scope": "dimension", "operator": "equals", "value": "East"
+        }))
+        .expect("Filter"),
+    );
+    let resp = wire::query(&mut catalog, &p).expect("a valid filter still runs");
+    assert_eq!(resp.rows.len(), 1, "only East survives: {:?}", resp.rows);
+    assert_eq!(resp.rows[0][0], json!("East"));
+}
+
 // ---------------------------------------------------------------------------
 // §1 describe
 // ---------------------------------------------------------------------------

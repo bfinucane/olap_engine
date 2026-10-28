@@ -1013,7 +1013,12 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
     for flt in &plan.filters {
         match flt.scope {
             FilterScope::Dimension => {
-                let vals = filter_values(cube, flt)?;
+                // ONE validation for every dimension-scope field, before operator
+                // dispatch: the slice's filter map is keyed by dimension name, so a field
+                // that is not an exact dimension of this cube could never apply. Dropping
+                // it silently would answer a predicate the client believes it sent.
+                let dim_index = dimension_index_for_filter(catalog, cube, &flt.field)?;
+                let vals = filter_values(cube, dim_index, flt)?;
                 filters.entry(flt.field.clone()).or_default().extend(vals);
             }
             FilterScope::Measure => {
@@ -1076,14 +1081,57 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
     })
 }
 
+/// Validates a dimension-scope filter's `field` against the cube's dimensions.
+///
+/// `SliceQuery.filters` is keyed by DIMENSION name, so a field that is not an exact
+/// dimension name of this cube can never apply. Dropping such a predicate silently would
+/// answer a filter the client believes it sent - the failure mode the contract forbids
+/// (PROTOCOL §5.6 MUST; §11.9 / owner ruling D2). Matching is EXACT and case-sensitive:
+/// clients MUST send the name exactly as `describe` returns it.
+///
+///   * an exact dimension name -> that dimension's index;
+///   * a hierarchy name (of a dimension THIS dataset uses) -> `unsupported_filter`,
+///     because the slice keys filters by dimension and hierarchy-scoped filtering is not
+///     implemented;
+///   * anything else -> `invalid_argument`, naming the field and the dataset.
+fn dimension_index_for_filter(
+    catalog: &Catalog,
+    cube: &Cube,
+    field: &str,
+) -> Result<usize, PlanError> {
+    if let Some(index) = cube.dimension_names.iter().position(|name| name == field) {
+        return Ok(index);
+    }
+    // Distinguish "this is a hierarchy, not a dimension" so the client gets the exact
+    // code the contract promises. Only a hierarchy of a dimension THIS dataset uses is
+    // reported as one; a hierarchy of some other cube is simply not a dimension here.
+    if let Some((owner, Some(hierarchy))) = catalog.dimension_of_reference(field)
+        && cube.dimension_names.iter().any(|name| name == &owner)
+    {
+        return Err(PlanError::UnsupportedFilter(format!(
+            "filter field '{}' names hierarchy '{}' of dimension '{}' in dataset '{}'; \
+             filters are keyed by DIMENSION name, so filter on the dimension itself",
+            field, hierarchy, owner, cube.name
+        )));
+    }
+    Err(PlanError::InvalidArgument(format!(
+        "filter field '{}' is not a dimension of dataset '{}' (filter fields are matched \
+         case-sensitively; send the name exactly as describe returns it)",
+        field, cube.name
+    )))
+}
+
 /// Extracts the engine-facing filter values for a dimension-scope filter.
+///
+/// The filter field has already been validated by `dimension_index_for_filter` (shared by
+/// every dimension-scope operator), so `dim_index` is a real dimension of `cube`.
 ///
 /// The engine's `SliceQuery.filters` is an INCLUSIVE name -> set-of-members map: a
 /// dimension is scanned only for the members listed. That expresses `equals` and `in`
 /// directly; `notEquals` is expressed as the complement over the dimension's own
 /// members - the negation of `equals` (ENGINE-PROTOCOL.md §3 "filters"). Operators this
 /// plumbing cannot express are refused with `unsupported_filter` rather than dropped.
-fn filter_values(cube: &Cube, flt: &Filter) -> Result<Vec<String>, PlanError> {
+fn filter_values(cube: &Cube, dim_index: usize, flt: &Filter) -> Result<Vec<String>, PlanError> {
     match flt.operator {
         FilterOp::Equals => {
             let v = flt.value.clone().ok_or_else(|| {
@@ -1103,7 +1151,7 @@ fn filter_values(cube: &Cube, flt: &Filter) -> Result<Vec<String>, PlanError> {
             }
             Ok(flt.values.clone())
         }
-        FilterOp::NotEquals => not_equals_values(cube, flt),
+        FilterOp::NotEquals => not_equals_values(cube, dim_index, flt),
         other => Err(PlanError::UnsupportedFilter(format!(
             "operator '{}' on '{}'",
             operator_name(other),
@@ -1115,38 +1163,30 @@ fn filter_values(cube: &Cube, flt: &Filter) -> Result<Vec<String>, PlanError> {
 /// Dimension-scope `notEquals`: every member of the dimension EXCEPT the excluded one,
 /// as the inclusive member filter the slice understands.
 ///
-/// Negation needs the dimension's member set, so the field must name a dimension OF
-/// THIS CUBE. A hierarchy reference is refused by name: the slice keys filters by
-/// DIMENSION, so such a filter would be silently ignored - and "silently ignored" is
-/// the one answer a filter must never give.
+/// The field was validated as an exact dimension of this cube by
+/// `dimension_index_for_filter` (shared with every other dimension-scope operator), so
+/// `dim_index` is valid; there is no second, divergent field check here.
 ///
 /// Only LEAF members are emitted. A consolidation re-admits the leaves beneath it, and
 /// a leaf may be reachable from more than one member, so emitting consolidations could
 /// re-admit an excluded leaf. Leaves partition the stored cells exactly.
-fn not_equals_values(cube: &Cube, flt: &Filter) -> Result<Vec<String>, PlanError> {
+fn not_equals_values(
+    cube: &Cube,
+    dim_index: usize,
+    flt: &Filter,
+) -> Result<Vec<String>, PlanError> {
     let excluded = flt.value.clone().ok_or_else(|| {
         PlanError::InvalidArgument(format!(
             "operator 'notEquals' on '{}' needs a 'value'",
             flt.field
         ))
     })?;
-    let idx = cube
-        .dimension_names
-        .iter()
-        .position(|n| n == &flt.field)
-        .ok_or_else(|| {
-            PlanError::UnsupportedFilter(format!(
-                "operator 'notEquals' on '{}' (only a dimension of '{}' can be negated; \
-                 hierarchy-scoped filters are not supported)",
-                flt.field, cube.name
-            ))
-        })?;
 
     // A filter value may be hierarchy-qualified `Hierarchy:Member`, the same spelling
     // the slice's own filter resolution accepts.
     let (hier, member) = split_qualified_filter_value(&excluded);
 
-    let dim_arc = &cube.dimensions[idx];
+    let dim_arc = &cube.dimensions[dim_index];
     let mut dim = dim_arc
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
