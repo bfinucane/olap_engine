@@ -1,0 +1,77 @@
+Running script 'order_by.sql'...
+> CREATE TABLE T (Region STRING, Product STRING, M MEASURE)
+Cube 'T' created. Measure dimension: M
+
+> INSERT INTO T VALUES ('East', 'A', 'Sales', 9)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('East', 'B', 'Sales', 10)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('West', 'A', 'Sales', 9)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('West', 'B', 'Sales', 12)
+Upserted 1 row(s) into 'T'.
+
+> SELECT Region, Product, Sales FROM T
+Region | Product | Sales
+------------------------------
+East | A | 9
+East | B | 10
+West | A | 9
+West | B | 12
+
+
+> SELECT Region, Product, Sales FROM T ORDER BY Sales
+Region | Product | Sales
+------------------------------
+East | A | 9
+West | A | 9
+East | B | 10
+West | B | 12
+
+
+> SELECT Region, Product, Sales FROM T ORDER BY Sales DESC
+Region | Product | Sales
+------------------------------
+West | B | 12
+East | B | 10
+East | A | 9
+West | A | 9
+
+
+> SELECT Region, Product, Sales FROM T ORDER BY Region, Product
+Region | Product | Sales
+------------------------------
+East | A | 9
+East | B | 10
+West | A | 9
+West | B | 12
+
+
+> SELECT Region, Product, Sales FROM T ORDER BY Sales DESC LIMIT 2
+Region | Product | Sales
+------------------------------
+West | B | 12
+East | B | 10
+
+
+> SELECT Region, Product, Sales FROM T ORDER BY 3 DESC
+Region | Product | Sales
+------------------------------
+West | B | 12
+East | B | 10
+East | A | 9
+West | A | 9
+
+
+> SELECT Region, Product, Sales FROM T ORDER BY Sales DESC, Region
+Region | Product | Sales
+------------------------------
+West | B | 12
+East | B | 10
+East | A | 9
+West | A | 9
+
+

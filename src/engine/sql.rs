@@ -149,6 +149,16 @@ pub fn execute_sql_with_denied(
                 let row_limit = parse_limit(&query.limit)?;
                 let row_offset = parse_offset(&query.offset)?;
 
+                                // --- 0b. ORDER BY ---
+                // sqlparser 0.43 DOES parse ORDER BY (into `query.order_by`), and this
+                // branch used to read only `limit`/`offset` - so the clause was parsed
+                // and then SILENTLY DROPPED: the caller got display order with no error,
+                // the plausible-wrong-answer failure mode this engine refuses elsewhere.
+                // Resolve the keys up front so a malformed or unsupported key is a clean
+                // error (matching LIMIT/OFFSET), and apply them after the join and
+                // BEFORE the page - which is SQL's order of operations.
+                let row_order = parse_order_by(&query.order_by)?;
+
                                 // --- 1. IDENTIFY PRIMARY AND JOINED CUBES ---
                 // Get Primary Cube (e.g., Transactions)
                 let relation = select.from.first()
@@ -606,7 +616,14 @@ pub fn execute_sql_with_denied(
                     )?;
                 }
 
-                // --- 5. LIMIT / OFFSET ---
+                // --- 5. ORDER BY ---
+                // SQL applies ORDER BY BEFORE LIMIT/OFFSET: `ORDER BY Sales DESC LIMIT 2`
+                // must sort the whole result and then take the top two, not re-sort the
+                // first two rows. Applying it after the join also lets ORDER BY name a
+                // joined attribute column, because attribute_join::apply has appended it.
+                apply_order_by(&mut result_set, &row_order)?;
+
+                // --- 6. LIMIT / OFFSET ---
                 // Applied last, to the materialised rows, so it counts exactly the
                 // output the user sees (after the join appended its columns).
                 apply_limit_offset(&mut result_set, row_limit, row_offset);
@@ -816,6 +833,152 @@ fn apply_limit_offset(result: &mut ResultSet, limit: Option<usize>, offset: usiz
     }
 }
 
+/// One `ORDER BY` key, before it is resolved against the result's output columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderKey {
+    target: OrderTarget,
+    descending: bool,
+}
+
+/// What an `ORDER BY` key names: an output column, or a 1-based output position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrderTarget {
+    Column(String),
+    Ordinal(usize),
+}
+
+/// Parses SQL `ORDER BY` keys that this front end can honour.
+///
+/// Deliberately narrow, like `LIMIT`/`OFFSET` above: a key the engine cannot honour
+/// is an ERROR naming the key, never a clause that is quietly dropped. Supported:
+///
+///   * `<output column>` or `<alias>.<output column>` (bare or qualified), `ASC`/`DESC`;
+///   * a 1-based output position, e.g. `ORDER BY 2 DESC` (standard SQL ordinal).
+///
+/// `NULLS FIRST`/`NULLS LAST` is refused rather than approximated: this engine has no
+/// NULL, it has the `-` absent-cell marker, and the plan layer already gives that
+/// marker an order. Inventing a second null rule here would make the two front doors
+/// disagree. Expressions (`ORDER BY Region || 'x'`) are likewise refused.
+fn parse_order_by(order_by: &[sqlparser::ast::OrderByExpr]) -> Result<Vec<OrderKey>, String> {
+    let mut keys = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        if item.nulls_first.is_some() {
+            return Err(format!(
+                "ORDER BY: NULLS FIRST/LAST is not supported (absent cells are the '-' \
+                 marker and follow the engine's normal order). Remove the clause or sort \
+                 on a different column."
+            ));
+        }
+        let target = match &item.expr {
+            Expr::Identifier(id) => OrderTarget::Column(id.value.clone()),
+            // `ORDER BY t.Sales` names the same output column as `ORDER BY Sales`.
+            Expr::CompoundIdentifier(parts) => match parts.last() {
+                Some(id) => OrderTarget::Column(id.value.clone()),
+                None => return Err("ORDER BY: malformed qualified column.".to_string()),
+            },
+            Expr::Value(Value::Number(text, _)) => {
+                let position = text.parse::<usize>().map_err(|_| {
+                    format!("ORDER BY position '{}' is not a 1-based column number.", text)
+                })?;
+                if position == 0 {
+                    return Err(
+                        "ORDER BY position must be at least 1 (columns are 1-based)."
+                            .to_string(),
+                    );
+                }
+                OrderTarget::Ordinal(position)
+            }
+            other => {
+                return Err(format!(
+                    "ORDER BY supports an output column or a 1-based column position, not '{}'.",
+                    other
+                ))
+            }
+        };
+        keys.push(OrderKey {
+            target,
+            // `None` means no keyword, which SQL defines as ASC.
+            descending: item.asc == Some(false),
+        });
+    }
+    Ok(keys)
+}
+
+/// Sorts the materialised rows by the parsed `ORDER BY` keys.
+///
+/// Semantics are the PLAN layer's (`plan::apply_order_and_limit`), so the two front
+/// doors cannot disagree about what "sorted" means:
+///   * a stable sort, so equal keys keep display order;
+///   * numeric when BOTH cells parse as a number, otherwise lexicographic.
+///
+/// An absent cell is the `-` marker. It is not numeric, so it takes part in the
+/// text order (first ascending, last descending) rather than being special-cased.
+fn apply_order_by(result: &mut ResultSet, keys: &[OrderKey]) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut resolved: Vec<(usize, bool)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let index = match &key.target {
+            OrderTarget::Column(name) => result
+                .headers
+                .iter()
+                // Exact first: SQL output names are the cube's dictionary casing. A
+                // case-insensitive fallback keeps unquoted SQL identifiers usable
+                // (`ORDER BY region`) without inventing a second name space.
+                .position(|header| header == name)
+                .or_else(|| {
+                    result
+                        .headers
+                        .iter()
+                        .position(|header| header.eq_ignore_ascii_case(name))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "ORDER BY names '{}', which is not an output column of this query \
+                         (output columns: {}).",
+                        name,
+                        result.headers.join(", ")
+                    )
+                })?,
+            OrderTarget::Ordinal(position) => position
+                .checked_sub(1)
+                .filter(|index| *index < result.headers.len())
+                .ok_or_else(|| {
+                    format!(
+                        "ORDER BY position {} is out of range: this query has {} output column(s).",
+                        position,
+                        result.headers.len()
+                    )
+                })?,
+        };
+        resolved.push((index, key.descending));
+    }
+
+    // `sort_by` is stable: ties keep the display order the engine produced, which is
+    // exactly the tie-break rule the plan layer uses.
+    result.rows.sort_by(|left, right| {
+        for &(index, descending) in &resolved {
+            let a = left.get(index).map(String::as_str).unwrap_or("");
+            let b = right.get(index).map(String::as_str).unwrap_or("");
+            let mut ordering = match (a.parse::<f64>(), b.parse::<f64>()) {
+                (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                _ => a.cmp(b),
+            };
+            if descending {
+                ordering = ordering.reverse();
+            }
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    Ok(())
+}
+
 fn format_result_set(rs: ResultSet) -> String {
     if rs.rows.is_empty() { return "0 rows returned.".to_string(); }
     let mut output = String::new();
@@ -947,6 +1110,136 @@ mod tests {
         let mut r = rs(2);
         apply_limit_offset(&mut r, Some(2), 10);
         assert!(r.rows.is_empty());
+    }
+
+    // --- ORDER BY ---
+
+    /// Pulls ORDER BY out of a parsed query, exactly as the SELECT branch does.
+    fn order_of(sql: &str) -> Result<Vec<OrderKey>, String> {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parses");
+        match statements.remove(0) {
+            Statement::Query(q) => parse_order_by(&q.order_by),
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_parses_a_column_a_position_and_a_direction() {
+        assert_eq!(
+            order_of("SELECT Region FROM Sales ORDER BY Region"),
+            Ok(vec![OrderKey {
+                target: OrderTarget::Column("Region".to_string()),
+                descending: false,
+            }])
+        );
+        assert_eq!(
+            order_of("SELECT Region FROM Sales ORDER BY t.Region DESC"),
+            Ok(vec![OrderKey {
+                target: OrderTarget::Column("Region".to_string()),
+                descending: true,
+            }])
+        );
+        assert_eq!(
+            order_of("SELECT Region FROM Sales ORDER BY 2 DESC"),
+            Ok(vec![OrderKey { target: OrderTarget::Ordinal(2), descending: true }])
+        );
+        // No ORDER BY means no keys, and no rows are touched.
+        assert_eq!(order_of("SELECT Region FROM Sales"), Ok(vec![]));
+    }
+
+    /// A key this front end cannot honour must be an ERROR naming it: dropping the
+    /// clause is the silent-wrong-answer bug this test exists to prevent.
+    #[test]
+    fn order_by_refuses_what_it_cannot_honour() {
+        let err = order_of("SELECT Region FROM Sales ORDER BY Region NULLS FIRST")
+            .expect_err("NULLS FIRST");
+        assert!(err.contains("NULLS"), "{err}");
+
+        let err =
+            order_of("SELECT Region FROM Sales ORDER BY Region || 'x'").expect_err("expression");
+        assert!(err.contains("ORDER BY"), "{err}");
+
+        let err = order_of("SELECT Region FROM Sales ORDER BY 0").expect_err("position 0");
+        assert!(err.contains("1-based"), "{err}");
+    }
+
+    fn result_set(headers: &[&str], rows: &[&[&str]]) -> ResultSet {
+        ResultSet {
+            headers: headers.iter().map(|h| h.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(|c| c.to_string()).collect())
+                .collect(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn order_by_sorts_numerically_and_keeps_ties_in_display_order() {
+        let rows: &[&[&str]] = &[
+            &["East", "A", "9"],
+            &["East", "B", "10"],
+            &["West", "A", "9"],
+            &["West", "B", "12"],
+        ];
+
+        // Numeric, not lexicographic: 9 before 10 ("10" < "9" as text).
+        let mut r = result_set(&["Region", "Product", "Sales"], rows);
+        apply_order_by(&mut r, &order_of("SELECT 1 ORDER BY Sales").expect("keys")).expect("sort");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec!["East", "A", "9"],
+                vec!["West", "A", "9"], // tie with the row above: display order kept
+                vec!["East", "B", "10"],
+                vec!["West", "B", "12"],
+            ]
+        );
+
+        // DESC reverses, and ties still keep display order.
+        let mut r = result_set(&["Region", "Product", "Sales"], rows);
+        apply_order_by(&mut r, &order_of("SELECT 1 ORDER BY Sales DESC").expect("keys"))
+            .expect("sort");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec!["West", "B", "12"],
+                vec!["East", "B", "10"],
+                vec!["East", "A", "9"],
+                vec!["West", "A", "9"],
+            ]
+        );
+
+        // Multiple keys: Sales DESC, then Region ASC to break the tie (East before West).
+        let mut r = result_set(&["Region", "Product", "Sales"], rows);
+        apply_order_by(
+            &mut r,
+            &order_of("SELECT 1 ORDER BY Sales DESC, Region").expect("keys"),
+        )
+        .expect("sort");
+        assert_eq!(r.rows[2], vec!["East", "A", "9"]);
+        assert_eq!(r.rows[3], vec!["West", "A", "9"]);
+    }
+
+    #[test]
+    fn order_by_resolves_output_columns_by_position_and_loudly_rejects_others() {
+        let mut r = result_set(&["Region", "Sales"], &[&["East", "10"], &["West", "20"]]);
+        apply_order_by(&mut r, &order_of("SELECT 1 ORDER BY 2 DESC").expect("keys"))
+            .expect("sort");
+        assert_eq!(r.rows[0], vec!["West", "20"]);
+
+        // An unknown column names itself AND the available output columns.
+        let mut r = result_set(&["Region", "Sales"], &[]);
+        let err = apply_order_by(&mut r, &order_of("SELECT 1 ORDER BY Nope").expect("keys"))
+            .expect_err("unknown output column");
+        assert!(err.contains("Nope"), "{err}");
+        assert!(err.contains("Region"), "the message should list the output columns: {err}");
+
+        // An out-of-range position is an error too, not a no-op.
+        let mut r = result_set(&["Region"], &[]);
+        let err = apply_order_by(&mut r, &order_of("SELECT 1 ORDER BY 3").expect("keys"))
+            .expect_err("out of range");
+        assert!(err.contains("out of range"), "{err}");
     }
 }
 

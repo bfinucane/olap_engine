@@ -51,6 +51,9 @@ const EXPECT_FAILURE: &[&str] = &[
     // Ends on the MEDIAN refusal on purpose: the fixture documents that an
     // unimplemented aggregation is a clear error, not a silent SUM.
     "aggregation_functions",
+    // Ends on the ORDER BY refusal on purpose: an unknown output column must be a
+    // loud error, not a silent drop (before the fix the whole clause was ignored).
+    "order_by_unknown_column",
 ];
 
 /// True when the caller asked us to (re)write golden files instead of comparing.

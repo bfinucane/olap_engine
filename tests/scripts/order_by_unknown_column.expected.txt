@@ -1,0 +1,13 @@
+Running script 'order_by_unknown_column.sql'...
+> CREATE TABLE T (Region STRING, M MEASURE)
+Cube 'T' created. Measure dimension: M
+
+> INSERT INTO T VALUES ('East', 'Sales', 10)
+Upserted 1 row(s) into 'T'.
+
+> INSERT INTO T VALUES ('West', 'Sales', 20)
+Upserted 1 row(s) into 'T'.
+
+> SELECT Region, Sales FROM T ORDER BY Nope
+Error: ORDER BY names 'Nope', which is not an output column of this query (output columns: Region, Sales).
+
