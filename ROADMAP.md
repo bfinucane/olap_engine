@@ -26,7 +26,7 @@ earlier structural work exists.
 
 ---
 
-## Where we are today (checked against the code, 2026-10-28)
+## Where we are today (checked against the code, 2026-10-28 — includes exact COUNTD)
 
 These are the concrete facts the plan is built around — not aspirational. This
 section is a snapshot, not a changelog: `git log` is the truth and
@@ -54,10 +54,12 @@ section is a snapshot, not a changelog: `git log` is the truth and
 * **Two query front doors.** SQL (`SELECT`/`WHERE`/`JOIN`/`LIMIT`/`OFFSET`/
   `ORDER BY`; grouping comes from the selected dimensions — a `GROUP BY` clause
   is not read) and the native plan/wire protocol (dimensions, measures, filters,
-  `orderBy`, `limit`, attribute joins). Calculated fields are evaluated from the
-  client's AST over aggregates `SUM/AVG/COUNT/MIN/MAX` plus arithmetic,
-  comparisons, `IF`, `ZN`, `IFNULL` (CALCULATIONS-DESIGN.md). MDX and calculated
-  dimension members do not exist.
+  `orderBy`, `limit`, attribute joins). Both share the aggregation set
+  `SUM/AVG/COUNT/MIN/MAX` plus exact `COUNTD` (`countDistinctExact: true`, see
+  below). Calculated fields are evaluated from the client's AST over aggregates
+  `SUM/AVG/COUNT/MIN/MAX` plus arithmetic, comparisons, `IF`, `ZN`, `IFNULL`
+  (CALCULATIONS-DESIGN.md); `COUNTD` is not available inside a formula yet. MDX
+  and calculated dimension members do not exist.
 
 ---
 
@@ -306,36 +308,44 @@ first, the first gate FAILED, and the cost was re-derived and **accepted explici
 (writes 2.7 KB / 2.8 µs, scans +33%/+20%) on the property that matters — per-write cost
 is bounded by fan-out, not by cube size. Details in `PHASE-1B-DESIGN.md`.
 
+**Done: exact `COUNTD`.** It counts distinct BASE leaf values of the measure among
+the group's non-empty cells: weights ignored (like AVG/MIN/MAX), empty group =
+absent (`null`, never 0), numeric equality exact (`0.0 == -0.0`, all NaNs one
+value, ±inf distinct), text exact and case-sensitive.
+The per-group set is allocated only for COUNTD, so the other aggregations keep
+their O(1) state. SQL accepts `COUNTD(x)` and `COUNT(DISTINCT x)` (they agree) and
+refuses DISTINCT on other aggregates; COUNTD inside a calculated-field formula is
+still refused — a documented limitation. Known pre-existing quirk, left unfixed:
+`COUNT` over a text/attribute column returns the last text, not a cell count;
+COUNTD is the supported text aggregation.
+
 **Open work** (verified against the code, 2026-10-28; ranked by user-visible value
 per unit of risk, because some items are blocked on a Plateau-facing protocol
 decision rather than on engine code):
 
-1. **COUNTD** — MISSING, M. Exact distinct count is the next slice: the protocol
-   vocabulary already lists it, so only `capabilities.aggregations` and
-   `countDistinctExact` change for the client. One set-valued accumulator on the
-   existing leaf scan; no dependency.
+1. **MEDIAN / STDEV / VAR** — MISSING, M. The non-additive aggregations still open:
+   STDEV/VAR fit a streaming (Welford) accumulator, MEDIAN needs the values per
+   group. COUNTD's per-group plumbing is now in place to share.
 2. **Temporal bucketing (`datePart` / DATE_TRUNC)** — MISSING, L. `groupBy[].datePart`
    is a protocol field and Plateau already sends it, but the engine refuses it
    ("no temporal bucketing yet"). Needs a date/truncation model, so it is
    Plateau-facing design work before it is code.
-3. **MEDIAN / STDEV / VAR** — MISSING, M. Same non-additive accumulator family as
-   COUNTD: STDEV/VAR fit a streaming (Welford) accumulator; MEDIAN needs the
-   values per group. Do after COUNTD, sharing its plumbing.
-4. **Measure-scope filters / Top-N** — MISSING, M–L. Refused with a typed error
+3. **Measure-scope filters / Top-N** — MISSING, M–L. Refused with a typed error
    today, and `capabilities.filterOperators` says so honestly; needs a
    post-aggregation pass that interacts with ordering and `limit`.
-5. **Dense (period) average** — design only, L, **blocked on a protocol decision**:
+4. **Dense (period) average** — design only, L, **blocked on a protocol decision**:
    `AGGREGATIONS-DESIGN.md` §8–8b leaves the aggregation name vs per-dimension
    denominator shape undecided, and it needs a period axis (see item 2).
-6. **LOD expressions** — MISSING by design, L, low value: `supportsLod` is
+5. **LOD expressions** — MISSING by design, L, low value: `supportsLod` is
    `false` and Plateau already computes LOD client-side, so engine support is a
    convenience, not a gap users hit today.
 
 Also verified, not ranked above: SQL `GROUP BY`/`HAVING` clauses are parsed but
 not read by the SQL front end (grouping derives from the projection) — the same
 silent-ignore class that `ORDER BY` was fixed for. Calculated fields implement the
-v1 set only (`ZN`/`IFNULL`; aggregates `SUM/AVG/COUNT/MIN/MAX`); string and date
-functions, the `ROUND` family and `CASE` are not implemented.
+v1 set only (`ZN`/`IFNULL`; aggregates `SUM/AVG/COUNT/MIN/MAX`) — `COUNTD` is a
+query aggregation, not a formula function. String and date functions, the `ROUND`
+family and `CASE` are not implemented.
 
 Client-facing changes are tracked in `WIRE-CHANGES.md`, which is the file the Plateau
 session reads first.
@@ -350,8 +360,8 @@ session reads first.
 | 1b | Versioned/MVCC storage engine | 1a | **M1–M3 done**; M4 deferred — **re-assess**: the HTTP write endpoint can create members concurrently, so the "no mutation surface" premise is only partly true (hierarchy structure is still CLI-only) |
 | 1c | Protocol + server/client split | 1a, 1b | **Done for reads and writes**: protocol v1, HTTP server and Plateau client, plus writeback (`POST /v1/{dataset}/write`, `POST /v1/save`, `supportsWrite: true`). Batch-validated, last-write-wins; no cross-request transactions or `ifVersion` (deliberate) |
 | 2 | Users, security, access limits | 1c | **S1–S5 done** (users/roles/tokens, table, dimension, write and join access). Open: S6 (sessions pin a security snapshot) and the recorded S2/S3 limits (`describe` cardinality, no `clear_rule`) |
-| 3 | Calculations | 1c, 2 | **In part**: SUM/AVG/COUNT/MIN/MAX, calculated fields over the client's AST (`ZN`/`IFNULL`). Open: COUNTD, MEDIAN/STDEV/VAR, dense average, LOD; SQL `ORDER BY` now sorts |
+| 3 | Calculations | 1c, 2 | **In part**: SUM/AVG/COUNT/MIN/MAX plus exact COUNTD (`countDistinctExact: true`; distinct base leaf values), calculated fields over the client's AST (`ZN`/`IFNULL`). Open: MEDIAN/STDEV/VAR, dense average, LOD; SQL `ORDER BY` now sorts |
 | 4 | Multidimensional syntax (MDX) | 1c, 2, 3 | Not started |
 
-Statuses were checked against the code on 2026-10-28; `WIRE-CHANGES.md` is the
-client-facing record, and `git log` is the truth.
+Statuses were checked against the code on 2026-10-28, including the exact `COUNTD`
+landing; `WIRE-CHANGES.md` is the client-facing record, and `git log` is the truth.

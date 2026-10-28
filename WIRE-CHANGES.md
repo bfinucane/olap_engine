@@ -5,10 +5,10 @@ interface, and this file is its changelog and index. `JOIN-HANDOVER.md` covers j
 detail; everything else that changed is recorded here.
 **Normative source:** `tableau-clone/docs/ENGINE-PROTOCOL.md` (theirs). Nothing here is
 normative — it is the paste-ready text to put THERE, plus what a client must do about it.
-**State:** engine HEAD `9a49cec` (2026-10-28) — `9740cf5` plus the wave-1 fixes in
-`7fc893b` (wire), `a8bb732` (http) and `9a49cec` (sql). The protocol document was last
-updated 2026-10-25, before the security and writeback work, so its paste-ready section
-below is longer than usual.
+**State:** engine HEAD `02c4347` (2026-10-28), which includes exact `COUNTD`. Wave-1 wire fixes
+landed in `7fc893b` (wire), `a8bb732` (http) and `9a49cec` (sql). The protocol document was
+last updated 2026-10-25, before the security, writeback and COUNTD work, so its paste-ready
+section below is longer than usual.
 
 ---
 
@@ -42,6 +42,11 @@ below is longer than usual.
    Plateau's `domainFor` call reads only `response.domain`, so its filter-picker path is
    unaffected; a dimension-only table/query against such a cube would show the duplicate
    rows until this is fixed.
+6. **PRE-EXISTING: `COUNT` over a TEXT cell is not a cell count.** In an attribute table the
+   accumulator treats a text cell as "last value wins", so `COUNT(<text column>)` returns the
+   last text rather than the number of cells. `COUNTD` is the supported aggregation for text
+   (exact and case-sensitive). Do not offer `COUNT` on a text-only column until this is
+   fixed.
 
 ---
 
@@ -143,6 +148,32 @@ below is longer than usual.
 > `maxRows` is INFORMATIONAL in this engine: it advertises `100000` but does not truncate
 > to it and never returns `row_limit` (see Open break 2). A client that needs a hard bound
 > must clamp its own limits.
+
+> ### §4 `capabilities` — aggregations and EXACT `COUNTD`
+>
+> This engine reports:
+>
+> ```json
+> "aggregations": ["SUM", "AVG", "COUNT", "MIN", "MAX", "COUNTD"],
+> "countDistinctExact": true
+> ```
+>
+> All six are evaluated; a name outside this list is refused with
+> `400 unsupported_aggregation`, never silently computed as another aggregation. Keep
+> reading the list at runtime: an older engine lacks `COUNTD`, so do not hardcode it.
+>
+> **`COUNTD` is EXACT — never label it an estimate.** `countDistinctExact: true` is this
+> engine's honest answer: COUNTD is the number of DISTINCT BASE LEAF VALUES of the measure
+> among the group's NON-EMPTY cells. Rollup weights are ignored (as for AVG/MIN/MAX: a
+> weight says how much a leaf contributes to a rollup, not what value it has). An empty
+> group, or a group with no cell for that measure, is `null` on the wire — never `0`.
+>
+> Equality is exact: numbers compare by value (`-0.0` folds onto `0.0`; every NaN payload
+> folds onto ONE value, so two NaNs are one distinct value; `+inf` and `-inf` are distinct;
+> nothing is rounded). Text compares exactly and case-sensitively, and a text cell never
+> equals a numeric cell. A per-group set is allocated ONLY for COUNTD, so SUM/AVG/COUNT/
+> MIN/MAX keep their fixed O(1) accumulator — COUNTD is the one that costs memory
+> proportional to the group's distinct values.
 
 > ### §4 `capabilities` — the `filterOperators` report, and its scope
 >
@@ -336,6 +367,40 @@ below is longer than usual.
 
 # Changelog (newest first)
 
+### Wave 2 (`02c4347`) — exact `COUNTD` (`countDistinctExact: true`)
+
+- **`capabilities.aggregations` is now `["SUM","AVG","COUNT","MIN","MAX","COUNTD"]`** (COUNTD
+  appended; `protocolVersion` stays 1), and **`capabilities.countDistinctExact` is `true`.**
+  The flag is honest: COUNTD is computed EXACTLY, so a client must stop labelling distinct
+  counts approximate/estimated and must not suppress the aggregation.
+- **Definition:** COUNTD = the number of DISTINCT BASE LEAF VALUES of the measure in the
+  group, over its NON-EMPTY cells. Weights are ignored (same rule as AVG/MIN/MAX). A group
+  with no cell for the measure stays the engine's `-` marker and goes on the wire as `null`,
+  never `0`.
+- **Equality:** numeric equality is exact by value — `-0.0` folds onto `0.0`, every NaN
+  payload folds onto ONE value, `±inf` are distinct, nothing is rounded. Text (attribute
+  cubes) is exact and case-sensitive, and never equal to a numeric cell.
+- **Cost:** the per-group set is allocated only for COUNTD; SUM/AVG/COUNT/MIN/MAX keep their
+  fixed O(1) accumulator.
+- **SQL front door (engine tooling, not the Plateau contract):** `COUNTD(x)` and
+  `COUNT(DISTINCT x)` both compute COUNTD and agree; `DISTINCT` on any OTHER aggregation
+  (`SUM(DISTINCT …)`) is refused with a typed error, never silently computed without it.
+- **Calculated fields:** COUNTD inside a formula is still `unsupported_expression` by name
+  (`calc.rs` untouched) — only a measure pill can ask for it, not a calculated field.
+- Pinned by `countd_counts_distinct_values_not_cells`, `countd_ignores_rollup_weights`,
+  `countd_skips_absent_cells_within_a_partial_group`,
+  `countd_numeric_equality_folds_zero_and_nan`,
+  `countd_text_values_are_exact_and_case_sensitive`,
+  `count_distinct_is_countd_not_plain_count`, `distinct_on_other_aggregations_is_refused_loudly`,
+  `countd_is_computed_exactly_through_the_plan_path`,
+  `countd_inside_a_calculated_field_is_refused_by_name`; capabilities pins updated:
+  `capabilities_section4_keys_and_honest_declarations`,
+  `capabilities_aggregations_match_what_actually_runs`,
+  `query_computes_the_advertised_aggregations_and_refuses_the_rest`. New golden fixture
+  `tests/scripts/countd.sql` (+ expected); `aggregation_functions.expected.txt` differs by one
+  line because the MEDIAN refusal message lists the implemented aggregations (COUNTD is now
+  in that list) — expected, not a weakening.
+
 ### Wave 1 (`7fc893b`, `a8bb732`, `9a49cec`) — sample encoding, honoured `domainFor`, honest `filterOperators`, serve/SQL docs
 
 - **Wire:** `sample`'s query-string values (`limit`, `offset`, `columns`) are now
@@ -487,11 +552,14 @@ belongs in Plateau, where the formula language lives.
 
 ### `6569921` / `e7c49ae` — four more aggregations, and absence becomes `null`
 
-- `capabilities.aggregations` is now `["SUM","AVG","COUNT","MIN","MAX"]`. Anything absent
-  from that list is refused with `unsupported_aggregation` — **do not offer it**.
-- **`capabilities.countDistinctExact` flipped `true` → `false`.** It was claiming an exact
-  distinct count for a `COUNTD` that never existed. If your UI read it, it should now label
-  distinct counts as unavailable (or just not offer COUNTD).
+- `capabilities.aggregations` became `["SUM","AVG","COUNT","MIN","MAX"]` at that commit.
+  Anything absent from the CURRENT list is refused with `unsupported_aggregation` — **do not
+  offer it**. (Superseded for COUNTD in wave 2: the current list appends `COUNTD`.)
+- **`capabilities.countDistinctExact` flipped `true` → `false`** at that commit: it had been
+  claiming an exact distinct count for a `COUNTD` that did not exist yet, so `false` was the
+  honest answer and a client was told to treat distinct counts as unavailable. **(Superseded
+  in wave 2 (`02c4347`): COUNTD exists and is exact, and the flag is `true` again — see
+  the newest entry.)**
 - **A measure with no cells in a group now arrives as `null`, not the string `"-"`.**
   This is a conformance fix (an absent value is not a dash), but it is the one change that
   can break a client silently: anything doing `String(cell)` or `cell.length` must handle
@@ -515,7 +583,12 @@ value is JSON `null`).
    `supportsWrite` the same way.
 2. **Handle `null` measure cells.** This is the only change here that can corrupt a display
    without an error.
-3. **Offer the aggregations you find in `aggregations`**, not a fixed list.
+3. **Offer the aggregations you find in `aggregations`**, not a fixed list. `COUNTD` is
+   implemented and EXACT on this engine (`countDistinctExact: true`) — do not label it
+   approximate and do not suppress it. A calculated-field formula still cannot use COUNTD
+   (`unsupported_expression`); only a measure pill can request it. (The engine's SQL tooling
+   agrees — `COUNTD(x)` and `COUNT(DISTINCT x)` are the same computation — but SQL is not
+   this contract.)
 4. **Calculated fields are the engine's job** if you send the AST: your parser produces
    `AstNode` already, so no work is needed on the request side — but stop computing
    expressions client-side for anything the engine accepts, or the two will disagree.

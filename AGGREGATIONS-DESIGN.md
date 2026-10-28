@@ -1,10 +1,12 @@
-# Non-additive aggregations — design proposal
+# Non-additive aggregations — design and implementation
 
-**Status:** IMPLEMENTED (M1–M3 below). Decisions 1, 2 and 4 taken; decision 3 taken as the
-honest default (COUNTD stays unimplemented, `countDistinctExact` now `false`).
-**Today:** `Capabilities::default()` advertises `["SUM", "AVG", "COUNT", "MIN", "MAX"]`, and
-`execute_plan` refuses anything else with `unsupported_aggregation` rather than returning a
-sum under an `AVG` label.
+**Status: IMPLEMENTED (M1–M3), with exact `COUNTD`.** `Capabilities::default()` advertises
+`["SUM", "AVG", "COUNT", "MIN", "MAX", "COUNTD"]` and `countDistinctExact` is `true`:
+COUNTD is exact, not an estimate. Decision 3 below is RESOLVED/superseded by the
+implementation — its "do not do it yet" recommendation was right while COUNTD did not
+exist, and the exact set it thought too costly turned out to be affordable (§0.4).
+**Today:** `execute_plan` refuses anything outside the advertised set with
+`unsupported_aggregation` rather than returning a sum under another label.
 
 ---
 
@@ -22,13 +24,31 @@ sum under an `AVG` label.
    nor filtered, so `SELECT Region, Sales` means "Product = its first member", not "all
    products". A multi-cell group in SQL therefore has to come from a hierarchy or a
    `WHERE` on a consolidated member. This surprised the first fixture written for it.
-4. **`COUNTD` remains unimplemented and `countDistinctExact` is now `false`.** It previously
-   claimed `true` for a capability that never ran, which is the kind of claim this project
-   has been careful not to make.
+4. **`COUNTD` is implemented and exact** (this supersedes decision 3, which is kept below
+   as history). It is the number of DISTINCT BASE LEAF VALUES of the measure among the
+   group's non-empty cells. The rules are fixed:
+   - **Weights ignored**: values are the stored base leaf values, the same rule as
+     AVG/MIN/MAX (decision 2).
+   - **Empties skipped**: empty cells are not values. An empty group is the engine's `-`
+     marker (wire `null`), never `0`.
+   - **Numeric equality is exact, no rounding**: `0.0 == -0.0`; every NaN counts as ONE
+     value; `+inf` and `-inf` are distinct. The set stores normalised IEEE-754 bits.
+   - **Text equality is exact and case-sensitive**: `"A"` and `"a"` are two values, and a
+     text value never equals a numeric one.
+   - **O(1) preserved for everyone else**: the per-group set is allocated only when the
+     requested aggregation IS COUNTD; SUM/AVG/COUNT/MIN/MAX keep their fixed-size state.
+   SQL accepts both `COUNTD(x)` and `COUNT(DISTINCT x)` (they agree) and refuses DISTINCT on
+   any other aggregation. COUNTD inside a calculated-field formula is still refused
+   (`calc.rs` was not extended) — a documented limitation, not a backlog item yet.
+   A **known pre-existing quirk**, left unfixed: a text cell replaces the numeric
+   accumulator, so `COUNT` over an attribute/text column returns the last text rather than a
+   cell count. COUNTD is the supported text aggregation; do not read `COUNT` of text as a
+   count.
 
 Tests: `tests/aggregation_tests.rs` (semantics below the SQL/wire layers),
 `tests/scripts/aggregation_functions.sql` (end-to-end golden, including the fractional-weight
-and absent-measure cases), and the updated `capabilities`/`wire` pins.
+and absent-measure cases), `tests/scripts/countd.sql` (COUNTD end-to-end: distinct values,
+weights ignored, `COUNT(DISTINCT x)` agreement), and the updated `capabilities`/`wire` pins.
 
 ---
 
@@ -59,21 +79,21 @@ counted", which is exactly this: base (leaf) cells, never consolidated members.
 0.5, and SUM multiplies by it. Non-additive aggregations must decide what a weight means,
 and there is no universally right answer — see decision 2.
 
-## 3. Proposed semantics
+## 3. Semantics (implemented)
 
 | Aggregation | Definition over one group's non-empty leaf cells | Empty group |
 |---|---|---|
-| `SUM` | Σ v (today, weighted) | `0` (today's behaviour, keep) |
-| `COUNT` | number of non-empty leaf cells | `0` |
+| `SUM` | Σ v (today, weighted) | `-` marker (wire `null`) |
+| `COUNT` | number of non-empty leaf cells | `-` marker (wire `null`) |
 | `AVG` | mean of the base leaf values | `null` |
 | `MIN` / `MAX` | smallest / largest base leaf value | `null` |
-| `COUNTD` | **deferred** (see decision 3) | — |
+| `COUNTD` | number of DISTINCT base leaf values (weights ignored; exact numeric/text equality, see §0.4) | `-` marker (wire `null`), never `0` |
 | `MEDIAN`, `STDEV`, `VAR` | out of scope for now: they need either two passes or all values held per group | — |
 
 "Base leaf value" means the stored `CellValue::Numeric` **before** any weight is applied.
 That is a deliberate difference from SUM on a ragged hierarchy: see decision 2.
 
-## 4. Decisions needed
+## 4. Decisions (taken; kept as the rationale)
 
 ### Decision 1 — empty cells (the question you raised)
 
@@ -117,17 +137,23 @@ member with a weight ≠ ±1. Honest, and it keeps the engine exactly additive. 
 `AVG` fails on the ragged hierarchies that are the product's distinguishing feature, so I
 do not recommend it.
 
-### Decision 3 — COUNTD
+### Decision 3 — COUNTD (RESOLVED; superseded — see §0.4)
 
-**Recommend: do not do it yet; keep `countDistinctExact` honest.**
+**Original recommendation: do not do it yet; keep `countDistinctExact` honest.** That was
+the right call *while COUNTD did not exist*: advertising an exact distinct count the engine
+could not compute is exactly the failure this project refuses. It has since been implemented
+exactly (a per-group set of base leaf values), so `countDistinctExact` is `true` again — this
+time earned. The reasoning below is kept as history, not as current state.
+
 - `COUNTD` of a dimension member is "distinct values of a column", but storage is a cube:
   it becomes "distinct coordinates of dimension D among the group's non-empty cells",
   which needs a `HashSet` per group — memory proportional to cardinality × groups, the one
-  aggregation that is not O(1) per group.
-- `capabilities.countDistinctExact` is currently `true`, and since `COUNTD` is not
-  advertised it is never exercised. If COUNTD stays unimplemented, that flag should become
-  `false`, because a client that reads it today is being told something the engine cannot
-  back up.
+  aggregation that is not O(1) per group. (Mitigated in the implementation: the set is
+  allocated ONLY for a measure whose requested aggregation is COUNTD, so the others keep
+  their fixed-size state.)
+- `capabilities.countDistinctExact` was `true` before COUNTD existed, which was the
+  inconsistency this decision named. It is `true` now because COUNTD runs, not because the
+  flag was left alone.
 
 ### Decision 4 — how "no value" travels
 
@@ -148,14 +174,18 @@ string, and a non-numeric one goes to the client as a JSON string.
    struct Acc { sum: f64, count: u64, min: f64, max: f64 }
    ```
    The loop keeps `raw` (before weighting) alongside the weighted value it already computes.
-   Four `f64`s per group per measure is the whole extra cost.
+   Four `f64`s per group per measure is the whole extra cost. COUNTD's set is the one
+   exception and is allocated only when COUNTD is the requested aggregation (§0.4).
 3. **Finalise per measure** when the row is emitted: `SUM` → `sum`, `COUNT` → `count`,
-   `AVG` → `sum(raw)/count`, `MIN`/`MAX` → the extremes or absent.
+   `AVG` → `sum(raw)/count`, `MIN`/`MAX` → the extremes or absent, `COUNTD` → the
+   distinct-set length (the set exists only for COUNTD).
 4. **`Capabilities`** advertises exactly the implemented set; the existing
    "advertised ⇒ accepted, un-advertised ⇒ refused" test keeps it honest.
 5. **Non-additive cubes** (attribute tables) are untouched: no math there today.
-6. **String cells** under an aggregation stay an error rather than being coerced —
-   `MIN` of a text column is a separate feature, not a free one.
+6. **Text cells**: the write API refuses text in an aggregating cube (it would silently
+   replace the accumulator), so text lives in attribute tables. There a text cell replaces
+   the numeric accumulator, which is the pre-existing `COUNT`-of-text quirk documented in
+   §0.4; COUNTD is the supported text aggregation.
 
 ## 6. Tests and the honest failure modes
 
@@ -170,9 +200,10 @@ string, and a non-numeric one goes to the client as a JSON string.
 
 ## 7. What this does not include
 
-`MEDIAN`, `STDEV`, `VAR` (need all values per group, or a second pass), `COUNT(*)`
-(needs a name), and `COUNTD` (decision 3). All four stay unadvertised, which keeps the
-capability list honest rather than aspirational.
+`MEDIAN`, `STDEV`, `VAR` (need all values per group, or a second pass), `COUNT(*)` (needs a
+name), and the dense/period average (§8). `COUNTD` is no longer here: it is implemented and
+advertised (§0.4). The remaining items stay unadvertised, which keeps the capability list
+honest rather than aspirational.
 
 ## 8. Deferred: averages that COUNT THE EMPTY CELLS (dense / period average)
 
