@@ -27,6 +27,8 @@
 //!   On load, and after every command in the CLI (`main.rs`). The HTTP server never
 //!   writes, so its system cubes cannot go stale between load and shutdown.
 
+use std::collections::HashSet;
+
 use crate::catalog::catalog::Catalog;
 use crate::cube::node::CellValue;
 
@@ -531,6 +533,215 @@ mod schema_tests {
         assert!(
             columns.iter().any(|r| r[0] == "Attributes" && r[1] == "Attribute" && r[3] == "measure"),
             "the attribute dimension is the measure here: {columns:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Refresh after an HTTP write (PROTOCOL §11.5)
+// ---------------------------------------------------------------------------
+
+/// Bring the derived cubes a WRITE can stale back in step, using only `&Catalog`.
+///
+/// WHAT A WRITE CAN CHANGE (and therefore what needs refresh): a write creates no cubes,
+/// dimensions or hierarchies, so `#Cubes`, `#Dimensions`, `#Hierarchies` and `#Edges` are
+/// unaffected. It CAN add members (`createMissing`) and change a column's cardinality, so
+/// `#Members` and `#Columns` are the cubes that lag — and they lag only ADDITIVELY.
+///
+/// WHY IN PLACE, NOT `rebuild()`: `rebuild` replaces cube objects, which needs `&mut Catalog`.
+/// The HTTP server deliberately holds `Arc<Catalog>` with no catalogue-wide lock (Phase 1b
+/// M3), and reads run concurrently, so replacing cubes under readers is exactly the design it
+/// removed. This function appends the missing rows and overwrites only CHANGED property cells
+/// through the cubes' own interior mutability: no catalogue structure moves, no reader is
+/// disturbed, and the writes publish new versions so caches invalidate lazily.
+///
+/// Row-level idempotence: only absent rows are written, so calling this after every batch
+/// that *could* add a member does not churn versions for existing members.
+pub fn refresh_after_write(catalog: &Catalog) {
+    refresh_members(catalog);
+    refresh_column_cardinalities(catalog);
+}
+
+/// Adds rows to `#Members` for members created since the last rebuild.
+fn refresh_members(catalog: &Catalog) {
+    let Some(members_cube) = catalog.get_cube(MEMBERS) else {
+        return;
+    };
+
+    // Snapshot the existing rows once: (dimension, hierarchy, member).
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    for (coords, _) in members_cube.store.scan_subcube(&vec![None; members_cube.dimensions.len()]) {
+        let names: Vec<String> = coords
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                members_cube.dimensions[index]
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_name(*id)
+            })
+            .collect();
+        if names.len() == 3 {
+            seen.insert((names[0].clone(), names[1].clone(), names[2].clone()));
+        }
+    }
+
+    for (dimension_name, dimension) in catalog.dimensions.iter() {
+        if is_system(dimension_name) {
+            continue;
+        }
+        let mut dim = dimension.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        dim.ensure_display_order();
+        for hierarchy in dim.hierarchy_names() {
+            let Some(hierarchy_ref) = dim.hierarchy(&hierarchy) else {
+                continue;
+            };
+            for id in hierarchy_ref.display_order().to_vec() {
+                let member = dim.get_name(id);
+                let key = (dimension_name.clone(), hierarchy.clone(), member.clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                put_existing(catalog, MEMBERS, &[dimension_name, &hierarchy, &member], "1");
+                seen.insert(key);
+            }
+        }
+    }
+}
+
+/// Overwrites the `cardinality` property of every column whose member count changed.
+fn refresh_column_cardinalities(catalog: &Catalog) {
+    let Some(columns_cube) = catalog.get_cube(COLUMNS) else {
+        return;
+    };
+
+    for cube in catalog.cubes.values() {
+        if is_system(&cube.name) {
+            continue;
+        }
+        for (index, dimension_name) in cube.dimension_names.iter().enumerate() {
+            let cardinality = cube.dimensions[index]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                .to_string();
+            let current = columns_cube.read_cell(&[&cube.name, dimension_name, "cardinality"]);
+            if matches!(&current, Some(CellValue::String(text)) if text == &cardinality) {
+                continue;
+            }
+            put_existing(
+                catalog,
+                COLUMNS,
+                &[&cube.name, dimension_name, "cardinality"],
+                &cardinality,
+            );
+        }
+    }
+}
+
+/// Writes one system-cube cell through `&Catalog` (interior mutability), bypassing the
+/// read-only guard the way the rebuild does. Only for ADDITIVE/overwrite maintenance of
+/// an existing derived cube: never creates cubes or dimensions.
+fn put_existing(catalog: &Catalog, cube_name: &str, coords: &[&str], value: &str) {
+    let Some(cube) = catalog.get_cube(cube_name) else {
+        return;
+    };
+    let ids: Vec<u32> = coords
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            cube.dimensions[index]
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .add_leaf(member)
+        })
+        .collect();
+    cube.store.write(&ids, CellValue::String(value.to_string()));
+}
+#[cfg(test)]
+mod refresh_tests {
+    //! PROTOCOL §11.5: an HTTP write's new member must reach `#Members` without a restart.
+
+    use super::*;
+    use crate::catalog::catalog::Catalog;
+
+    fn rows(catalog: &Catalog, cube_name: &str) -> Vec<Vec<String>> {
+        let cube = catalog.get_cube(cube_name).expect("system cube");
+        let mut result: Vec<Vec<String>> = cube
+            .store
+            .scan_subcube(&vec![None; cube.dimensions.len()])
+            .into_iter()
+            .map(|(coords, value)| {
+                let mut row: Vec<String> = coords
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| cube.dimensions[i].read().unwrap().get_name(*id))
+                    .collect();
+                row.push(value.to_string());
+                row
+            })
+            .collect();
+        result.sort();
+        result
+    }
+
+    #[test]
+    fn a_member_created_after_the_rebuild_appears_after_refresh() {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Sales", &["Region", "Measure"], Some("Measure"), true);
+        {
+            let cube = catalog.get_cube_mut("Sales").expect("Sales");
+            cube.write(&["East", "Sales"], CellValue::Numeric(1.0)).expect("write");
+        }
+        rebuild(&mut catalog);
+
+        // A post-rebuild member, created exactly the way `createMissing` creates one.
+        {
+            let cube = catalog.get_cube_mut("Sales").expect("Sales");
+            cube.write(&["North", "Sales"], CellValue::Numeric(2.0)).expect("write");
+        }
+        assert!(
+            !rows(&catalog, MEMBERS).iter().any(|r| r[0] == "Region" && r[2] == "North"),
+            "the member is not in #Members before the refresh"
+        );
+
+        refresh_after_write(&catalog);
+
+        assert!(
+            rows(&catalog, MEMBERS).iter().any(|r| r[0] == "Region" && r[2] == "North"),
+            "the new member must appear in #Members: {:?}",
+            rows(&catalog, MEMBERS)
+        );
+        assert!(
+            rows(&catalog, COLUMNS).iter().any(|r| {
+                r[0] == "Sales" && r[1] == "Region" && r[2] == "cardinality" && r[3] == "2"
+            }),
+            "Region's cardinality must be refreshed to 2: {:?}",
+            rows(&catalog, COLUMNS)
+        );
+    }
+
+    #[test]
+    fn the_refresh_is_idempotent() {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("Sales", &["Region", "Measure"], Some("Measure"), true);
+        {
+            let cube = catalog.get_cube_mut("Sales").expect("Sales");
+            cube.write(&["East", "Sales"], CellValue::Numeric(1.0)).expect("write");
+        }
+        rebuild(&mut catalog);
+        {
+            let cube = catalog.get_cube_mut("Sales").expect("Sales");
+            cube.write(&["North", "Sales"], CellValue::Numeric(2.0)).expect("write");
+        }
+
+        refresh_after_write(&catalog);
+        let members_after_first = rows(&catalog, MEMBERS).len();
+        refresh_after_write(&catalog);
+        assert_eq!(
+            rows(&catalog, MEMBERS).len(),
+            members_after_first,
+            "a second refresh must not duplicate rows"
         );
     }
 }

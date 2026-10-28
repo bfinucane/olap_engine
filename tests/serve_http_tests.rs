@@ -1796,3 +1796,35 @@ fn saving_requires_the_admin_role() {
     assert_eq!(resp.status, 403, "{}", resp.body);
     assert_eq!(resp.code(), "forbidden");
 }
+/// PROTOCOL §11.5: a member created by an HTTP write must be visible in `#Members` without a
+/// restart. The refresh is additive and in place, so a concurrent reader sees no torn state.
+#[test]
+fn a_member_created_by_a_write_appears_in_the_system_cubes() {
+    let srv = rich_server(&[("admin", "adminpw", &["admin"])], &[]);
+    let token = token_for(&srv, "admin", "adminpw");
+
+    let body = r#"{"cells":[{"coords":{"Region":"East","Product":"Gizmo","Measure":"Sales"},"value":1}],
+                    "createMissing":true}"#;
+    let write = request_with_auth(
+        "POST",
+        &format!("{}/v1/Sales/write", srv.base),
+        Some(body),
+        Some(&token),
+    );
+    assert_eq!(write.status, 200, "write failed: {}", write.body);
+
+    let query = r##"{"dataset":"#Members","groupBy":[{"name":"#Member"}],
+                    "filters":[{"field":"#Dimension","operator":"in","values":["Product"]}]}"##;
+    let members = request_with_auth(
+        "POST",
+        &format!("{}/v1/%23Members/query", srv.base),
+        Some(query),
+        Some(&token),
+    );
+    assert_eq!(members.status, 200, "{}", members.body);
+    let rows = members.json()["rows"].as_array().cloned().unwrap_or_default();
+    assert!(
+        rows.iter().any(|row| row[0] == serde_json::json!("Gizmo")),
+        "a member created by a write must appear in #Members without a restart: {rows:?}"
+    );
+}

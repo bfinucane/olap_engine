@@ -121,6 +121,33 @@ run it before any wire commit).
 
 # Changelog (newest first)
 
+### Wave 4 — PROTOCOL §11.4 and §11.5 closed (engine/database session)
+
+#### §11.4 — measures + the measure-dimension axis are refused
+
+A request that groups by a cube's **measure dimension** *and* requests measures (explicitly,
+or via the `value` expansion) is now **`400 invalid_argument`**, message starting *"Cannot
+select both measure dimension and specific measures."* — the wording the SQL front end has
+always used. Previously the plan/wire path rendered the axis column as an empty string beside
+the pivoted measures: a malformed row that looked like data.
+
+- Narrow: only measure-dimension axis **with** measures. A measure-dimension axis with **no**
+  measures keeps its pre-existing shape (§11.8 duplication).
+- A client that sent this was already non-conformant (PROTOCOL §11.4 "MUST NOT"); no
+  `protocolVersion` bump and no new field.
+
+#### §11.5 — `#` cubes refresh after an HTTP write
+
+`POST /v1/{dataset}/write` with `"createMissing": true` now refreshes the derived cubes a
+write can stale — a member created by the write appears in `#Members` immediately and
+`#Columns` cardinality is updated, with **no server restart**.
+
+- Scoped: a write cannot create cubes/dimensions/hierarchies, so `#Cubes`, `#Dimensions`,
+  `#Hierarchies`, `#Edges` need nothing; only `#Members`/`#Columns` can lag.
+- In place and additive: no catalogue-wide lock (Phase 1b M3 preserved), no torn reads, no
+  duplicate rows on repeat; writes publish new versions so caches invalidate lazily.
+- Reads of **user** cubes were never stale; this closes the metadata gap.
+- Contract change request: `contract/handoffs/005-engine-11-4-11-5-fixes.md`.
 ### Uncommitted (wave 3, HEAD `ae5e2c9`) — this file is now the engine-side change feed
 
 - **Docs only; no wire change.** `WIRE-CHANGES.md` no longer claims to be normative or

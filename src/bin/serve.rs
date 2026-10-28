@@ -976,6 +976,12 @@ fn route(
                     code: e.code,
                     message: e.message,
                 })?;
+            // PROTOCOL §11.5: a member created by this batch must appear in `#Members`
+            // without a restart. Only `createMissing` can add members, and the refresh is
+            // additive and in place (no catalogue lock), so it runs only where it can matter.
+            if create_missing {
+                olap_engine::catalog::system_cubes::refresh_after_write(shared);
+            }
             Ok((200, serde_json::to_value(resp).unwrap()))
         }
         ("GET", _) | ("POST", _) => Err(WireError {

@@ -2168,3 +2168,41 @@ fn a_denied_member_is_excluded_even_when_it_is_not_the_axis() {
     let products: Vec<Value> = resp.rows.iter().map(|row| row[0].clone()).collect();
     assert!(!products.is_empty(), "there must still be visible rows");
 }
+
+/// PROTOCOL §11.4: the measure dimension as a `groupBy` axis WHILE measures are requested is
+/// malformed (the pivot would leave an empty axis column). It is refused with the same typed
+/// error the SQL front end gives; a measure axis with NO measures stays allowed.
+#[test]
+fn measures_plus_the_measure_dimension_axis_are_refused() {
+    let mut catalog = build_catalog();
+    let measure_axis = || serde_json::from_value(json!({"name": "Measure"})).expect("GroupBy");
+
+    // Explicit measure + measure-dimension axis.
+    let mut explicit = request("Sales");
+    measure(&mut explicit, "Sales", "SUM");
+    explicit.group_by = vec![measure_axis()];
+    let err = wire::query(&mut catalog, &explicit).expect_err("must be refused");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("Cannot select both measure dimension and specific measures"),
+        "{}",
+        err.message
+    );
+
+    // `value` expands into measures, so the same combination is refused.
+    let mut implicit = request("Sales");
+    implicit.group_by = vec![measure_axis()];
+    implicit
+        .measures
+        .push(serde_json::from_value(json!({"name": "value"})).expect("Measure"));
+    let err = wire::query(&mut catalog, &implicit).expect_err("must be refused");
+    assert_eq!(err.code, "invalid_argument");
+
+    // A measure-dimension axis with NO measures is the pre-existing shape and stays allowed.
+    let mut axis_only = request("Sales");
+    axis_only.group_by = vec![measure_axis()];
+    assert!(
+        wire::query(&mut catalog, &axis_only).is_ok(),
+        "a measure axis without measures must stay allowed"
+    );
+}

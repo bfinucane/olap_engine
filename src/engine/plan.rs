@@ -1007,6 +1007,23 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
         }
     }
 
+    // PROTOCOL §11.4: the measure dimension as an AXIS while measures are also requested is
+    // malformed. The slice pivots the requested measures into columns, so a measure-dimension
+    // axis would be rendered as an empty string beside them — a row that looks like data and
+    // is not. The SQL front end has always refused this combination; the plan path now gives
+    // the same typed refusal instead of emitting the malformed row. A measure-dimension axis
+    // with NO measures is allowed (it is the pre-existing grouped-no-measures shape, §11.8).
+    if let Some(measure_dimension) = &cube.measure_dimension
+        && !requested_measures.is_empty()
+        && axes.iter().any(|axis| axis == measure_dimension)
+    {
+        return Err(PlanError::InvalidArgument(format!(
+            "Cannot select both measure dimension and specific measures. Send '{}' as an axis \
+             with no measures, or request measures without '{}' as an axis.",
+            measure_dimension, measure_dimension
+        )));
+    }
+
     // Dimension-scope filters become the slice's WHERE. Measure-scope filters
     // are rejected earlier (top/bottom) or, for now, unsupported.
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
