@@ -669,6 +669,34 @@ impl Dimension {
         h.print_tree(id, &display, 0, current_weight, out);
     }
 
+    /// Restores the display casing of members whose original spelling a LEGACY SAVE lost.
+    ///
+    /// WHY: `Hierarchy::display_names` postdates the first saved catalogues. It is
+    /// `#[serde(default)]`, so a file written before it deserialises with an EMPTY map, and
+    /// `Hierarchy::member_name` falls back to the lowercased lookup key. A legacy file then
+    /// lists `bookcases`/`office supplies` while its own leaf bank and `domainFor` say
+    /// `Bookcases`/`Office Supplies` - two casings for one identity, which the wire contract
+    /// forbids. This does NOT invent casing: the dimension's canonical leaf bank always wins
+    /// (`Bookcases`), and only ids the bank does not know are title-cased from the key
+    /// (`office supplies` -> `Office Supplies`), which is exactly the convention the seeded
+    /// model uses. Idempotent: once a display name exists it is never overwritten.
+    pub fn repair_legacy_casing(&mut self) {
+        // Recover ONLY casing that canonically exists: the dimension's leaf bank. Never invent a
+        // spelling - a name that is legitimately lowercase (`r-1`) must stay exactly as
+        // registered, and an aggregate whose original casing a legacy save dropped is left
+        // alone (that needs an explicit data migration, not a guess in the read path).
+        for hierarchy in self.hierarchies.values_mut() {
+            let missing = hierarchy.members_without_display_name();
+            for (id, key) in missing {
+                let Some(canonical) = self.leaf_id_to_name.get(&id).cloned() else {
+                    continue;
+                };
+                if canonical != key {
+                    hierarchy.set_display_name(id, canonical);
+                }
+            }
+        }
+    }
     /// The current depth-first display order of a hierarchy as member names.
     pub fn member_order_names_in(&mut self, hier: Option<&str>) -> Vec<String> {
         let Some(h) = self.resolve_hierarchy_mut(hier) else {
@@ -715,5 +743,33 @@ impl Dimension {
     /// Returns the member type (Leaf / Consolidated) for a raw member id.
     pub fn member_type(&self, id: u32) -> Option<MemberType> {
         self.member_types.get(&id).cloned()
+    }
+}
+#[cfg(test)]
+mod legacy_casing_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_display_names_are_repaired_from_the_leaf_bank_or_title_case() {
+        let mut dim = Dimension::new("Product");
+        let leaf = dim.add_leaf("Bookcases");
+        // A legacy file: the hierarchy knew the lowercased keys but its display names are gone.
+        {
+            let h = dim.hierarchies.get_mut("product").expect("default hierarchy");
+            h.register_aggregate("Office Supplies", 90);
+            h.register_aggregate("All", 91);
+            h.forget_display_names_for_test();
+        }
+        assert_eq!(dim.get_name(leaf), "Bookcases", "leaf bank keeps canonical casing");
+
+        dim.repair_legacy_casing();
+
+        assert_eq!(dim.get_name(leaf), "Bookcases");
+        // No canonical spelling exists for an aggregate a legacy save lost: it is NOT guessed.
+        assert_eq!(dim.get_name(90), "office supplies", "never invented in the read path");
+        assert_eq!(dim.get_name(91), "all");
+        // Idempotent: a second repair must not change anything.
+        dim.repair_legacy_casing();
+        assert_eq!(dim.get_name(90), "office supplies");
     }
 }

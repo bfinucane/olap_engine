@@ -87,6 +87,21 @@ impl Hierarchy {
             .map(|(k, _)| k.as_str())
     }
 
+    /// Members whose display casing is UNKNOWN because a legacy save predates
+    /// `display_names` (deserialised empty). Returns (id, lowercased key) pairs;
+    /// the dimension re-cases them from its canonical bank or a title-case rule.
+    pub(crate) fn members_without_display_name(&self) -> Vec<(u32, String)> {
+        self.member_to_id
+            .iter()
+            .filter(|(_, id)| !self.display_names.contains_key(id))
+            .map(|(key, id)| (*id, key.clone()))
+            .collect()
+    }
+
+    /// Records the restored display name for an id (used only by the repair).
+    pub(crate) fn set_display_name(&mut self, id: u32, name: String) {
+        self.display_names.insert(id, name);
+    }
     /// The display name registered in this hierarchy for an id, if any.
     pub fn display_name_of(&self, id: u32) -> Option<&str> {
         self.display_names.get(&id).map(|s| s.as_str())
@@ -435,4 +450,10 @@ impl Hierarchy {
             }
         }
     }
+    /// TEST ONLY: simulate a save written before `display_names` existed.
+    #[cfg(test)]
+    pub(crate) fn forget_display_names_for_test(&mut self) {
+        self.display_names.clear();
+    }
 }
+

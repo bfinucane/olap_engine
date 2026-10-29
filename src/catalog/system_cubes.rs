@@ -112,6 +112,9 @@ pub fn rebuild(catalog: &mut Catalog) {
         if is_system(name) {
             continue;
         }        let mut dim = dimension.write().unwrap_or_else(|e| e.into_inner());
+        // Legacy saves lost member display casing (display_names postdates them); restore it
+        // BEFORE reading names, so #Members/#Edges agree with describe/query/domainFor.
+        dim.repair_legacy_casing();
         // `registered_ids()` lists only members the hierarchy has a NAME for; a
         // consolidated parent can live in the consolidation map alone, so iterating it
         // skipped every parent and produced an empty edge table. `display_order()` covers
@@ -742,6 +745,59 @@ mod refresh_tests {
             rows(&catalog, MEMBERS).len(),
             members_after_first,
             "a second refresh must not duplicate rows"
+        );
+    }
+}
+#[cfg(test)]
+mod legacy_casing_tests {
+    use super::*;
+    use crate::catalog::catalog::Catalog;
+
+    fn members(catalog: &Catalog, dimension: &str) -> Vec<String> {
+        let cube = catalog.get_cube(MEMBERS).expect("#Members");
+        cube.store
+            .scan_subcube(&vec![None; cube.dimensions.len()])
+            .into_iter()
+            .filter_map(|(coords, _)| {
+                let names: Vec<String> = coords
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| cube.dimensions[i].read().unwrap().get_name(*id))
+                    .collect();
+                (names[0] == dimension).then_some(names[2].clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rebuild_repairs_casing_lost_by_a_legacy_save() {
+        let mut catalog = Catalog::new();
+        catalog.add_cube("ProductClass", &["Product", "Measure"], Some("Measure"), true);
+        {
+            let cube = catalog.get_cube_mut("ProductClass").expect("cube");
+            cube.write(&["Furniture", "Sales"], CellValue::Numeric(1.0)).expect("write");
+            cube.write(&["Bookcases", "Sales"], CellValue::Numeric(2.0)).expect("write");
+        }
+        rebuild(&mut catalog);
+
+        // Simulate the legacy file: every hierarchy lost its display names.
+        for dim in catalog.dimensions.values() {
+            let mut dim = dim.write().unwrap();
+            for name in dim.hierarchy_names() {
+                if let Some(h) = dim.hierarchy_mut(&name) {
+                    h.forget_display_names_for_test();
+                }
+            }
+        }
+
+        rebuild(&mut catalog);
+
+        let listed = members(&catalog, "Product");
+        assert!(listed.contains(&"Bookcases".to_string()), "{listed:?}");
+        assert!(listed.contains(&"Furniture".to_string()), "{listed:?}");
+        assert!(
+            !listed.iter().any(|m| m == "bookcases" || m == "furniture"),
+            "repaired names must not be the raw lowercased keys: {listed:?}"
         );
     }
 }
