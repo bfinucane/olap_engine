@@ -3,3 +3,5 @@ database.json
 database.bin
 *.csv
 database.dev.bin
+# Development credentials (created by start-engine.ps1 on first run; never commit)
+security.json
