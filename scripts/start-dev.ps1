@@ -1,4 +1,4 @@
-<#
+﻿<#
   DEVELOPMENT engine launcher (D13/D14 isolation shape).
 
   This is the engine session's own instance:
@@ -86,7 +86,12 @@ if ($Fresh -or -not (Test-Path $DevDb)) {
 }
 
 if (-not $NoStart -and -not $Anonymous) {
-  [void](New-DevelopmentAdmin -Server $DevExe -SecurityFile $DevSec)
+  $created = New-DevelopmentAdmin -Server $DevExe -SecurityFile $DevSec
+  if ($created) {
+    Write-Host "  The credentials above are shown ONCE. Press Enter once you have stored them." -ForegroundColor Yellow
+    Write-Host "  To replace a lost password, stop the server, delete dev-work\security.json, restart." -ForegroundColor Yellow
+    [void](Read-Host)
+  }
 }
 
 $args = @('--bind', "${Bind}:${Port}", '--db', $DevDb, '--security', $DevSec)

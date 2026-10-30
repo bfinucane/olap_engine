@@ -1,4 +1,4 @@
-<#
+﻿<#
   SHARED engine launcher (contract handoff 009 / ruling D14).
 
   Serves the FROZEN pair and never builds:
@@ -71,7 +71,13 @@ if ($Fresh -or -not (Test-Path $RunningDb)) {
 }
 
 if (-not $NoStart -and -not $Anonymous) {
-  [void](New-DevelopmentAdmin -Server $SharedExe -SecurityFile $RunningSec)
+  $created = New-DevelopmentAdmin -Server $SharedExe -SecurityFile $RunningSec
+  if ($created) {
+    Write-Host "  The credentials above are shown ONCE. Press Enter once you have stored them;" -ForegroundColor Yellow
+    Write-Host "  the window will then start the server and stay open. To replace a lost password," -ForegroundColor Yellow
+    Write-Host "  stop the server, delete shared\running\security.json, and start again." -ForegroundColor Yellow
+    [void](Read-Host)
+  }
 }
 
 $args = @('--bind', "${Bind}:${Port}", '--db', $RunningDb, '--security', $RunningSec)
