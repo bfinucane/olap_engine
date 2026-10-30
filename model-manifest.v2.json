@@ -1,0 +1,175 @@
+﻿{
+    "modelName":  "Superstore line items",
+    "modelVersion":  "v2",
+    "definedAt":  "2026-10-30",
+    "engine":  {
+                   "packageVersion":  "0.1.0",
+                   "commit":  "e9bb2b4",
+                   "protocolVersion":  1,
+                   "storageFormatVersion":  1
+               },
+    "contract":  "v1",
+    "source":  {
+                   "file":  "examples/Plateau/superstore-raw.csv",
+                   "rows":  5560,
+                   "columns":  21,
+                   "grain":  "one row per order line item"
+               },
+    "seed":  "examples/superstore-v2.sql",
+    "file":  {
+                 "size":  5177295,
+                 "sha256":  "4F4F15969209CEC4B746FD607237F4F2D2033D7F077714164332F5197F802BCB",
+                 "contentFingerprint":  "E9423ED713438316C293EC2D58780915BFC14C15013964F548D03BDCBBFDB908"
+             },
+    "datasets":  [
+                     {
+                         "name":  "Orders",
+                         "kind":  "transactional",
+                         "measureDimension":  "Measure",
+                         "lineItems":  5560,
+                         "rowCount":  22240,
+                         "columns":  [
+                                         {
+                                             "name":  "Row ID",
+                                             "kind":  "dimension",
+                                             "cardinality":  5560
+                                         },
+                                         {
+                                             "name":  "Order ID",
+                                             "kind":  "dimension",
+                                             "cardinality":  1600
+                                         },
+                                         {
+                                             "name":  "Order Date",
+                                             "kind":  "dimension",
+                                             "cardinality":  929
+                                         },
+                                         {
+                                             "name":  "Ship Date",
+                                             "kind":  "dimension",
+                                             "cardinality":  975
+                                         },
+                                         {
+                                             "name":  "Ship Mode",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Customer ID",
+                                             "kind":  "dimension",
+                                             "cardinality":  695
+                                         },
+                                         {
+                                             "name":  "Customer Name",
+                                             "kind":  "dimension",
+                                             "cardinality":  415
+                                         },
+                                         {
+                                             "name":  "Segment",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "Country",
+                                             "kind":  "dimension",
+                                             "cardinality":  1
+                                         },
+                                         {
+                                             "name":  "City",
+                                             "kind":  "dimension",
+                                             "cardinality":  24
+                                         },
+                                         {
+                                             "name":  "State",
+                                             "kind":  "dimension",
+                                             "cardinality":  24
+                                         },
+                                         {
+                                             "name":  "Postal Code",
+                                             "kind":  "dimension",
+                                             "cardinality":  1584
+                                         },
+                                         {
+                                             "name":  "Region",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Product ID",
+                                             "kind":  "dimension",
+                                             "cardinality":  5560
+                                         },
+                                         {
+                                             "name":  "Category",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "Sub-Category",
+                                             "kind":  "dimension",
+                                             "cardinality":  16
+                                         },
+                                         {
+                                             "name":  "Product Name",
+                                             "kind":  "dimension",
+                                             "cardinality":  30
+                                         },
+                                         {
+                                             "name":  "Order Priority",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Measure",
+                                             "kind":  "measure",
+                                             "cardinality":  4
+                                         }
+                                     ]
+                     }
+                 ],
+    "systemCubes":  [
+                        "#Cubes",
+                        "#Dimensions",
+                        "#Hierarchies",
+                        "#Members",
+                        "#Edges",
+                        "#Columns",
+                        "#TableSecurity",
+                        "#DimensionSecurity"
+                    ],
+    "checks":  {
+                   "totals":  {
+                                  "Sales":  26763427.43,
+                                  "Profit":  1190153.82,
+                                  "Quantity":  22450,
+                                  "Discount":  520
+                              },
+                   "byRegion":  {
+                                    "Central":  {
+                                                    "Sales":  6436941.57,
+                                                    "Profit":  356587.93,
+                                                    "Quantity":  5643
+                                                },
+                                    "East":  {
+                                                 "Sales":  6319711.15,
+                                                 "Profit":  261155.47,
+                                                 "Quantity":  5330
+                                             },
+                                    "South":  {
+                                                  "Sales":  6441942.55,
+                                                  "Profit":  334630.96,
+                                                  "Quantity":  5731
+                                              },
+                                    "West":  {
+                                                 "Sales":  7564832.16,
+                                                 "Profit":  237779.46,
+                                                 "Quantity":  5746
+                                             }
+                                },
+                   "lineItems":  {
+                                     "filterField":  "Measure",
+                                     "filterValue":  "Sales",
+                                     "expected":  5560
+                                 }
+               }
+}
