@@ -9,6 +9,144 @@ use olap_engine::catalog::catalog::Catalog;
 use olap_engine::cube::node::CellValue;
 use olap_engine::engine::sql::execute_sql;
 
+
+/// Imports a WIDE raw CSV — several numeric measure columns — into a measure-dimension cube.
+///
+/// WHY: `.import` reads ONE trailing numeric value, because a cube normally stores one value
+/// per cell. Real source files are wide: `examples/Plateau/superstore-raw.csv` has dimensions
+/// (order, dates, geography, product, customer...) plus FOUR measures (Sales, Quantity,
+/// Discount, Profit) on the same row. Splitting such a file into one CSV per measure would
+/// duplicate every dimension column and let the copies drift; this command keeps the raw file
+/// as the single source.
+///
+/// SHAPE: every non-measure column becomes a dimension (in header order, nothing dropped), and
+/// the cube gets a `Measure` dimension whose members are the given column names. Each CSV row
+/// becomes one cell per measure. Validation happens on a full read BEFORE the cube is created,
+/// so a bad row cannot leave a half-imported cube behind.
+fn import_measures(
+    catalog: &mut Catalog,
+    path: &str,
+    cube_name: &str,
+    measures: &[String],
+) -> Result<String, String> {
+    if measures.is_empty() {
+        return Err("no measure columns were given".to_string());
+    }
+    if !Path::new(path).exists() {
+        return Err(format!("Could not open '{}'.", path));
+    }
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(path)
+        .map_err(|e| format!("Could not read '{}': {}", path, e))?;
+    let headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| format!("Could not read the header of '{}': {}", path, e))?
+        .iter()
+        .map(|h| h.trim().trim_start_matches('\u{feff}').to_string())
+        .collect();
+
+    // Locate the measure columns by name. Case-insensitive so a CSV exported from another
+    // tool still works, but the resulting Measure members keep the CSV's own spelling.
+    let mut measure_idx: Vec<usize> = Vec::new();
+    let mut measure_members: Vec<String> = Vec::new();
+    for wanted in measures {
+        let Some(index) = headers.iter().position(|h| h.eq_ignore_ascii_case(wanted)) else {
+            return Err(format!(
+                "measure column '{}' is not in '{}' (header: {})",
+                wanted,
+                path,
+                headers.join(", ")
+            ));
+        };
+        if measure_idx.contains(&index) {
+            return Err(format!("measure column '{}' is listed twice", wanted));
+        }
+        measure_idx.push(index);
+        measure_members.push(headers[index].clone());
+    }
+
+    let dim_idx: Vec<usize> = (0..headers.len())
+        .filter(|index| !measure_idx.contains(index))
+        .collect();
+    let dim_names: Vec<String> = dim_idx.iter().map(|&index| headers[index].clone()).collect();
+    if dim_names.is_empty() {
+        return Err("the CSV has no dimension columns".to_string());
+    }
+    for (i, name) in dim_names.iter().enumerate() {
+        if dim_names[..i].iter().any(|earlier| earlier.eq_ignore_ascii_case(name)) {
+            return Err(format!("dimension column '{}' appears twice", name));
+        }
+    }
+
+    // Validate every row first: measure cells must be finite numbers.
+    let mut rows: Vec<(Vec<String>, Vec<f64>)> = Vec::new();
+    for (row_number, record) in rdr.records().enumerate() {
+        let record = record.map_err(|e| format!("row {}: {}", row_number + 2, e))?;
+        let mut coordinates: Vec<String> = Vec::with_capacity(dim_names.len());
+        for &index in &dim_idx {
+            coordinates.push(record.get(index).unwrap_or("").to_string());
+        }
+        let mut values: Vec<f64> = Vec::with_capacity(measure_members.len());
+        for (m, &index) in measure_idx.iter().enumerate() {
+            let raw = record.get(index).unwrap_or("").trim();
+            let parsed: f64 = raw.parse().map_err(|_| {
+                format!(
+                    "row {}: measure '{}' has value '{}', which is not a number",
+                    row_number + 2,
+                    measure_members[m],
+                    raw
+                )
+            })?;
+            if !parsed.is_finite() {
+                return Err(format!(
+                    "row {}: measure '{}' has a non-finite value",
+                    row_number + 2,
+                    measure_members[m]
+                ));
+            }
+            values.push(parsed);
+        }
+        rows.push((coordinates, values));
+    }
+    if rows.is_empty() {
+        return Err(format!("'{}' has a header but no data rows", path));
+    }
+
+    if catalog.get_cube(cube_name).is_some() {
+        return Err(format!(
+            "cube '{}' already exists; .import_measures creates the cube from the CSV header, so choose a new name",
+            cube_name
+        ));
+    }
+    let mut all_dimensions: Vec<&str> = dim_names.iter().map(String::as_str).collect();
+    all_dimensions.push("Measure");
+    catalog.add_cube(cube_name, &all_dimensions, Some("Measure"), true);
+
+    let cube = catalog
+        .get_cube_mut(cube_name)
+        .ok_or_else(|| format!("cube '{}' could not be created", cube_name))?;
+    let mut written = 0usize;
+    for (coordinates, values) in &rows {
+        for (measure, value) in measure_members.iter().zip(values) {
+            let mut key: Vec<&str> = coordinates.iter().map(String::as_str).collect();
+            key.push(measure.as_str());
+            cube.write(&key, CellValue::Numeric(*value))
+                .map_err(|reason| format!("row {}: {}", written / measure_members.len() + 2, reason))?;
+            written += 1;
+        }
+    }
+
+    Ok(format!(
+        "Imported {} rows x {} measures into '{}' ({} dimension columns + Measure; {} cells).",
+        rows.len(),
+        measure_members.len(),
+        cube_name,
+        dim_names.len(),
+        written
+    ))
+}
 /// Parsed command-line arguments for the batch (headless) mode.
 struct CliArgs {
     /// The script to run non-interactively. `None` means "start the REPL".
@@ -276,7 +414,8 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                 let _ = writeln!(out, "  .dimensions                  - List all dimensions and their hierarchies");
                 let _ = writeln!(out, "  Startup: --db <file>          - Use this database file instead of .\\\\database.bin");
                 let _ = writeln!(out, "  .create_hierarchy <dim> <h>  - Create a hierarchy inside a dimension");
-                let _ = writeln!(out, "  .import <file.csv> <cube>    - Import numeric data from CSV");
+                let _ = writeln!(out, "  .import <file.csv> <cube>    - Import numeric data from CSV
+  .import_measures <file.csv> <cube> <M1,M2,...> - Import a wide raw CSV into a measure-dimension cube");
                 let _ = writeln!(out, "  .import_attr <file.csv> <cube> - Import STRING attributes (key..., attr, value)");
                 let _ = writeln!(out, "  .rollup <hier> <p> <c> <wt>  - Create parent/child hierarchy relation");
                 let _ = writeln!(out, "  .detach <hier> <p> <c>       - Remove a parent/child hierarchy relation");
@@ -447,7 +586,31 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                     ok = false;
                 }
             }
-                                    // IMPORT an ATTRIBUTE file (string-valued).
+                                    // IMPORT a WIDE raw CSV: several numeric measure columns in ONE row.
+            //
+            // `.import` reads one trailing value column; this reads N named measure columns
+            // and keeps every other column as a dimension. Use it for raw source files (the
+            // Superstore line items) so the file stays the single source of truth.
+            ".import_measures" => {
+                if parts.len() == 4 {
+                    let measures: Vec<String> = parts[3]
+                        .split(',')
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    match import_measures(catalog, parts[1], parts[2], &measures) {
+                        Ok(message) => { let _ = writeln!(out, "{}", message); }
+                        Err(reason) => {
+                            let _ = writeln!(out, "Import failed: {}", reason);
+                            ok = false;
+                        }
+                    }
+                } else {
+                    let _ = writeln!(out, "Usage: .import_measures <file.csv> <cube> <Measure1,Measure2,...>");
+                    ok = false;
+                }
+            }
+            // IMPORT an ATTRIBUTE file (string-valued).
             //
             // `.import` treats EVERY dimension as a coordinate and reads one
             // trailing NUMERIC value column. A string attribute cube is shaped
@@ -1004,4 +1167,36 @@ fn run_script(catalog: &mut Catalog, filepath: &str, out: &mut String, db_path: 
 
     let _ = writeln!(out, "Script finished. Executed {} commands in {:?}.", line_count, script_start.elapsed());
     all_ok
+}
+
+#[cfg(test)]
+mod import_measures_tests {
+    use super::*;
+
+    #[test]
+    fn imports_a_wide_csv_into_a_measure_dimension_cube() {
+        let path = std::env::temp_dir().join(format!("olap-wide-{}.csv", std::process::id()));
+        std::fs::write(
+            &path,
+            "Region,City,Sales,Profit\nEast,Boston,10.5,2.5\nWest,Seattle,4.0,1.0\n",
+        )
+        .expect("write fixture");
+        let mut catalog = Catalog::new();
+        let message = import_measures(
+            &mut catalog,
+            path.to_str().expect("path"),
+            "Orders",
+            &["Sales".to_string(), "Profit".to_string()],
+        )
+        .expect("import must succeed");
+        std::fs::remove_file(&path).ok();
+
+        assert!(message.contains("2 rows x 2 measures"), "{message}");
+        let cube = catalog.get_cube("Orders").expect("cube exists");
+        assert_eq!(cube.dimension_names, vec!["Region", "City", "Measure"]);
+        assert_eq!(cube.measure_dimension.as_deref(), Some("Measure"));
+        // One cell per row per measure: 2 rows x 2 measures.
+        let cells = cube.store.scan_subcube(&vec![None; cube.dimensions.len()]);
+        assert_eq!(cells.len(), 4, "cells: {cells:?}");
+    }
 }
