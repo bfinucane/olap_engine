@@ -1,0 +1,200 @@
+﻿{
+    "modelName":  "Plateau default (seeded superstore)",
+    "modelVersion":  "v1",
+    "definedAt":  "2026-10-30",
+    "engine":  {
+                   "packageVersion":  "0.1.0",
+                   "commit":  "bbaecc1",
+                   "protocolVersion":  1,
+                   "storageFormatVersion":  1
+               },
+    "contract":  "v1",
+    "file":  {
+                 "size":  42978,
+                 "sha256":  "F389C30E97EFBAF6DA6A97673A75C0F51AAC7AB385A6B9EC7091E98DFD4104F0",
+                 "contentFingerprint":  "E53819FB218FA9DD801347686FBDD944B123ED87AAA8A068DE2E4066B753707E"
+             },
+    "regeneration":  {
+                         "command":  "target\\debug\\olap_engine.exe --db \u003cscratch\u003e.bin examples\\Plateau\\seed.sql",
+                         "cwd":  "Patricia/olap_engine",
+                         "note":  "A seed run ends with .save. Bytes are NOT reproducible (bincode/HashMap order); the content fingerprint is. The file SHA-256 pins the exact frozen artefact."
+                     },
+    "datasets":  [
+                     {
+                         "name":  "Sales",
+                         "kind":  "transactional",
+                         "measureDimension":  null,
+                         "rowCount":  36,
+                         "columns":  [
+                                         {
+                                             "name":  "Region",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Segment",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "Category",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "value",
+                                             "kind":  "measure",
+                                             "cardinality":  36
+                                         }
+                                     ]
+                     },
+                     {
+                         "name":  "Pivot",
+                         "kind":  "transactional",
+                         "measureDimension":  null,
+                         "rowCount":  36,
+                         "columns":  [
+                                         {
+                                             "name":  "Region",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Category",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "Measure",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "value",
+                                             "kind":  "measure",
+                                             "cardinality":  36
+                                         }
+                                     ]
+                     },
+                     {
+                         "name":  "CostCentre",
+                         "kind":  "transactional",
+                         "measureDimension":  "Measure",
+                         "rowCount":  0,
+                         "columns":  [
+                                         {
+                                             "name":  "Account",
+                                             "kind":  "dimension",
+                                             "cardinality":  8
+                                         },
+                                         {
+                                             "name":  "Measure",
+                                             "kind":  "measure",
+                                             "cardinality":  3
+                                         }
+                                     ]
+                     },
+                     {
+                         "name":  "Geography",
+                         "kind":  "transactional",
+                         "measureDimension":  "Measure",
+                         "rowCount":  0,
+                         "columns":  [
+                                         {
+                                             "name":  "Geo",
+                                             "kind":  "dimension",
+                                             "cardinality":  53
+                                         },
+                                         {
+                                             "name":  "Measure",
+                                             "kind":  "measure",
+                                             "cardinality":  3
+                                         }
+                                     ]
+                     },
+                     {
+                         "name":  "ProductClass",
+                         "kind":  "transactional",
+                         "measureDimension":  "Measure",
+                         "rowCount":  0,
+                         "columns":  [
+                                         {
+                                             "name":  "Product",
+                                             "kind":  "dimension",
+                                             "cardinality":  20
+                                         },
+                                         {
+                                             "name":  "Measure",
+                                             "kind":  "measure",
+                                             "cardinality":  3
+                                         }
+                                     ]
+                     },
+                     {
+                         "name":  "Attributes",
+                         "kind":  "attribute",
+                         "measureDimension":  null,
+                         "rowCount":  6,
+                         "columns":  [
+                                         {
+                                             "name":  "Region",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Category",
+                                             "kind":  "dimension",
+                                             "cardinality":  3
+                                         },
+                                         {
+                                             "name":  "value",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         }
+                                     ]
+                     },
+                     {
+                         "name":  "RegionAttr",
+                         "kind":  "attribute",
+                         "measureDimension":  "Attribute",
+                         "rowCount":  4,
+                         "columns":  [
+                                         {
+                                             "name":  "Region",
+                                             "kind":  "dimension",
+                                             "cardinality":  4
+                                         },
+                                         {
+                                             "name":  "Attribute",
+                                             "kind":  "dimension",
+                                             "cardinality":  1
+                                         }
+                                     ]
+                     }
+                 ],
+    "systemCubes":  [
+                        "#Cubes",
+                        "#Dimensions",
+                        "#Hierarchies",
+                        "#Members",
+                        "#Edges",
+                        "#Columns",
+                        "#TableSecurity",
+                        "#DimensionSecurity"
+                    ],
+    "checks":  {
+                   "salesByRegion":  {
+                                         "Central":  6436941.57,
+                                         "East":  6319711.15,
+                                         "South":  6441942.55,
+                                         "West":  7564832.16
+                                     },
+                   "salesGrandTotal":  26763427.43,
+                   "salesLeafGroups":  36
+               },
+    "knownEmpty":  [
+                       "CostCentre",
+                       "Geography",
+                       "ProductClass"
+                   ]
+}
