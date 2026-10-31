@@ -1,10 +1,10 @@
 ﻿{
     "modelName":  "Superstore line items",
-    "modelVersion":  "v2",
+    "modelVersion":  "v2.1",
     "definedAt":  "2026-10-30",
     "engine":  {
                    "packageVersion":  "0.1.0",
-                   "commit":  "e9bb2b4",
+                   "commit":  "088a262",
                    "protocolVersion":  1,
                    "storageFormatVersion":  1
                },
@@ -17,9 +17,9 @@
                },
     "seed":  "examples/superstore-v2.sql",
     "file":  {
-                 "size":  5177295,
-                 "sha256":  "4F4F15969209CEC4B746FD607237F4F2D2033D7F077714164332F5197F802BCB",
-                 "contentFingerprint":  "E9423ED713438316C293EC2D58780915BFC14C15013964F548D03BDCBBFDB908"
+                 "size":  5177280,
+                 "sha256":  "5332BFB2D672168E591B239817C6CEA2B7BF13267D141C2CEB46A89B70F9F556",
+                 "contentFingerprint":  "48A6AF3E67060D848148B5E03B823263C873F10DEE2D330A3EA43CD602F8F97F"
              },
     "datasets":  [
                      {
@@ -105,7 +105,7 @@
                                              "cardinality":  3
                                          },
                                          {
-                                             "name":  "Sub-Category",
+                                             "name":  "SubCategory",
                                              "kind":  "dimension",
                                              "cardinality":  16
                                          },
@@ -171,5 +171,6 @@
                                      "filterValue":  "Sales",
                                      "expected":  5560
                                  }
-               }
+               },
+    "revision":  "SQL-safe member names: source column Sub-Category imported as SubCategory (handoff addendum 2026-10-31)"
 }

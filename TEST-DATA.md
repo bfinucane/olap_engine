@@ -14,11 +14,11 @@ Three independent axes; record all three.
 | --- | --- |
 | **Engine** | package `0.1.0`, engine commit recorded in the manifest, `protocolVersion 1`, storage `FORMAT_VERSION 1` |
 | **Contract** | `contract/PROTOCOL.md` v1 |
-| **Model** | **`Superstore line items v2`** — file SHA-256 + content fingerprint from the manifest |
+| **Model** | **`Superstore line items v2.1`** — file SHA-256 + content fingerprint from the manifest |
 
-Frozen artefact (2026-10-30): 5,177,295 B,
-SHA-256 `4F4F15969209CEC4B746FD607237F4F2D2033D7F077714164332F5197F802BCB`;
-content fingerprint `E9423ED713438316C293EC2D58780915BFC14C15013964F548D03BDCBBFDB908`.
+Frozen artefact (2026-10-30): 5,177,280 B,
+SHA-256 `5332BFB2D672168E591B239817C6CEA2B7BF13267D141C2CEB46A89B70F9F556`;
+content fingerprint `48A6AF3E67060D848148B5E03B823263C873F10DEE2D330A3EA43CD602F8F97F`.
 
 The pin has two halves because a seed regeneration is **not byte-reproducible** (bincode walks
 HashMap-backed catalogues in iteration order): the **file SHA-256** identifies the frozen
@@ -54,7 +54,7 @@ dimensions with `Measure = 'Sales'`.
 | Ship Mode | 4 | State | 24 |
 | Customer ID | 695 | Postal Code | 1,584 |
 | Region | 4 | Product ID | 5,560 |
-| Category | 3 | Sub-Category | 16 |
+| Category | 3 | SubCategory | 16 |
 | Product Name | 30 | Order Priority | 4 |
 
 Measures (measure dimension `Measure`, one member each): `Sales`, `Profit`, `Quantity`,
@@ -111,6 +111,13 @@ version** (v3, …):
    separate release event from an engine-code change;
 4. the contract owner records it in `contract/SHARED-ENGINE.md`; clients must re-login and
    save before the restart.
+
+
+**SQL-safe names:** `.import_measures` refuses a CSV header containing a dash (`SubCategory`),
+because SQL identifiers cannot contain `-` (it parses as subtraction) — a cube built from such
+a header would be unaddressable from the SQL surface. Give an explicit rename instead:
+`.import_measures <csv> <cube> <measures> Old-Dash=NewName`. Model v2.1 therefore imports the
+raw source's `Sub-Category` as `SubCategory`; the source file itself is unchanged.
 
 v1 (the 36-row demo: `Sales`, `Pivot`, `Attributes`, `RegionAttr`, empty `CostCentre`/
 `Geography`/`ProductClass`) is **history**: it is not served, not verified by default, and its
