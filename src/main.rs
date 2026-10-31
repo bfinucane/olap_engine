@@ -28,6 +28,7 @@ fn import_measures(
     path: &str,
     cube_name: &str,
     measures: &[String],
+    renames: &[(String, String)],
 ) -> Result<String, String> {
     if measures.is_empty() {
         return Err("no measure columns were given".to_string());
@@ -47,6 +48,44 @@ fn import_measures(
         .map(|h| h.trim().trim_start_matches('\u{feff}').to_string())
         .collect();
 
+    // Apply optional EXPLICIT renames, then refuse any name SQL cannot address.
+    //
+    // WHY: a CSV header is a user-facing dimension name. SQL identifiers cannot contain a
+    // dash (`Sub-Category` parses as subtraction), so a cube built straight from such a header
+    // is unqueryable from the SQL surface. Silently accepting it is the trap; the importer
+    // refuses and names the column, and the caller can either fix the export or pass an
+    // explicit rename (the optional 4th argument: `Sub-Category=SubCategory`).
+    let rename_of = |name: &str| -> String {
+        renames
+            .iter()
+            .find(|(old, _)| old.eq_ignore_ascii_case(name))
+            .map(|(_, new)| new.clone())
+            .unwrap_or_else(|| name.to_string())
+    };
+    for (old, new) in renames {
+        if !headers.iter().any(|header| header.eq_ignore_ascii_case(old)) {
+            return Err(format!("cannot rename '{}': no such column in '{}'", old, path));
+        }
+        if new.contains('-') {
+            return Err(format!("replacement name '{}' still contains '-'", new));
+        }
+        if !headers.iter().any(|header| header.eq_ignore_ascii_case(old)) {
+            return Err(format!("cannot rename '{}': no such column", old));
+        }
+    }
+    for header in &headers {
+        let final_name = rename_of(header);
+        if final_name.contains('-') {
+            return Err(format!(
+                "column '{}' contains a dash; SQL identifiers cannot contain '-' (it parses as \
+                 subtraction), so the cube would be unqueryable from SQL. Rename the column in \
+                 the export, or pass an explicit rename as the optional argument \
+                 (e.g. '{}=<SQL-safe name>' after the measure list).",
+                header,
+                header
+            ));
+        }
+    }
     // Locate the measure columns by name. Case-insensitive so a CSV exported from another
     // tool still works, but the resulting Measure members keep the CSV's own spelling.
     let mut measure_idx: Vec<usize> = Vec::new();
@@ -64,13 +103,13 @@ fn import_measures(
             return Err(format!("measure column '{}' is listed twice", wanted));
         }
         measure_idx.push(index);
-        measure_members.push(headers[index].clone());
+        measure_members.push(rename_of(&headers[index]));
     }
 
     let dim_idx: Vec<usize> = (0..headers.len())
         .filter(|index| !measure_idx.contains(index))
         .collect();
-    let dim_names: Vec<String> = dim_idx.iter().map(|&index| headers[index].clone()).collect();
+    let dim_names: Vec<String> = dim_idx.iter().map(|&index| rename_of(&headers[index])).collect();
     if dim_names.is_empty() {
         return Err("the CSV has no dimension columns".to_string());
     }
@@ -592,13 +631,28 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
             // and keeps every other column as a dimension. Use it for raw source files (the
             // Superstore line items) so the file stays the single source of truth.
             ".import_measures" => {
-                if parts.len() == 4 {
+                if parts.len() == 4 || parts.len() == 5 {
                     let measures: Vec<String> = parts[3]
                         .split(',')
                         .map(|name| name.trim().to_string())
                         .filter(|name| !name.is_empty())
                         .collect();
-                    match import_measures(catalog, parts[1], parts[2], &measures) {
+                    let mut renames: Vec<(String, String)> = Vec::new();
+                    if parts.len() == 5 {
+                        for pair in parts[4].split(',') {
+                            match pair.split_once('=') {
+                                Some((old, new)) if !old.trim().is_empty() && !new.trim().is_empty() => {
+                                    renames.push((old.trim().to_string(), new.trim().to_string()));
+                                }
+                                _ => {
+                                    let _ = writeln!(out, "Bad rename '{}': expected Old=New", pair);
+                                    ok = false;
+                                }
+                            }
+                        }
+                        if !ok { return false; }
+                    }
+                    match import_measures(catalog, parts[1], parts[2], &measures, &renames) {
                         Ok(message) => { let _ = writeln!(out, "{}", message); }
                         Err(reason) => {
                             let _ = writeln!(out, "Import failed: {}", reason);
@@ -1187,6 +1241,7 @@ mod import_measures_tests {
             path.to_str().expect("path"),
             "Orders",
             &["Sales".to_string(), "Profit".to_string()],
+            &[],
         )
         .expect("import must succeed");
         std::fs::remove_file(&path).ok();
@@ -1198,5 +1253,33 @@ mod import_measures_tests {
         // One cell per row per measure: 2 rows x 2 measures.
         let cells = cube.store.scan_subcube(&vec![None; cube.dimensions.len()]);
         assert_eq!(cells.len(), 4, "cells: {cells:?}");
+    }
+
+    #[test]
+    fn a_dash_in_a_column_name_is_refused_unless_explicitly_renamed() {
+        let path = std::env::temp_dir().join(format!("olap-dash-{}.csv", std::process::id()));
+        std::fs::write(&path, "Region,Sub-Category,Sales\nEast,Chairs,10\n").expect("write fixture");
+        let measures = ["Sales".to_string()];
+
+        let mut catalog = Catalog::new();
+        let error = import_measures(&mut catalog, path.to_str().expect("path"), "Orders", &measures, &[])
+            .expect_err("a dashed column must be refused");
+        assert!(error.contains("contains a dash"), "{error}");
+        assert!(catalog.get_cube("Orders").is_none(), "no half-created cube");
+
+        let mut renamed = Catalog::new();
+        let message = import_measures(
+            &mut renamed,
+            path.to_str().expect("path"),
+            "Orders",
+            &measures,
+            &[("Sub-Category".to_string(), "SubCategory".to_string())],
+        )
+        .expect("an explicit rename makes it SQL-safe");
+        std::fs::remove_file(&path).ok();
+        assert!(message.contains("1 rows x 1 measures"), "{message}");
+        let cube = renamed.get_cube("Orders").expect("cube");
+        assert!(cube.dimension_names.contains(&"SubCategory".to_string()), "{:?}", cube.dimension_names);
+        assert!(!cube.dimension_names.iter().any(|name| name.contains('-')), "{:?}", cube.dimension_names);
     }
 }

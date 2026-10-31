@@ -15,5 +15,5 @@
 --     target\debug\olap_engine.exe --db <scratch>.bin examples\superstore-v2.sql
 --
 -- The trailing `.save` is what produces the database file `serve` loads.
-.import_measures examples/Plateau/superstore-raw.csv Orders Sales,Profit,Quantity,Discount
+.import_measures examples/Plateau/superstore-raw.csv Orders Sales,Profit,Quantity,Discount Sub-Category=SubCategory
 .save
