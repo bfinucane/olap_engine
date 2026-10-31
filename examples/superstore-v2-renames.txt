@@ -1,0 +1,14 @@
+# Source CSV header -> SQL-safe member name. SQL here accepts bare identifiers only
+# (letters, digits, underscore; no quotes, spaces, dashes or leading digits).
+Row ID=RowID
+Order ID=OrderID
+Order Date=OrderDate
+Ship Date=ShipDate
+Ship Mode=ShipMode
+Customer ID=CustomerID
+Customer Name=CustomerName
+Postal Code=PostalCode
+Product ID=ProductID
+Sub-Category=SubCategory
+Product Name=ProductName
+Order Priority=OrderPriority

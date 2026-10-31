@@ -10,6 +10,17 @@ use olap_engine::cube::node::CellValue;
 use olap_engine::engine::sql::execute_sql;
 
 
+/// The identifier grammar this engine's SQL accepts: ASCII letter or '_', then letters,
+/// digits or '_'. Quoted identifiers are NOT supported, so anything else (space, dash,
+/// punctuation, leading digit) is unusable from SQL and must be refused at import time.
+fn is_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
 /// Imports a WIDE raw CSV — several numeric measure columns — into a measure-dimension cube.
 ///
 /// WHY: `.import` reads ONE trailing numeric value, because a cube normally stores one value
@@ -50,11 +61,13 @@ fn import_measures(
 
     // Apply optional EXPLICIT renames, then refuse any name SQL cannot address.
     //
-    // WHY: a CSV header is a user-facing dimension name. SQL identifiers cannot contain a
-    // dash (`Sub-Category` parses as subtraction), so a cube built straight from such a header
-    // is unqueryable from the SQL surface. Silently accepting it is the trap; the importer
-    // refuses and names the column, and the caller can either fix the export or pass an
-    // explicit rename (the optional 4th argument: `Sub-Category=SubCategory`).
+    // WHY: a CSV header becomes a user-facing dimension or measure name. This engine's SQL
+    // accepts BARE identifiers only - quoted `"Region"` is not recognised, a space parses as
+    // an alias (`Order Date` -> `Order AS Date`), and `-` parses as subtraction. A name with
+    // any of those makes the cube unqueryable from SQL, so it is refused at import time
+    // instead of being discovered by a user later. Rename the export, or pass explicit
+    // renames: the optional 4th argument is `Old=New,...`, or a FILE with one `Old=New` per
+    // line when the source name itself contains spaces.
     let rename_of = |name: &str| -> String {
         renames
             .iter()
@@ -62,26 +75,30 @@ fn import_measures(
             .map(|(_, new)| new.clone())
             .unwrap_or_else(|| name.to_string())
     };
+    if !is_sql_identifier(cube_name) {
+        return Err(format!(
+            "cube name '{}' is not a usable SQL identifier (letters, digits and '_' only)",
+            cube_name
+        ));
+    }
     for (old, new) in renames {
         if !headers.iter().any(|header| header.eq_ignore_ascii_case(old)) {
             return Err(format!("cannot rename '{}': no such column in '{}'", old, path));
         }
-        if new.contains('-') {
-            return Err(format!("replacement name '{}' still contains '-'", new));
-        }
-        if !headers.iter().any(|header| header.eq_ignore_ascii_case(old)) {
-            return Err(format!("cannot rename '{}': no such column", old));
+        if !is_sql_identifier(new) {
+            return Err(format!(
+                "replacement name '{}' for '{}' is not a usable SQL identifier",
+                new, old
+            ));
         }
     }
     for header in &headers {
-        let final_name = rename_of(header);
-        if final_name.contains('-') {
+        if !is_sql_identifier(&rename_of(header)) {
             return Err(format!(
-                "column '{}' contains a dash; SQL identifiers cannot contain '-' (it parses as \
-                 subtraction), so the cube would be unqueryable from SQL. Rename the column in \
-                 the export, or pass an explicit rename as the optional argument \
-                 (e.g. '{}=<SQL-safe name>' after the measure list).",
-                header,
+                "column '{}' is not a usable SQL identifier (letters, digits and '_' only, not \
+                 starting with a digit); SQL would reject it. Rename the column in the export, \
+                 or pass explicit renames: 4th argument 'Old=New,...', or a FILE of 'Old=New' \
+                 lines when the source name itself contains spaces.",
                 header
             ));
         }
@@ -639,18 +656,33 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                         .collect();
                     let mut renames: Vec<(String, String)> = Vec::new();
                     if parts.len() == 5 {
-                        for pair in parts[4].split(',') {
+                        let spec = parts[4];
+                        let pairs: Vec<String> = if spec.contains('=') {
+                            spec.split(',').map(|pair| pair.to_string()).collect()
+                        } else {
+                            match std::fs::read_to_string(spec) {
+                                Ok(text) => text
+                                    .lines()
+                                    .map(|line| line.trim().to_string())
+                                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                                    .collect(),
+                                Err(reason) => {
+                                    let _ = writeln!(out, "Could not read the rename file '{}': {}", spec, reason);
+                                    return false;
+                                }
+                            }
+                        };
+                        for pair in pairs {
                             match pair.split_once('=') {
                                 Some((old, new)) if !old.trim().is_empty() && !new.trim().is_empty() => {
                                     renames.push((old.trim().to_string(), new.trim().to_string()));
                                 }
                                 _ => {
                                     let _ = writeln!(out, "Bad rename '{}': expected Old=New", pair);
-                                    ok = false;
+                                    return false;
                                 }
                             }
                         }
-                        if !ok { return false; }
                     }
                     match import_measures(catalog, parts[1], parts[2], &measures, &renames) {
                         Ok(message) => { let _ = writeln!(out, "{}", message); }
@@ -1258,13 +1290,13 @@ mod import_measures_tests {
     #[test]
     fn a_dash_in_a_column_name_is_refused_unless_explicitly_renamed() {
         let path = std::env::temp_dir().join(format!("olap-dash-{}.csv", std::process::id()));
-        std::fs::write(&path, "Region,Sub-Category,Sales\nEast,Chairs,10\n").expect("write fixture");
+        std::fs::write(&path, "Region,Row ID,Sub-Category,Sales\nEast,1,Chairs,10\n").expect("write fixture");
         let measures = ["Sales".to_string()];
 
         let mut catalog = Catalog::new();
         let error = import_measures(&mut catalog, path.to_str().expect("path"), "Orders", &measures, &[])
             .expect_err("a dashed column must be refused");
-        assert!(error.contains("contains a dash"), "{error}");
+        assert!(error.contains("not a usable SQL identifier"), "{error}");
         assert!(catalog.get_cube("Orders").is_none(), "no half-created cube");
 
         let mut renamed = Catalog::new();
@@ -1273,13 +1305,14 @@ mod import_measures_tests {
             path.to_str().expect("path"),
             "Orders",
             &measures,
-            &[("Sub-Category".to_string(), "SubCategory".to_string())],
+            &[("Sub-Category".to_string(), "SubCategory".to_string()), ("Row ID".to_string(), "RowID".to_string())],
         )
         .expect("an explicit rename makes it SQL-safe");
         std::fs::remove_file(&path).ok();
         assert!(message.contains("1 rows x 1 measures"), "{message}");
         let cube = renamed.get_cube("Orders").expect("cube");
         assert!(cube.dimension_names.contains(&"SubCategory".to_string()), "{:?}", cube.dimension_names);
+        assert!(cube.dimension_names.contains(&"RowID".to_string()), "{:?}", cube.dimension_names);
         assert!(!cube.dimension_names.iter().any(|name| name.contains('-')), "{:?}", cube.dimension_names);
     }
 }
