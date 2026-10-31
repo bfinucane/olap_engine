@@ -14,11 +14,11 @@ Three independent axes; record all three.
 | --- | --- |
 | **Engine** | package `0.1.0`, engine commit recorded in the manifest, `protocolVersion 1`, storage `FORMAT_VERSION 1` |
 | **Contract** | `contract/PROTOCOL.md` v1 |
-| **Model** | **`Superstore line items v2.1`** — file SHA-256 + content fingerprint from the manifest |
+| **Model** | **`Superstore line items v2.2`** — file SHA-256 + content fingerprint from the manifest |
 
-Frozen artefact (2026-10-30): 5,177,280 B,
-SHA-256 `5332BFB2D672168E591B239817C6CEA2B7BF13267D141C2CEB46A89B70F9F556`;
-content fingerprint `48A6AF3E67060D848148B5E03B823263C873F10DEE2D330A3EA43CD602F8F97F`.
+Frozen artefact (2026-10-30): 5,177,115 B,
+SHA-256 `F2F9A6A33FD89F62317062861268543A99DBD17CBB0651EB44B83D40ADD14042`;
+content fingerprint `4E88A9D42E217C298CC504C96A13538F4F2BEE501B32CE65B6525D1952EAEC97`.
 
 The pin has two halves because a seed regeneration is **not byte-reproducible** (bincode walks
 HashMap-backed catalogues in iteration order): the **file SHA-256** identifies the frozen
@@ -47,15 +47,15 @@ dimensions with `Measure = 'Sales'`.
 
 | Dimension | Cardinality | Dimension | Cardinality |
 | --- | --- | --- | --- |
-| Row ID | 5,560 | Customer Name | 415 |
-| Order ID | 1,600 | Segment | 3 |
-| Order Date | 929 | Country | 1 |
-| Ship Date | 975 | City | 24 |
-| Ship Mode | 4 | State | 24 |
-| Customer ID | 695 | Postal Code | 1,584 |
-| Region | 4 | Product ID | 5,560 |
+| RowID | 5,560 | CustomerName | 415 |
+| OrderID | 1,600 | Segment | 3 |
+| OrderDate | 929 | Country | 1 |
+| ShipDate | 975 | City | 24 |
+| ShipMode | 4 | State | 24 |
+| CustomerID | 695 | PostalCode | 1,584 |
+| Region | 4 | ProductID | 5,560 |
 | Category | 3 | SubCategory | 16 |
-| Product Name | 30 | Order Priority | 4 |
+| ProductName | 30 | OrderPriority | 4 |
 
 Measures (measure dimension `Measure`, one member each): `Sales`, `Profit`, `Quantity`,
 `Discount`.
@@ -73,7 +73,7 @@ Measures (measure dimension `Measure`, one member each): `Sales`, `Profit`, `Qua
 | South | 6,441,942.55 | 334,630.96 | 5,731 |
 | West | 7,564,832.16 | 237,779.46 | 5,746 |
 
-Dates are string dimensions (`Order Date` 2021-01-01 … 2024-12-28); they filter and group
+Dates are string dimensions (`OrderDate` 2021-01-01 … 2024-12-28); they filter and group
 normally. Derived Year/Quarter/Month are not materialised.
 
 ## 4. Verifying
@@ -116,7 +116,7 @@ version** (v3, …):
 **SQL-safe names:** `.import_measures` refuses a CSV header containing a dash (`SubCategory`),
 because SQL identifiers cannot contain `-` (it parses as subtraction) — a cube built from such
 a header would be unaddressable from the SQL surface. Give an explicit rename instead:
-`.import_measures <csv> <cube> <measures> Old-Dash=NewName`. Model v2.1 therefore imports the
+`.import_measures <csv> <cube> <measures> Old-Dash=NewName`. Model v2.2 therefore imports the
 raw source's `Sub-Category` as `SubCategory`; the source file itself is unchanged.
 
 v1 (the 36-row demo: `Sales`, `Pivot`, `Attributes`, `RegionAttr`, empty `CostCentre`/

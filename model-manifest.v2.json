@@ -1,10 +1,10 @@
 ﻿{
     "modelName":  "Superstore line items",
-    "modelVersion":  "v2.1",
+    "modelVersion":  "v2.2",
     "definedAt":  "2026-10-30",
     "engine":  {
                    "packageVersion":  "0.1.0",
-                   "commit":  "088a262",
+                   "commit":  "4d33d82",
                    "protocolVersion":  1,
                    "storageFormatVersion":  1
                },
@@ -17,9 +17,9 @@
                },
     "seed":  "examples/superstore-v2.sql",
     "file":  {
-                 "size":  5177280,
-                 "sha256":  "5332BFB2D672168E591B239817C6CEA2B7BF13267D141C2CEB46A89B70F9F556",
-                 "contentFingerprint":  "48A6AF3E67060D848148B5E03B823263C873F10DEE2D330A3EA43CD602F8F97F"
+                 "size":  5177115,
+                 "sha256":  "F2F9A6A33FD89F62317062861268543A99DBD17CBB0651EB44B83D40ADD14042",
+                 "contentFingerprint":  "4E88A9D42E217C298CC504C96A13538F4F2BEE501B32CE65B6525D1952EAEC97"
              },
     "datasets":  [
                      {
@@ -30,37 +30,37 @@
                          "rowCount":  22240,
                          "columns":  [
                                          {
-                                             "name":  "Row ID",
+                                             "name":  "RowID",
                                              "kind":  "dimension",
                                              "cardinality":  5560
                                          },
                                          {
-                                             "name":  "Order ID",
+                                             "name":  "OrderID",
                                              "kind":  "dimension",
                                              "cardinality":  1600
                                          },
                                          {
-                                             "name":  "Order Date",
+                                             "name":  "OrderDate",
                                              "kind":  "dimension",
                                              "cardinality":  929
                                          },
                                          {
-                                             "name":  "Ship Date",
+                                             "name":  "ShipDate",
                                              "kind":  "dimension",
                                              "cardinality":  975
                                          },
                                          {
-                                             "name":  "Ship Mode",
+                                             "name":  "ShipMode",
                                              "kind":  "dimension",
                                              "cardinality":  4
                                          },
                                          {
-                                             "name":  "Customer ID",
+                                             "name":  "CustomerID",
                                              "kind":  "dimension",
                                              "cardinality":  695
                                          },
                                          {
-                                             "name":  "Customer Name",
+                                             "name":  "CustomerName",
                                              "kind":  "dimension",
                                              "cardinality":  415
                                          },
@@ -85,7 +85,7 @@
                                              "cardinality":  24
                                          },
                                          {
-                                             "name":  "Postal Code",
+                                             "name":  "PostalCode",
                                              "kind":  "dimension",
                                              "cardinality":  1584
                                          },
@@ -95,7 +95,7 @@
                                              "cardinality":  4
                                          },
                                          {
-                                             "name":  "Product ID",
+                                             "name":  "ProductID",
                                              "kind":  "dimension",
                                              "cardinality":  5560
                                          },
@@ -110,12 +110,12 @@
                                              "cardinality":  16
                                          },
                                          {
-                                             "name":  "Product Name",
+                                             "name":  "ProductName",
                                              "kind":  "dimension",
                                              "cardinality":  30
                                          },
                                          {
-                                             "name":  "Order Priority",
+                                             "name":  "OrderPriority",
                                              "kind":  "dimension",
                                              "cardinality":  4
                                          },
@@ -172,5 +172,5 @@
                                      "expected":  5560
                                  }
                },
-    "revision":  "SQL-safe member names: source column Sub-Category imported as SubCategory (handoff addendum 2026-10-31)"
+    "revision":  "SQL-safe member names: every source header renamed to a bare SQL identifier (spaces/dashes rejected by the importer)"
 }
