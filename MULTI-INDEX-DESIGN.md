@@ -736,7 +736,7 @@ Options considered:
 | Option | Cost | Decision |
 |---|---|---|
 | dense only when span ≤ cap; otherwise bitmap/sparse | none | **chosen for v1** |
-| renumber ids on compaction (`1..n`) | must remap every index and cell coordinate, atomically across views; internal ids so feasible at save/load | later option, not v1 |
+| renumber ids on a user-triggered **cleanup** step (`1..n`) | must remap every index and cell coordinate atomically; internal ids, so an offline pass is safe | **chosen** as a maintenance step, §25 (not automatic) |
 | local ordinal per node (compact slot + id→slot map) | O(1) lost, extra structure per node | rejected for now |
 
 The practical rule: **dense is keyed by span, and the span cap is benchmark-driven**; do not
@@ -750,8 +750,9 @@ assume the live cardinality bounds the span.
    the start" was also meant for production, say so — that is the one open point.)
 2. **Span cap**: benchmark-driven. No fixed number: measure 4K/16K/64K spans and choose from the
    memory/latency curve. The cap governs both dense arrays and bitmap span.
-3. **Id gaps**: no renumbering for v1. Dense only when span ≤ cap; otherwise bitmap/sparse; a
-   compaction pass is recorded as a later option (above).
+3. **Id gaps**: no automatic renumbering. Dense only when span ≤ cap; otherwise bitmap/sparse.
+   A **user-triggered cleanup step** (§25) can renumber ids on demand; it is explicit, offline, and
+   extensible with future optimisation steps.
 4. Benchmark matrix unchanged (§22.6); add the span/occupancy sweeps of (2).
 
 ## 24. Revision 5 — adaptive choices recorded (2026-11-02)
@@ -759,3 +760,94 @@ assume the live cardinality bounds the span.
 Added §22.8 (id-gap explanation) and §22.9 (operator decisions: compression in the prototype from
 the start, production follow-up; benchmark-driven span cap; no id renumbering in v1). No change to
 §11 decisions or §20 load-time contract.
+## 25. User-triggered maintenance ("cleanup")
+
+Decision (2026-11-02): the id-gap fix is a **maintenance operation the user triggers**, not an
+automatic rewrite, and the mechanism is a **step registry** so future optimisations can be added
+without inventing new commands.
+
+### 25.1 Shape
+
+```
+maintain --db <file> --steps ids[,heap,delta,nodes] [--dry-run] [--backup] [--verify]
+```
+
+or, for the operator, a `scripts\maintain-db.cmd` wrapper (execution-policy safe) with the same
+options. Each step has a name, a description, a safety class and a before/after report. `--steps
+all` runs the registered steps in a fixed order; a failing step aborts before the file is
+replaced. **Offline first:** the command refuses to run while the shared server is listening
+(the file must not be in use), loads the database, applies the steps, saves atomically
+(temp + fsync + rename), and keeps the previous file when asked. A server-side admin endpoint is
+possible later but is a wire change (contract handoff); v1 does not need it.
+
+### 25.2 The `ids` step (renumber to remove gaps)
+
+1. For every dimension, collect live ids (leaf bank + aggregates reachable in the hierarchies +
+   `default_member_id`), sort by old id, assign `1..n`, build `old → new`.
+2. Rewrite the dimension: `leaf_id_to_name`, `member_types`, every hierarchy's `member_to_id`
+   values, `display_names` keys, `consolidations` parent keys and child ids, `child_to_parent`,
+   `root_order`, `display_order`; set `next_id = n + 1`. Member **names and order are unchanged** —
+   only internal ids move.
+3. Rewrite every index/trie over every fact set: walk cells and remap each coordinate; for a
+   compressed (Patricia) edge, remap every id in its path. The cell heap (CellIds) is untouched.
+4. If a delta log exists, **checkpoint it into the canonical index first**, then rewrite its ids
+   or truncate it; stale derived indexes are dropped and rebuilt from the canonical index.
+5. Rebuild derived system cubes (`#Members`, `#Edges`, `#Columns`, …) from the remapped metadata.
+6. Drop caches; publish a new version; save atomically.
+7. Report per dimension: live members, old span, new span, reclaimed slots; and totals (cells
+   remapped, bytes saved on the next save, duration).
+
+The **model identity must not change**: `verify-model` (content fingerprint) is run before and
+after; a difference aborts and restores the backup. A second run is a no-op (idempotent).
+
+### 25.3 Extensible step registry
+
+| Step | Future use | Safety |
+|---|---|---|
+| `ids` | remove id gaps (this section) | offline; atomic |
+| `nodes` | re-encode tries with adaptive/dense/compressed nodes (§22) | offline; atomic |
+| `heap` | compact the CellId arena / reclaim dead cells | offline; atomic |
+| `delta` | checkpoint and truncate the delta log | offline; atomic |
+| `cache` | drop per-index caches (no file change) | online-safe |
+| `system` | rebuild derived system cubes | online-safe when quiescent |
+| `verify` | model fingerprint + referential checks | read-only |
+
+Each step reports what it did; new steps are added to the registry rather than surfaced as new
+commands. Order is fixed (`delta` → `ids` → `heap` → `nodes` → `system` → `verify`) so a later
+step can rely on the previous one.
+
+### 25.4 Why offline and user-triggered
+
+- Renumbering touches **every index and every cell coordinate**; doing it under live readers
+  would replace the whole catalogue, which the MVCC design (persistent tries, versioned caches)
+  deliberately avoids. Offline it is a linear rebuild, with a backup and an atomic rename.
+- It is rare (after churn, before a release, or when the span cap is pushing bitmap/dense
+  choices); an automatic trigger would surprise operators and complicate save/release.
+- The same command runs naturally in the **promotion** flow: maintain the candidate file, verify
+  its fingerprint, then promote and broadcast.
+
+### 25.5 Acceptance
+
+- `--dry-run` prints the per-dimension gap report and saves nothing.
+- Running `ids` on the demo model (no deletions) changes nothing (no gaps; second run idempotent).
+- On a synthetic dimension with 10,000 live members and ids to 50,000, `ids` yields span =
+  10,000 and the model fingerprint is unchanged.
+- Server-listening detection: refuses with a clear message; no file written.
+- Backup + restore: a deliberately failing step leaves the original file intact.
+
+### 25.6 Open choices
+
+1. Surface for v1: offline CLI + `maintain-db.cmd` wrapper (recommended) — or also a server admin
+   endpoint (wire change) now?
+2. Default `--steps` when none given: `ids` only, or `all`?
+3. Backup retention: keep `<file>.bak` until the next successful maintenance, or never?
+4. Should promotion automatically run `maintain --steps all` on the candidate (as a release
+   hygiene step), or leave it explicit?
+5. Who may trigger it: operator only (offline anyway) — confirm that the server admin endpoint,
+   if added later, requires the admin role and quiescence.
+
+## 26. Revision 6 — user-triggered cleanup recorded (2026-11-02)
+
+Added §25: a step-based maintenance command, `ids` compaction algorithm and safety, an extensible
+registry (nodes/heap/delta/cache/system/verify), offline-first invocation, acceptance tests, and
+open choices. The id-gap decision in §22.9 item 3 now points at this step instead of "later".
