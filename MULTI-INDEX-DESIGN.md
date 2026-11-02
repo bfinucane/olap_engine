@@ -282,3 +282,287 @@ work as much as code.
    mapping.
 5. Only then decide whether the flat-only SQL keyword is needed; measure the 30-dimension case
    before promising it.
+
+---
+
+# Revision 2 — operator decisions, attributes and non-unique hierarchy members
+
+Appended 2026-11-02 after the operator's response. Where this conflicts with §3.3, this
+revision wins.
+
+## 11. Decisions recorded
+
+1. **Canonical scheme: flat**, organised as a **star schema** (fact rows carry keys, master data
+   lives beside them). How to enforce the star shape is still open — options in §13.
+2. **Cell token: `CellId`** into an arena (not `Arc<Cell>`); reclamation via epoch GC (§14.1).
+3. **Lazy loading with a delta log**: unloaded indexes are stale; writes append fact-level
+   deltas they replay on load.
+4. **Delete UX: open** — examples in §15 to evaluate.
+5. **`viewOf` marker: yes**, mark it on the wire (§16).
+6. Dimension counts/benchmark unchanged (§6); per-index caches confirmed.
+
+Consequence of (1): fact identity is the canonical **flat key** (the key columns + measures),
+not a hierarchy leaf. The tree view derives a hierarchy leaf from those keys, and the tree's
+consolidations are pure metadata. This makes the "what is data vs shape" question sharper, not
+simpler — see §15.
+
+## 12. Why attributes break the flat model
+
+The demo columns `Customer ID` and `Customer Name` are master data: the name belongs to the
+customer, not to each order line. Three concrete shapes, to compare:
+
+**Example A — denormalised fact (what an importer produces today).**
+
+| RowID | OrderDate | CustomerID | CustomerName | City | State | Sales |
+|---|---|---|---|---|---|---|
+| 1 | 2024-01-05 | C-001 | Ava Thompson | Bristol | Tennessee | 261.96 |
+| 2 | 2024-01-06 | C-001 | Ava Thompson | Bristol | Virginia | 731.94 |
+| 3 | 2024-01-07 | C-002 | Ava Thompson | Bristol | Tennessee | 14.62 |
+
+Problems: the name is repeated 5,560 times; renaming C-001 rewrites every fact (and can leave
+disagreement); `Ava Thompson` is also two different customers (a join on name would merge them);
+and the flat fact carries level labels (`State`) that are really master data. This shape is
+easy to import but is not a star schema.
+
+**Example B — star schema, keys in the fact, masters beside it.**
+
+```
+Fact Orders (canonical, flat key)
+  RowID, OrderID, DateID, ShipDateID, CustomerID, CityID, ProductID,
+  ShipMode, OrderPriority, Measure, CellValue
+Master Date      (DateID PK, Date, Year, Quarter, Month, Week)
+Master Customer  (CustomerID PK, Name, Segment)
+Master Geography (CityID PK, CityName, StateID, StateName, CountryID)
+Master Product   (ProductID PK, ProductName, Category, SubCategory)
+```
+
+- `Customer Name` is stored once; a rename is one master row.
+- Two customers may share a name: identity is `CustomerID`.
+- The tree view derives `Year→Quarter→Month` from `DateID`, and `Country→State→City` from
+  `CityID`/`StateID`; labels come from the masters.
+- The flat view presents `DateID, CustomerID, CityID, …`; display labels can be joined in (see
+  Example C) but are not part of the fact.
+
+**Example C — derived attribute columns (client convenience, engine-side join).**
+
+`GET /v1/OrdersFlat` describe exposes, in addition to the keys:
+
+| Column | Kind | Origin | Writable |
+|---|---|---|---|
+| CustomerID | dimension | fact | yes |
+| CustomerName | attribute | master Customer | no (write the master) |
+| City | attribute | master Geography | no |
+| State | attribute | master Geography | no |
+
+A query `SELECT CustomerName, SUM(Sales)` is resolved by the engine joining the fact's
+`CustomerID` to the master. This is what lets Plateau, which has no join, use a star schema.
+Writing `CustomerName` through the fact is refused unless the schema declares it a
+**denormalised snapshot** column (then it is fact data and the master is advisory).
+
+**What enforcement needs to say** (the open question):
+- which fact columns are **keys into a master**, which are **fact attributes**,
+- which master columns are **attributes** (read-through) and whether any are snapshotted,
+- referential integrity: a fact key must resolve in its master (or a declared autocreate policy),
+- uniqueness of master keys,
+- which hierarchy is derived from which keys (DateID for the date tree, Geography for geo).
+
+## 13. Star-schema enforcement — options to evaluate
+
+The engine currently has dimensions, attribute tables (EAV cubes) and a SQL join, but no
+declared foreign keys. Plateau has no join. Four enforcement levels:
+
+**Option 0 — convention + tooling.** The import tool/schema script declares masters and keys;
+a validation pass checks referential integrity and rejects attribute columns in the fact. No
+engine change; the server cannot guarantee it, and a hand-written CETAS/import can violate it.
+
+**Option 1 — `REFERENCES` in the cube DDL.** Extend the existing `CREATE TABLE`/`CREATE CUBE`
+with foreign keys:
+
+```sql
+CREATE TABLE Orders (
+  RowID STRING, OrderID STRING,
+  DateID STRING REFERENCES Date,      -- master dimension Date
+  CustomerID STRING REFERENCES Customer,
+  CityID STRING REFERENCES Geography,
+  ProductID STRING REFERENCES Product,
+  ShipMode STRING, OrderPriority STRING,
+  Measure MEASURE
+)
+```
+Enforcement: import/write validates that the referenced member exists (or creates it per
+policy; the engine already has `createMissing`); `Customer.Name` cannot be inserted into
+`Orders` unless declared; `describe` can expose master attributes as derived columns. Cost:
+DDL parser work + referential checks + query-time attribute resolution.
+
+**Option 2 — a declared schema manifest / meta-command.** A single declaration loaded with the
+database (JSON or `.schema` command) describes fact keys, masters, attributes, hierarchies and
+key formats:
+
+```json
+{
+  "facts": { "Orders": {
+      "keys": { "DateID": "Date", "CustomerID": "Customer", "CityID": "Geography",
+                "ProductID": "Product" },
+      "attributes": ["ShipMode", "OrderPriority"],
+      "measures": ["Sales", "Profit", "Quantity", "Discount"] } },
+  "masters": {
+      "Customer":  { "key": "CustomerID", "attributes": ["Name", "Segment"] },
+      "Geography": { "key": "CityID",    "attributes": ["CityName", "StateID", "StateName", "CountryID"] } },
+  "hierarchies": {
+      "Date":  { "levels": ["Year", "Quarter", "Month", "Date"] },
+      "Geography": { "levels": ["CountryID", "StateID", "CityID"] } }
+}
+```
+The importer builds and validates everything from this; the server enforces on write. This is
+the option I would evaluate first: it centralises enforcement without committing to a full SQL
+DDL implementation, and the same document can be the model pin.
+
+**Option 3 — full star-schema DDL** (`CREATE DIMENSION …`, `ALTER …`, constraints, catalogs).
+Most familiar to Infor/TM1 users, largest change.
+
+Comparison:
+
+| | Enforced by server | Client sees joins? | Effort | Risk |
+|---|---|---|---|---|
+| 0 convention | no | no (data already flat) | none | silent inconsistency |
+| 1 REFERENCES | yes | attributes derivable | medium (DDL, checks) | SQL parser growth |
+| 2 schema manifest | yes | yes, via describe | medium | new file concept |
+| 3 full DDL | yes | yes | large | scope explosion |
+
+## 14. Non-unique hierarchy members — the two Bristols
+
+**Example D — automatic hierarchy from names is ambiguous.**
+
+| Row | City | State | Sales |
+|---|---|---|---|
+| 1 | Bristol | Tennessee | 100 |
+| 2 | Bristol | Virginia | 200 |
+| 3 | Bristol | Tennessee | 50 |
+
+An automatic `State → City` hierarchy on **names** creates one `Bristol` member with two
+parents. The engine's model allows one parent per hierarchy (`child_to_parent`), so the build
+either errors, silently keeps one parent (wrong rollup), or, if `Bristol` is made a leaf and
+`Tennessee`/`Virginia` its parents, the member cannot be a child of both. Names are not
+identities.
+
+Three ways out, in increasing cost:
+
+1. **Qualified member names** — `City` member is `Bristol, TN` / `Bristol, VA` (or
+   `US/TN/Bristol`). Works today; display is noisy and any label change is a schema change;
+   state names also need qualifying by country (`Georgia` the state vs the country).
+2. **Surrogate keys** — `CityID` (and `StateID`, `CountryID`) are the dimension members;
+   `CityName`, `StateName` are attributes in a master table. Uniqueness is structural. Display
+   needs attribute columns (Example C) or a client that resolves the attribute. This is the
+   star-schema answer and works with today's engine *provided* clients get attributes.
+3. **Surrogate identity with display names** — the engine's member identity becomes an id, with
+   a separate display name (as aggregates already have `display_names`). Then two members can
+   both display `Bristol` and clients see friendly labels. This is an engine-model change
+   (leaf identity is currently the name), and it is the cleanest long-term answer.
+
+Note the related trap: **auto-constructed hierarchies from columns are only valid if each
+level's member is unique within its parent.** The safe construction rule is "key columns, not
+labels"; the loader should reject a hierarchy whose keys are not unique rather than inventing
+one.
+
+## 15. Delete UX — examples to evaluate
+
+Same fact set, both views. Candidates:
+
+**(a) Tree view.** `DELETE MEMBER 'Q1-2024' FROM Time`
+- intent: reshape (remove the consolidation) — facts untouched; tree view loses the quarter
+  rollup; flat view still has its `Quarter` label column (if flat is canonical and stores the
+  label) — the two views now disagree about "Q1 exists".
+- if the leaf hierarchy is derived from the flat key, removing a level member means changing
+  the **derivation**, not the facts.
+
+**(b) Flat view.** `DELETE MEMBER 'Q1-2024' FROM OrdersFlat`
+- the member is a label on facts; deleting it either (i) deletes facts labelled Q1 (data loss)
+  or (ii) is refused/reshapes the label domain. The operator must say which.
+
+**Recommended command set** (explicit intent, never inferred from the name):
+
+```
+RESHAPE Time REMOVE 'Q1-2024'            -- schema only: facts and labels unchanged; derived
+                                         -- tree index rebuilt; flat data untouched
+PURGE FACTS FROM OrdersFlat
+      WHERE Quarter = 'Q1-2024'          -- data: removes canonical facts + all index entries
+DROP VIEW OrdersTree                     -- metadata: index removed; facts untouched
+```
+
+Examples to evaluate: (i) should `RESHAPE` be allowed when the flat canonical stores the label?
+(ii) should `PURGE` require a fact-grain coordinate, or is a level predicate acceptable?
+(iii) should the engine expose "this member is a consolidation / a label / a fact key" in
+describe so the UI can warn?
+
+## 16. `viewOf` marker — payload example
+
+On the wire (describe/capabilities/dataset list), e.g.:
+
+```json
+{
+  "dataset": "OrdersTree",
+  "viewOf": "factset:orders",
+  "scheme": "tree",
+  "schemeGroup": "Orders",
+  "canonical": false,
+  "writable": "leaf"
+}
+```
+and for the canonical flat view:
+
+```json
+{
+  "dataset": "OrdersFlat", "viewOf": "factset:orders", "scheme": "flat",
+  "schemeGroup": "Orders", "canonical": true, "writable": "full"
+}
+```
+Clients group by `schemeGroup`, warn before summing two views of one fact set, and choose the
+writable one. This is a wire addition (owner ruling).
+
+## 17. Delta-log example (lazy loading)
+
+One record per write, canonical coordinate + new cell token (or tombstone):
+
+```
+{"seq":1042,"op":"upsert","fact":["D-2024-01-05","C-001","G-Bristol-TN","P-42"],"cell":918273}
+{"seq":1043,"op":"delete","fact":["D-2024-01-06","C-002","G-Bristol-VA","P-17"],"cell":null}
+```
+A stale index records the last `seq` it incorporates. On load it either replays the delta or
+rebuilds from the canonical index (batch path); the delta is compacted at save/checkpoint.
+
+## 18. SQL keyword — examples to evaluate
+
+If the goal is flat-table SQL convenience, two candidates:
+
+**(a) Standard `ROLLUP`:**
+
+```sql
+SELECT Year, Quarter, Month, SUM(Sales)
+FROM OrdersFlat
+GROUP BY ROLLUP(Year, Quarter, Month)
+```
+One result set with subtotals (NULL marks the rolled-up level). No new storage; the engine's
+SQL front end would implement the grouping sets.
+
+**(b) An engine-specific level clause**, e.g. asking for the hierarchy's levels as columns:
+
+```sql
+SELECT LEVELS(Date), SUM(Sales) FROM OrdersTree GROUP BY LEVELS(Date)
+```
+returns `(Year, Quarter, Month, SUM)` per fact with its ancestors. This is the "flat view over
+the tree" without a second index; it is the cheapest way to get your quarter/month columns.
+
+The concrete failing query you have in mind determines which is needed; `ROLLUP` is standard and
+understood by SQL users, the level clause is engine-native.
+
+## 19. Open decisions after revision 2
+
+1. Star-schema enforcement: option 0/1/2/3 (§13), and if option 1/2, what happens on a missing
+   master member (refuse / autocreate / quarantine)?
+2. Are master attributes read-only through the fact view, or may they be snapshotted?
+3. City identity: qualified names, surrogate keys + attribute exposure, or display-name support
+   in the dimension model (§14)?
+4. Delete UX (§15): allow `RESHAPE` on a label that is also fact data? require fact-grain
+   `PURGE`?
+5. SQL keyword: `ROLLUP` or level clause (§18)?
+6. Benchmark 10⁶ facts × depth 20/30/40 before promising a wide flat cube (§6).
