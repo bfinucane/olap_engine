@@ -297,8 +297,8 @@ revision wins.
 2. **Cell token: `CellId`** into an arena (not `Arc<Cell>`); reclamation via epoch GC (§14.1).
 3. **Lazy loading with a delta log**: unloaded indexes are stale; writes append fact-level
    deltas they replay on load.
-4. **Delete UX: open** — examples in §15 to evaluate.
-5. **`viewOf` marker: yes**, mark it on the wire (§16).
+4. **Delete UX: not pressing** — postponed; the examples in §15 remain for later.
+5. **`viewOf` marker: yes — a tag in the data and an icon in the UI** (§16).
 6. Dimension counts/benchmark unchanged (§6); per-index caches confirmed.
 
 Consequence of (1): fact identity is the canonical **flat key** (the key columns + measures),
@@ -306,10 +306,19 @@ not a hierarchy leaf. The tree view derives a hierarchy leaf from those keys, an
 consolidations are pure metadata. This makes the "what is data vs shape" question sharper, not
 simpler — see §15.
 
+**Operator clarification (2026-11-02):** the reason enforcement is hard is the **source data**:
+the demo CSV mixes master data into the transaction rows (`Customer Name`, `City`, `State`,
+`Category`, `Product Name`, …). A flat canonical model has to split those into masters + keys;
+the engine has no modelling module to declare or enforce that. Such a module is required to
+finish the project but is **postponed**; until it exists the split is carried by import tooling
+and its validation (§20).
+
 ## 12. Why attributes break the flat model
 
 The demo columns `Customer ID` and `Customer Name` are master data: the name belongs to the
-customer, not to each order line. Three concrete shapes, to compare:
+customer, not to each order line. **Operator clarification:** this is the *source-data admixture*
+problem — master data arrives inside the transaction table instead of separate master tables.
+Three concrete shapes, to compare:
 
 **Example A — denormalised fact (what an importer produces today).**
 
@@ -519,6 +528,10 @@ and for the canonical flat view:
 Clients group by `schemeGroup`, warn before summing two views of one fact set, and choose the
 writable one. This is a wire addition (owner ruling).
 
+The four fields are the **data tag**; the UI additionally shows an **icon** for a view that is
+not canonical (operator decision 5). The tag is wire metadata (owner ruling); the icon is a
+client-side rendering decision.
+
 ## 17. Delta-log example (lazy loading)
 
 One record per write, canonical coordinate + new cell token (or tombstone):
@@ -530,39 +543,63 @@ One record per write, canonical coordinate + new cell token (or tombstone):
 A stale index records the last `seq` it incorporates. On load it either replays the delta or
 rebuilds from the canonical index (batch path); the delta is compacted at save/checkpoint.
 
-## 18. SQL keyword — examples to evaluate
+## 18. SQL convenience — removed from the core decisions
 
-If the goal is flat-table SQL convenience, two candidates:
+The operator's correction: deriving levels and parsing data is a **modelling** exercise, not a
+query-time operation. Query time must reference modelled levels/columns; it must not parse
+strings or infer structure. Therefore:
 
-**(a) Standard `ROLLUP`:**
+- the SQL-keyword idea is **not a design decision** for the multi-index work;
+- `YEAR(Date)`/`QUARTER(Date)`-style parsing is dropped (it would put modelling in queries);
+- if both shapes are modelled (flat and tree indexes), clients query the flat one directly and
+  need no keyword;
+- an optional console convenience (`EXPAND Date INTO (Year, Quarter, Month)`, or standard
+  `GROUP BY ROLLUP(...)` for subtotals) may be revisited later as **T3 engine tooling** — it
+  exposes already-modelled levels and changes no storage or semantics. It is not required.
 
-```sql
-SELECT Year, Quarter, Month, SUM(Sales)
-FROM OrdersFlat
-GROUP BY ROLLUP(Year, Quarter, Month)
-```
-One result set with subtotals (NULL marks the rolled-up level). No new storage; the engine's
-SQL front end would implement the grouping sets.
-
-**(b) An engine-specific level clause**, e.g. asking for the hierarchy's levels as columns:
-
-```sql
-SELECT LEVELS(Date), SUM(Sales) FROM OrdersTree GROUP BY LEVELS(Date)
-```
-returns `(Year, Quarter, Month, SUM)` per fact with its ancestors. This is the "flat view over
-the tree" without a second index; it is the cheapest way to get your quarter/month columns.
-
-The concrete failing query you have in mind determines which is needed; `ROLLUP` is standard and
-understood by SQL users, the level clause is engine-native.
-
-## 19. Open decisions after revision 2
+This leaves the design focused on the model: fact set, schemes, masters, indexes.
+## 19. Open decisions after revision 3
 
 1. Star-schema enforcement: option 0/1/2/3 (§13), and if option 1/2, what happens on a missing
    master member (refuse / autocreate / quarantine)?
 2. Are master attributes read-only through the fact view, or may they be snapshotted?
 3. City identity: qualified names, surrogate keys + attribute exposure, or display-name support
    in the dimension model (§14)?
-4. Delete UX (§15): allow `RESHAPE` on a label that is also fact data? require fact-grain
-   `PURGE`?
-5. SQL keyword: `ROLLUP` or level clause (§18)?
-6. Benchmark 10⁶ facts × depth 20/30/40 before promising a wide flat cube (§6).
+4. Delete UX: **postponed** (not pressing). The examples in §15 remain for when it is picked up.
+5. Benchmark 10⁶ facts × depth 20/30/40 before promising a wide flat cube (§6).
+
+The modelling module (star-schema declaration, level derivation, master validation) is required
+to finish the project and is **postponed**; §20 records the load-time contract the design assumes
+so it can be implemented inside that module later.
+## 20. Load-time contract (applied edit)
+
+Everything that interprets data belongs here, once, not per query.
+
+| Input | Load-time action | Failure |
+|---|---|---|
+| dates | parse an ISO date into the declared hierarchy (tree scheme) or into Year/Quarter/Month columns (flat scheme) | unparseable value names the row/column |
+| city/state labels | assign or require surrogate keys (`CityID`, `StateID`); validate uniqueness within parent | duplicate key or ambiguous label refuses the load |
+| master data | declare master tables (Customer, Product, Geography, Date) and their attributes; facts carry only keys | an attribute column in a fact table is refused unless declared a snapshot |
+| fact keys | check referential integrity against masters (or a declared autocreate policy) | unknown key refuses the row (or autocreates, per declaration) |
+| hierarchies | build from **key columns**, never from display labels; validate one parent per child and a unique path | ambiguous member refuses the hierarchy build |
+| measures | declared per fact set; the cell heap stores them (vector or measure dimension) | unknown measure refuses |
+
+Query time: `describe` exposes the declared columns/levels; queries address them directly.
+`ROLLUP` (later, optional T3) only produces subtotals over those columns. No query parses,
+derives or infers model structure.
+
+Until the modelling module exists, the import script/tool is responsible for the table above and
+must fail loudly instead of guessing. Today's `superstore-v2.sql` imports names straight from the
+CSV — exactly the admixture the operator flagged; the import rules above are what that module
+will formalise.
+
+## 21. Revision 3 — applied edits (2026-11-02)
+
+1. SQL-keyword item removed from the decisions and demoted to an optional T3 appendix (§18);
+   `YEAR()/QUARTER()` parsing dropped; shapes are modelled, queries reference them.
+2. Load-time contract added (§20): parsing/derivation, city keys, masters, referential integrity
+   all at intake; validation fails loudly.
+3. View marker clarified: data tag (`viewOf`/`schemeGroup`/`canonical`/`writable`) plus a UI icon
+   for non-canonical views (§16); delete UX marked postponed (§19).
+4. Operator clarifications recorded: flat canonical + star schema addresses the **source-data
+   admixture**; a modelling module is required but postponed.
