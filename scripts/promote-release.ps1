@@ -38,6 +38,12 @@ foreach ($f in @($CandExe, $CandDb)) {
   }
 }
 
+# RELEASE HYGIENE (decided 2026-11-02): once the maintenance command exists
+# (scripts\maintain-db.cmd --db <candidate> --steps all --backup, followed by a
+# verify-model fingerprint check), this script must run it on the CANDIDATE before
+# hashing and swapping, and abort on failure. It is not called yet: maintenance ships
+# with the fact-set storage work, and promotion must not silently claim hygiene it did
+# not perform.
 # Refuse to swap while anything is listening on the shared port.
 $inUse = $null
 try { $inUse = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop } catch { }

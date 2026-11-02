@@ -773,7 +773,7 @@ maintain --db <file> --steps ids[,heap,delta,nodes] [--dry-run] [--backup] [--ve
 ```
 
 or, for the operator, a `scripts\maintain-db.cmd` wrapper (execution-policy safe) with the same
-options. Each step has a name, a description, a safety class and a before/after report. `--steps
+options. **CLI only** (decided 2026-11-02): there is no server admin endpoint for maintenance. Each step has a name, a description, a safety class and a before/after report. `--steps
 all` runs the registered steps in a fixed order; a failing step aborts before the file is
 replaced. **Offline first:** the command refuses to run while the shared server is listening
 (the file must not be in use), loads the database, applies the steps, saves atomically
@@ -823,8 +823,12 @@ step can rely on the previous one.
   deliberately avoids. Offline it is a linear rebuild, with a backup and an atomic rename.
 - It is rare (after churn, before a release, or when the span cap is pushing bitmap/dense
   choices); an automatic trigger would surprise operators and complicate save/release.
-- The same command runs naturally in the **promotion** flow: maintain the candidate file, verify
-  its fingerprint, then promote and broadcast.
+- **Release hygiene (decided 2026-11-02):** `promote-release` runs `maintain --steps all --backup`
+  on the candidate **before** recording hashes, then re-runs `verify-model` (fingerprint must be
+  unchanged), then swaps and broadcasts. A maintenance failure aborts the promotion with the
+  candidate and the current release untouched. Until the maintenance command ships with the
+  fact-set storage work, promotion stays explicit and must not silently claim hygiene it did not
+  perform.
 
 ### 25.5 Acceptance
 
@@ -833,21 +837,40 @@ step can rely on the previous one.
 - On a synthetic dimension with 10,000 live members and ids to 50,000, `ids` yields span =
   10,000 and the model fingerprint is unchanged.
 - Server-listening detection: refuses with a clear message; no file written.
-- Backup + restore: a deliberately failing step leaves the original file intact.
+- Backup + restore: a deliberately failing step leaves the original file intact; a successful run
+  leaves `<file>.bak` (decision 3).
+- `--steps all` is the default and reports each step; `--dry-run` writes nothing.
+- Promotion hygiene: with maintenance available, the promoted hashes are from the maintained
+  candidate; the model fingerprint before/after maintenance and after promotion is identical.
 
-### 25.6 Open choices
+### 25.6 Decisions (2026-11-02)
 
-1. Surface for v1: offline CLI + `maintain-db.cmd` wrapper (recommended) — or also a server admin
-   endpoint (wire change) now?
-2. Default `--steps` when none given: `ids` only, or `all`?
-3. Backup retention: keep `<file>.bak` until the next successful maintenance, or never?
-4. Should promotion automatically run `maintain --steps all` on the candidate (as a release
-   hygiene step), or leave it explicit?
-5. Who may trigger it: operator only (offline anyway) — confirm that the server admin endpoint,
-   if added later, requires the admin role and quiescence.
+1. **Surface: CLI only.** `maintain-db.cmd` / the engine `--maintain` flag. No server admin
+   endpoint now; if one is ever added it needs the `admin` role and a quiescent instance, plus a
+   contract handoff because it is a wire change.
+2. **Default steps: `all`** — every registered step runs in the fixed order
+   (`delta` → `ids` → `heap` → `nodes` → `system` → `verify`). `--steps ids` remains available
+   for a targeted, cheap run.
+3. **Backup: keep `<file>.bak`.** Maintenance writes the pre-run file to `<file>.bak` and leaves
+   it; the next successful maintenance replaces it. Promotion keeps its own archive under
+   `shared\previous\<stamp>\`; the two are separate and both retained.
+4. **Promotion = release hygiene.** `promote-release` runs `maintain --steps all --backup` on the
+   candidate before hashing/swapping, then re-runs `verify-model` (fingerprint must be identical),
+   then records the new hashes. Failure aborts before anything is swapped.
+5. **Trigger rights confirmed:** operator-only (offline CLI). A future remote surface, if ever
+   added, is admin + quiescent; not part of this design.
 
+`--dry-run` remains the way to judge a cleanup before applying it; it prints the gap report and
+writes nothing.
 ## 26. Revision 6 — user-triggered cleanup recorded (2026-11-02)
 
 Added §25: a step-based maintenance command, `ids` compaction algorithm and safety, an extensible
 registry (nodes/heap/delta/cache/system/verify), offline-first invocation, acceptance tests, and
 open choices. The id-gap decision in §22.9 item 3 now points at this step instead of "later".
+## 27. Revision 7 — cleanup decisions (2026-11-02)
+
+Recorded the operator's answers to §25.6: CLI only (no admin endpoint); default `--steps all`;
+keep `<file>.bak`; promotion runs maintenance as release hygiene before hashing/swapping and
+re-verifies the fingerprint; operator-only confirmed. §25.4 promotion flow and §25.5 acceptance
+updated accordingly. The maintenance command itself ships with the fact-set storage work; until
+then promotion remains explicit and must not claim hygiene it did not run.
