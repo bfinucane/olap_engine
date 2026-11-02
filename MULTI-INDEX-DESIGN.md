@@ -716,3 +716,46 @@ baseline HashMap layout's estimate is retained as baseline, but the design now a
 branch nodes (singleton/sorted/bitmap/dense) with occupancy-based promotion, level defaults from
 dimension span, and path compression, all gated by the §22.6 benchmark. This does not change the
 decisions in §11; it changes how the memory question is answered.
+### 22.8 The id-gap issue (why span ≠ cardinality)
+
+Dimension ids are **internal, monotonic and never reused**: `add_leaf`/aggregate creation do
+`let id = next_id; next_id += 1`, and `delete_member` removes the id from the maps without
+decrementing `next_id`. So a dimension with 1,000 live members can have ids up to 50,000 after
+loads that create and delete members (re-imports, corrections, scratch loads).
+
+A dense array indexed by id must allocate `max_id + 1` slots, not `live_members` slots:
+
+- City dimension, 1,000 live cities, ids up to 50,000 → one dense node is 50,001 × 8 B ≈ **400 KB**
+  even if that node has 10 children; a sparse/sorted node is ≈ 160 B.
+- Bitmap has the same span problem (`span/8` bits) but is far cheaper: 50,000 bits ≈ 6 KB per
+  node; still bad if there are thousands of nodes at that level.
+- Sparse variants do not care about the span at all.
+
+Options considered:
+
+| Option | Cost | Decision |
+|---|---|---|
+| dense only when span ≤ cap; otherwise bitmap/sparse | none | **chosen for v1** |
+| renumber ids on compaction (`1..n`) | must remap every index and cell coordinate, atomically across views; internal ids so feasible at save/load | later option, not v1 |
+| local ordinal per node (compact slot + id→slot map) | O(1) lost, extra structure per node | rejected for now |
+
+The practical rule: **dense is keyed by span, and the span cap is benchmark-driven**; do not
+assume the live cardinality bounds the span.
+
+### 22.9 Decisions recorded (2026-11-02)
+
+1. **Path compression**: included from the start in the prototype/benchmark (it is the main lever
+   for wide flat schemes); the production implementation lands it as a **follow-up** after the
+   two-index fact-set model works. (Reading operator items 1 and 4 together; if "compression from
+   the start" was also meant for production, say so — that is the one open point.)
+2. **Span cap**: benchmark-driven. No fixed number: measure 4K/16K/64K spans and choose from the
+   memory/latency curve. The cap governs both dense arrays and bitmap span.
+3. **Id gaps**: no renumbering for v1. Dense only when span ≤ cap; otherwise bitmap/sparse; a
+   compaction pass is recorded as a later option (above).
+4. Benchmark matrix unchanged (§22.6); add the span/occupancy sweeps of (2).
+
+## 24. Revision 5 — adaptive choices recorded (2026-11-02)
+
+Added §22.8 (id-gap explanation) and §22.9 (operator decisions: compression in the prototype from
+the start, production follow-up; benchmark-driven span cap; no id renumbering in v1). No change to
+§11 decisions or §20 load-time contract.
