@@ -183,13 +183,16 @@ code). The practical constraints are real:
 
 - **Key length:** 4 bytes per dimension per cell in an index leaf; a 30-dimension index means
   30 ids on each path.
-- **Trie node cost:** this trie stores a `HashMap<u32, Arc<Node>>` per level and has **no path
-  compression**, so even a single-child run costs a node per dimension. Nodes are the dominant
-  memory term, not cells.
-- **Rough model:** node count is the number of distinct prefixes. With 10⁶ facts and high
-  cardinalities, a 30-dimension index can approach 10⁶ × 30 nodes in the worst case; at
-  ~50–100 bytes per node that is far too much. Realistic sharing (date levels, low-cardinality
-  dimensions first) reduces it greatly, but **this must be measured, not assumed**.
+- **Trie node cost (baseline):** the present trie stores a `HashMap<u32, Arc<Node>>` per level and
+  has **no path compression**, so even a single-child run costs a node per dimension. Nodes are
+  the dominant memory term, not cells. This is a *property of the current representation*, not of
+  the model: adaptive nodes and path compression (§22) can remove most of it, which is why the
+  dimension limit has to be measured per representation.
+- **Rough model (baseline layout):** node count is the number of distinct prefixes. With 10⁶
+  facts and high cardinalities, a 30-dimension index can approach 10⁶ × 30 nodes in the worst
+  case; at ~50–100 bytes per node that is far too much. Realistic sharing (date levels,
+  low-cardinality dimensions first) reduces it, and an adaptive layout (§22) reduces it much
+  further — **this must be measured per representation, not assumed**.
 - **One vs two indexes:** cells are stored once; index nodes roughly double. At 10⁶ facts, a
   single 30-dim index may already be the limiting factor.
 
@@ -197,9 +200,9 @@ Recommendations:
 1. **Benchmark before promising 30+ dimensions**: 10⁶ facts, flat index depth 20/30/40,
    measure node count, heap, load time, scan and write times, with one and two indexes.
 2. Keep the number of **materialized indexes** small (2–3); lazy loading makes this cheap.
-3. If memory is binding, the next lever is the trie representation (sorted-array children,
-   path compression), not a dimension cap. A soft product limit (documented, not enforced) can
-   follow the benchmark.
+3. If memory is binding, the next lever is the trie representation — adaptive branch nodes,
+   path compression (§22) — not a dimension cap. Benchmark the baseline layout and the adaptive
+   layout side by side; a soft product limit (documented, not enforced) can follow.
 4. Dimension order in a scheme is an optimisation: put the dimensions used for filtering early
    (the present `scan_subcube` prunes level by level; later dimensions cannot prune).
 
@@ -603,3 +606,113 @@ will formalise.
    for non-canonical views (§16); delete UX marked postponed (§19).
 4. Operator clarifications recorded: flat canonical + star schema addresses the **source-data
    admixture**; a modelling module is required but postponed.
+## 22. Adaptive node representation (operator note, 2026-11-02)
+
+The current node (`children: HashMap<u32, Arc<Node>> + value`) is the baseline, not the design.
+Multidimensional in-memory engines use adaptive branch nodes to trade lookup speed against
+memory across sparse spaces; this section records how that applies here.
+
+### 22.1 Branch variants
+
+| Variant | Lookup | Memory (rough) | Use when |
+|---|---|---|---|
+| singleton | O(1) | one `(id, Arc)` inline | exactly one child (very common in deep paths) |
+| small vector | O(n), n ≤ 8 | ~16·n | few children |
+| sorted vector | O(log n) | ~16·n | sparse node, moderate child count |
+| bitmap + pointer array | O(1) via rank/select (popcount) | C/8 + 8·n | medium density, large coordinate span |
+| dense direct array | O(1) | 8·C | high occupancy and/or small C |
+
+`n` = child count; `C` = dense coordinate span at that level (`max_id + 1` for the dimension,
+not its cardinality: ids are sequential but deletions leave gaps). A dense array indexed by a
+32-bit id is only safe under a span cap (e.g. 4–16K); beyond that use bitmap or sparse.
+
+### 22.2 Promotion and demotion
+
+Use **estimated bytes**, not only fill ratio, and compare variants:
+
+- sparse ≈ 16·n, bitmap ≈ C/8 + 8·n, dense ≈ 8·C;
+- promote to dense when `8·C < 2·(16·n)` (≈ occupancy > 25%) **and** `C ≤ span cap`;
+- promote to bitmap when `C/8 + 8·n < 16·n` (i.e. `C < 64·n`) and dense is not preferable;
+- demote with hysteresis (e.g. promote at > 0.30 occupancy, demote below 0.15) to avoid thrash;
+- conversions are path-copy writes: the old snapshot keeps the old representation (MVCC is
+  preserved), and the cost is O(children) on the write that converts.
+
+Examples with the demo cardinalities:
+
+| Level | Dimension | C (span) | Default |
+|---|---|---|---|
+| Year | 4 | 4 | dense, always (32 B) |
+| Quarter | 16 | 16 | dense (128 B) |
+| Month | 48 | 48 | dense (384 B) |
+| City | ~1,000 | ~1,000 | sparse/bitmap; dense only if most cities appear under each parent |
+| CustomerID | ~10,000 | ~10,000 | bitmap or sparse; never dense per node |
+| unique-ish (RowID) | 10⁶ | 10⁶ | sparse/path-compressed; dense excluded by span cap |
+
+So the correct statement is **"low-span / low-cardinality levels default to dense; occupancy and
+span decide the rest"** — not "upper levels are always dense". Level-based defaults come from the
+dimension metadata at that position in the scheme (span, expected fan-out, position).
+
+### 22.3 Path compression
+
+Runs of nodes with exactly one child and no value collapse into one edge carrying the path ids
+(`Vec<u32>`): a Patricia trie. This matters most for wide flat schemes, where the last dimensions
+are often unique per fact: without compression that is one node *per dimension per fact*; with
+compression it is one edge per fact carrying its remaining ids (~4 bytes each), eliminating the
+per-node/HashMap overhead. Insert splits a compressed edge at the divergence; delete merges it.
+`scan_subcube` must test every id in a compressed path against its allowed set (prefix pruning
+still works when the filter dimension falls beyond the compressed segment).
+
+### 22.4 MVCC, persistence and format
+
+- Variants and compressed edges are part of the node; path-copy keeps snapshots correct, and
+  promotion/demotion never mutates an existing version.
+- Persistence must serialise the variant tag (format bump in the fact-set/views work). No wire
+  change: this is internal storage.
+- Caches stay per index; a write that converts nodes still bumps only the affected index/store
+  version.
+
+### 22.5 Revised expectation for the 10⁶-fact flat cube
+
+The earlier estimate (≈18–22 M nodes for 22 dimensions) assumed HashMap nodes. With singleton +
+sorted/bitmap/dense variants and path compression, the dominant per-level node overhead is
+replaced by: small dense arrays at low-span levels, bitmaps at medium span, and compressed path
+ids at high span. Illustratively, a 22-dimension, 10⁶-fact index with low-cardinality date/geo
+levels first and unique-ish tail dimensions could fall from ~20 M nodes to a few million
+branch/leaf nodes plus ~4 bytes × remaining dimensions per fact (~50–90 MB of path ids) —
+plausibly a 3–10× reduction, **but the branching factor in the middle levels decides it and only
+a benchmark can settle it**. Two indexes still roughly double index memory; cells remain shared
+and single-copy.
+
+### 22.6 Benchmark additions
+
+Compare, at 10⁵ and 10⁶ facts:
+
+- representations: baseline HashMap; singleton+sorted; +bitmap; +dense (spans 64/1K/16K);
+  +path compression;
+- thresholds: occupancy 0.25 vs 0.50; hysteresis on/off;
+- schemes: tree (8 dims), flat (22), wide (30), with 1 and 4 measures; one and two indexes;
+- metrics: RSS, node/edge counts, serialized size, load/save time, Q1–Q8 latencies, write 10k
+  cells, conversion counts.
+
+The benchmark answers the dimension question: with adaptive nodes the practical limit may be
+set by the **middle-level branching factor and the span cap**, not by a flat dimension cap.
+
+### 22.7 Open choices
+
+1. Variant set for the first implementation: singleton + sorted vector + dense, with bitmap and
+   path compression later? Or all at once (a much harder MVCC/serialisation change)?
+2. Dense span cap: 4K, 16K, or profile-driven?
+3. Occupancy thresholds (0.25/0.25 hysteresis?) and whether conversion cost should be amortised
+   across writes.
+4. Dimension-id gaps: accept sparse spans (dense excluded), renumber ids on compaction, or keep
+   bitmap only.
+5. Is path compression in scope for the first fact-set implementation, or a follow-up after the
+   two-index model works?
+
+## 23. Revision 4 — adaptive nodes recorded (2026-11-02)
+
+Added §22 and revised §6: the dimension/memory limit is **representation-dependent**. The
+baseline HashMap layout's estimate is retained as baseline, but the design now assumes adaptive
+branch nodes (singleton/sorted/bitmap/dense) with occupancy-based promotion, level defaults from
+dimension span, and path compression, all gated by the §22.6 benchmark. This does not change the
+decisions in §11; it changes how the memory question is answered.
