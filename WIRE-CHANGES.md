@@ -121,6 +121,24 @@ run it before any wire commit).
 
 # Changelog (newest first)
 
+### `0e4214d` — no implicit default member; an omitted dimension aggregates all
+
+**Behavioural change, no new wire fields.** The first member of a dimension is no longer a
+default. Without a user-defined default, a query that omits a dimension aggregates across **all**
+its base members. A default exists only when set explicitly (`.default_member <dim> <member>`);
+it is then applied as an implicit filter by both the plan/wire path and the SQL front end. System
+cubes and the measure dimension are never defaulted.
+
+- **Legacy catalogues migrate without a rewrite:** old files stored an unflagged auto-default;
+  those ids are ignored, so existing files simply stop restricting. New explicit defaults carry
+  a flag bit and survive save/load.
+- **SQL totals were understated before this fix:** on the seeded v1 model, `SUM(value)` returned
+  the 2,236,176.96 subset produced by the auto-first-member filters; it now returns the full
+  **26,763,427.43**, and the per-Region sums match the documented values. Grouping a dimension
+  explicitly is unaffected by its default.
+- Clients: no route/field/capability changed. If an operator sets a default (CLI only; there is
+  no wire route to set one), omitted-dimension queries change meaning by design. Contract wording
+  requested in handoff 016.
 ### Wave 4 — PROTOCOL §11.4 and §11.5 closed (engine/database session)
 
 #### §11.4 — measures + the measure-dimension axis are refused
