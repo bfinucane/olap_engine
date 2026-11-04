@@ -2206,3 +2206,42 @@ fn measures_plus_the_measure_dimension_axis_are_refused() {
         "a measure axis without measures must stay allowed"
     );
 }
+
+/// Operator rule: no implicit default. Omitting a dimension aggregates ALL its base members;
+/// an EXPLICIT user default is the only thing that restricts an omitted dimension.
+#[test]
+fn omitted_dimensions_aggregate_all_unless_an_explicit_default_exists() {
+    let mut catalog = build_catalog();
+    let mut p = request("Sales");
+    measure(&mut p, "Sales", "SUM");
+    let all = wire::query(&mut catalog, &p).expect("all regions");
+    let all_total = all.rows[0][0].as_f64().expect("numeric total");
+
+    catalog
+        .get_dimension("Region")
+        .expect("Region dimension")
+        .write()
+        .expect("dimension lock")
+        .set_default_member("East")
+        .expect("set explicit default");
+
+    let east = wire::query(&mut catalog, &p).expect("defaulted query");
+    let east_total = east.rows[0][0].as_f64().expect("numeric total");
+    assert!(
+        east_total > 0.0 && east_total < all_total,
+        "an explicit default restricts the query: all={all_total}, east={east_total}"
+    );
+
+    catalog
+        .get_dimension("Region")
+        .expect("Region dimension")
+        .write()
+        .expect("dimension lock")
+        .clear_default_member();
+    let cleared = wire::query(&mut catalog, &p).expect("cleared query");
+    assert_eq!(
+        cleared.rows[0][0].as_f64().expect("numeric total"),
+        all_total,
+        "clearing the default returns to aggregating all base members"
+    );
+}

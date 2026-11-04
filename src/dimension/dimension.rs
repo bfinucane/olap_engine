@@ -57,10 +57,18 @@ pub struct Dimension {
 
     next_id: u32,
 
-    // Tracks the explicit default leaf, or the first element added.
+    /// The EXPLICIT default member, encoded with `EXPLICIT_DEFAULT_FLAG`.
+    ///
+    /// `None` means **there is no default member**: a query that omits this dimension
+    /// aggregates across all its base members. A legacy file (written before this rule)
+    /// stored an unflagged id for the auto-assigned first member; those are deliberately NOT
+    /// honoured - an unflagged id reads as "no default", so old catalogues migrate by
+    /// stopping the implicit restriction.
     pub default_member_id: Option<u32>,
 }
 
+/// Marks a default member the USER set. Unflagged ids are legacy auto-defaults and are ignored.
+const EXPLICIT_DEFAULT_FLAG: u32 = 1 << 31;
 impl Dimension {
 
     pub fn new(name: &str) -> Self {
@@ -213,9 +221,8 @@ impl Dimension {
             h.register_leaf_alias(name, id);
         }
 
-        if self.default_member_id.is_none() {
-            self.default_member_id = Some(id);
-        }
+        // NO automatic default member. The first member is not special: omitting the
+        // dimension aggregates all base members unless the user sets a default explicitly.
         id
     }
 
@@ -498,8 +505,10 @@ impl Dimension {
     }
 
     fn fix_default(&mut self, deleted_id: u32) {
-        if self.default_member_id == Some(deleted_id) {
-            self.default_member_id = self.leaf_name_to_id.values().copied().min();
+        // Deleting the user's default leaves the dimension with NO default again. Never
+        // promote another member: an implicit default is exactly what this rule removes.
+        if self.explicit_default_id() == Some(deleted_id) {
+            self.default_member_id = None;
         }
     }
 
@@ -567,41 +576,65 @@ impl Dimension {
 
     // --- DEFAULT MEMBER ---
 
+    /// Sets the user's EXPLICIT default member. Queries that omit this dimension will then use
+    /// that member (the same way a declared default works in other engines). Without this, the
+    /// dimension has no default and an omitted dimension aggregates over all base members.
     pub fn set_default_member(&mut self, name: &str) -> Result<(), String> {
-        if let Some(id) = self.get_id(name) {
-            self.default_member_id = Some(id);
+        // The default is injected as a filter in the DEFAULT hierarchy, so a member that only
+        // lives in another hierarchy could never be honoured. Refuse it instead of storing a
+        // default that silently does nothing.
+        if let Some(id) = self.get_id_in(None, name) {
+            if id & EXPLICIT_DEFAULT_FLAG != 0 {
+                return Err(format!("Member id {} cannot be used as a default", id));
+            }
+            self.default_member_id = Some(id | EXPLICIT_DEFAULT_FLAG);
             Ok(())
+        } else if self.get_id(name).is_some() {
+            Err(format!(
+                "Member '{}' exists only outside the default hierarchy of '{}'; a default must be addressable there",
+                name, self.name
+            ))
         } else {
-            Err(format!("Member '{}' does not exist in dimension '{}'", name, self.name))
+            Err(format!(
+                "Member '{}' does not exist in dimension '{}'",
+                name, self.name
+            ))
         }
     }
 
-    /// The member used when a query leaves this dimension unnamed.
+    /// Removes the explicit default; the dimension returns to "no default".
+    pub fn clear_default_member(&mut self) {
+        self.default_member_id = None;
+    }
+
+    /// True when the user has explicitly set a default member (legacy auto-defaults are not).
+    pub fn has_explicit_default(&self) -> bool {
+        self.explicit_default_id().is_some()
+    }
+
+    fn explicit_default_id(&self) -> Option<u32> {
+        self.default_member_id
+            .filter(|id| id & EXPLICIT_DEFAULT_FLAG != 0)
+            .map(|id| id & !EXPLICIT_DEFAULT_FLAG)
+    }
+
+    /// The member a query uses when it omits this dimension, or `None`.
     ///
-    /// It must be ADDRESSABLE in the DEFAULT hierarchy, because that is how a generated
-    /// filter is resolved. A dimension with several hierarchies can have its
-    /// first-created member living in one of the others — `default_member_id` follows
-    /// "first added", not "first in the default hierarchy" — which produced
-    /// `Member 'Furniture' not found` when such a name was injected as a filter.
+    /// There is **no implicit default**: a dimension with no user-set default returns `None` and
+    /// the query aggregates across every base member. A legacy unflagged id is ignored.
     ///
-    /// Falling back to the LOWEST id present in the default hierarchy keeps the choice
-    /// deterministic (ids are never reused), where iterating a HashMap would not.
+    /// An explicit default is only usable when it is ADDRESSABLE in the DEFAULT hierarchy,
+    /// because that is how an injected filter is resolved; otherwise this returns `None`
+    /// rather than inventing a fallback.
     pub fn get_default_member_name(&self) -> Option<String> {
-        if let Some(name) = self.default_member_id.map(|id| self.get_name(id))
-            && self.get_id_in(None, &name).is_some()
-        {
-            return Some(name);
+        let id = self.explicit_default_id()?;
+        let name = self.get_name(id);
+        if self.get_id_in(None, &name).is_some() {
+            Some(name)
+        } else {
+            None
         }
-
-        let hierarchy = self.resolve_hierarchy(None)?;
-        let lowest = hierarchy
-            .registered_ids()
-            .into_iter()
-            .min()
-            .and_then(|id| hierarchy.member_name(id).map(str::to_string));
-        lowest
     }
-
     // --- QUERIES OVER THE LEAF BANK / HIERARCHIES ---
 
     /// Total number of distinct members across the leaf bank and all

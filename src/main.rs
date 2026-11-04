@@ -475,7 +475,8 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                 let _ = writeln!(out, "  .import_attr <file.csv> <cube> - Import STRING attributes (key..., attr, value)");
                 let _ = writeln!(out, "  .rollup <hier> <p> <c> <wt>  - Create parent/child hierarchy relation");
                 let _ = writeln!(out, "  .detach <hier> <p> <c>       - Remove a parent/child hierarchy relation");
-                let _ = writeln!(out, "  .delete_member <dim> <member>- Delete a member and purge its data");
+                let _ = writeln!(out, "  .delete_member <dim> <member>- Delete a member and purge its data
+  .default_member <dim> [<m>|none] - Set/clear/show the explicit default member (no implicit default)");
                 let _ = writeln!(out, "  .splash [ADD] <cube> <val> <m...> - Allocate a value to leaf descendants");
                 let _ = writeln!(out, "                                 (qualify a member as Hierarchy:Member)");
                 let _ = writeln!(out, "  .order <hier> [<m> front | <m> before <r>] - Set/show member display order");
@@ -1000,6 +1001,71 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
 
             // Delete a member ENTIRELY (a big operation): removed from the
             // dimension and all referencing data purged from every cube.
+            // .default_member <dimension>            -> show
+            // .default_member <dimension> <member>   -> set an EXPLICIT default
+            // .default_member <dimension> none       -> clear it
+            //
+            // There is NO implicit default: without one, a query that omits the dimension
+            // aggregates across all its base members. A default is a user choice.
+            ".default_member" => {
+                if parts.len() == 2 || parts.len() == 3 {
+                    let wanted = parts[1];
+                    let key = catalog
+                        .dimensions
+                        .keys()
+                        .find(|name| name.eq_ignore_ascii_case(wanted))
+                        .cloned();
+                    match key {
+                        Some(key) => {
+                            let arc = catalog.dimensions[&key].clone();
+                            let mut dim = arc.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if parts.len() == 2 {
+                                match dim.get_default_member_name() {
+                                    Some(name) => {
+                                        let _ = writeln!(out, "Default member of '{}': {}", dim.name, name);
+                                    }
+                                    None => {
+                                        let _ = writeln!(
+                                            out,
+                                            "Dimension '{}' has no default member; a query that omits it aggregates all base members.",
+                                            dim.name
+                                        );
+                                    }
+                                }
+                            } else if parts[2].eq_ignore_ascii_case("none") {
+                                dim.clear_default_member();
+                                let _ = writeln!(
+                                    out,
+                                    "Cleared the default member of '{}'; omitted queries aggregate all base members.",
+                                    dim.name
+                                );
+                            } else {
+                                match dim.set_default_member(parts[2]) {
+                                    Ok(()) => {
+                                        let _ = writeln!(
+                                            out,
+                                            "Default member of '{}' is now '{}'.",
+                                            dim.name,
+                                            parts[2]
+                                        );
+                                    }
+                                    Err(reason) => {
+                                        let _ = writeln!(out, "Error: {}", reason);
+                                        ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = writeln!(out, "Dimension '{}' not found.", wanted);
+                            ok = false;
+                        }
+                    }
+                } else {
+                    let _ = writeln!(out, "Usage: .default_member <dimension> [<member>|none]");
+                    ok = false;
+                }
+            }
             ".delete_member" | ".drop_member" => {
                 if parts.len() == 3 {
                     match catalog.delete_member(parts[1], parts[2]) {

@@ -1048,6 +1048,29 @@ fn build_slice_query(catalog: &Catalog, plan: &QueryRequest) -> Result<SliceQuer
         }
     }
 
+    // NO IMPLICIT DEFAULT (operator rule, 2026-11-01): a query that omits a dimension aggregates
+    // across ALL its base members. Only a user-defined EXPLICIT default is honoured, as an
+    // implicit filter. Legacy catalogues stored an auto-assigned first member; those ids are
+    // unflagged and `get_default_member_name` ignores them, so old files migrate to "aggregate
+    // all" without a rewrite. System cubes are metadata tables: never default them.
+    if !crate::catalog::system_cubes::is_system(&cube.name) {
+        for (index, dimension_name) in cube.dimension_names.iter().enumerate() {
+            if Some(dimension_name.as_str()) == cube.measure_dimension.as_deref() {
+                continue;
+            }
+            if axes.iter().any(|axis| axis == dimension_name)
+                || filters.contains_key(dimension_name)
+            {
+                continue;
+            }
+            let dimension = cube.dimensions[index]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(default_name) = dimension.get_default_member_name() {
+                filters.insert(dimension_name.clone(), vec![default_name]);
+            }
+        }
+    }
     let mut output_columns: Vec<String> = plan.group_by.iter().map(|g| g.name.clone()).collect();
     if has_calculated || expanded_value {
         // The slice returns the raw aggregate slots; `apply_calculated_fields` evaluates
