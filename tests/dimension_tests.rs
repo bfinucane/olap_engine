@@ -78,3 +78,33 @@ fn an_explicit_default_must_resolve_in_the_default_hierarchy() {
     assert!(error.contains("default hierarchy"), "{error}");
     assert_eq!(dim.get_default_member_name(), None);
 }
+
+#[test]
+fn model_declaration_and_cli_override_are_separate_revocable_layers() {
+    let mut dim = Dimension::new("Region");
+    dim.add_leaf("East");
+    dim.add_leaf("West");
+
+    // Model declares a default.
+    dim.set_model_default_member("East").expect("declare the model default");
+    assert_eq!(dim.model_default_member_name().as_deref(), Some("East"));
+    assert_eq!(dim.get_default_member_name().as_deref(), Some("East"));
+
+    // CLI override wins.
+    dim.set_default_member("West").expect("override the default");
+    assert_eq!(dim.get_default_member_name().as_deref(), Some("West"));
+
+    // Override-to-none suppresses the model declaration without deleting it.
+    dim.clear_default_member();
+    assert!(dim.override_is_cleared());
+    assert_eq!(dim.get_default_member_name(), None);
+
+    // Revoking the override restores the model declaration (settings are undoable).
+    dim.revert_to_model_default();
+    assert_eq!(dim.get_default_member_name().as_deref(), Some("East"));
+
+    // Revoking the model declaration too leaves no default.
+    dim.clear_model_default_member();
+    assert_eq!(dim.model_default_member_name(), None);
+    assert_eq!(dim.get_default_member_name(), None);
+}

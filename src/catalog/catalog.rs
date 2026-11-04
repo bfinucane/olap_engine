@@ -15,7 +15,7 @@ const CATALOG_MAGIC: [u8; 4] = *b"OLAP";
 /// Current on-disk format version. Bump this whenever the serialized layout
 /// changes (new fields, changed types) and add a migration branch in
 /// `load_from_disk`.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Errors that can occur while persisting or loading a catalog.
 #[derive(Debug)]
@@ -72,15 +72,37 @@ impl From<std::io::Error> for PersistError {
 struct PersistedCatalog {
     magic: [u8; 4],
     version: u32,
-    payload: CatalogDiskFormat,
+    payload: CatalogDiskFormatV2,
 }
 
 // The serialized shape of the catalog. This is the PAYLOAD of `PersistedCatalog`
 // and should change only in lockstep with `FORMAT_VERSION`.
+//
+// v2 adds `model_defaults`: dimension name -> member name, the MODEL-declared default members.
+// They are stored by NAME (not id) so an id renumbering/cleanup cannot corrupt them; the loader
+// resolves each name to an id in the default hierarchy. v1 files load through the legacy struct
+// below with an empty map (no model defaults), so the migration is read-compatible and the next
+// save writes v2.
 #[derive(Serialize, Deserialize)]
-struct CatalogDiskFormat {
+struct CatalogDiskFormatV2 {
     dimensions: HashMap<String, Dimension>,
     cubes: HashMap<String, Cube>,
+    model_defaults: HashMap<String, String>,
+}
+
+/// The v1 payload (before model defaults). Kept only to migrate old files.
+#[derive(Serialize, Deserialize)]
+struct CatalogDiskFormatV1 {
+    dimensions: HashMap<String, Dimension>,
+    cubes: HashMap<String, Cube>,
+}
+
+/// v1 envelope, used only by the loader's migration branch.
+#[derive(Serialize, Deserialize)]
+struct PersistedCatalogV1 {
+    magic: [u8; 4],
+    version: u32,
+    payload: CatalogDiskFormatV1,
 }
 
 /// The whole database: dimensions (shared by `Arc`) and cubes.
@@ -323,15 +345,22 @@ impl Catalog {
     /// the on-disk file reflects a single coherent moment, never a half-applied
     /// write. (Phase 1b will replace the deep clone with a copy-on-write version
     /// store that does not freeze writers.)
-    fn snapshot(&self) -> CatalogDiskFormat {
-        let mut disk_data = CatalogDiskFormat {
-            dimensions: HashMap::new(),
-            cubes: self.cubes.clone(),
-        };
+    fn snapshot(&self) -> CatalogDiskFormatV2 {
+        let mut dimensions: HashMap<String, Dimension> = HashMap::new();
+        let mut model_defaults: HashMap<String, String> = HashMap::new();
         for (name, dim_arc) in &self.dimensions {
-            disk_data.dimensions.insert(name.clone(), dim_arc.read().unwrap().clone());
+            let dim = dim_arc.read().unwrap();
+            // Model declarations persist by NAME: ids are internal and may be renumbered.
+            if let Some(member) = dim.model_default_member_name() {
+                model_defaults.insert(name.clone(), member);
+            }
+            dimensions.insert(name.clone(), dim.clone());
         }
-        disk_data
+        CatalogDiskFormatV2 {
+            dimensions,
+            cubes: self.cubes.clone(),
+            model_defaults,
+        }
     }
 
     /// Durably saves the catalog to `filepath`.
@@ -439,25 +468,52 @@ impl Catalog {
                 supported: FORMAT_VERSION,
             });
         }
-        // (When FORMAT_VERSION grows, migration branches for older versions go
-        //  here. For now there is only v1, so nothing to migrate.)
-
+        // Migration: v1 (no model defaults) reads through the legacy struct; v2 carries the
+        // dimension-name -> member-name map. A newer file is refused above.
         // Decode the payload. We re-read the whole file from the start because
         // bincode consumes the header bytes again into the envelope struct.
         let mut reader = BufReader::new(File::open(filepath)?);
-        let envelope: PersistedCatalog =
-            bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
-
-        let disk_data = envelope.payload;
+        let (disk_dimensions, disk_cubes, model_defaults) = match version {
+            1 => {
+                let envelope: PersistedCatalogV1 =
+                    bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
+                (envelope.payload.dimensions, envelope.payload.cubes, HashMap::new())
+            }
+            2 => {
+                let envelope: PersistedCatalog =
+                    bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
+                (
+                    envelope.payload.dimensions,
+                    envelope.payload.cubes,
+                    envelope.payload.model_defaults,
+                )
+            }
+            other => {
+                return Err(PersistError::UnsupportedVersion {
+                    found: other,
+                    supported: FORMAT_VERSION,
+                });
+            }
+        };
         let mut catalog = Catalog::new();
 
         // 1. Restore dimensions and put them back into locks
-        for (name, dim) in disk_data.dimensions {
+        for (name, dim) in disk_dimensions {
             catalog.dimensions.insert(name, Arc::new(RwLock::new(dim)));
         }
 
+        // 1b. Restore model-declared defaults by NAME (ids are not persisted for them).
+        for (dimension_name, member_name) in model_defaults {
+            if let Some(dim_arc) = catalog.dimensions.get(&dimension_name) {
+                let mut dim = dim_arc.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(id) = dim.get_id_in(None, &member_name) {
+                    dim.model_default_member_id = Some(id);
+                }
+            }
+        }
+
         // 2. Restore cubes & reconnect shared dimensions
-        for (name, mut cube) in disk_data.cubes {
+        for (name, mut cube) in disk_cubes {
             let mut dim_arcs = Vec::new();
             for dim_name in &cube.dimension_names {
                 dim_arcs.push(catalog.get_or_create_dimension(dim_name));

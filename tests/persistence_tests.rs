@@ -421,3 +421,33 @@ fn write_rejects_a_coordinate_dimension_mismatch_instead_of_panicking() {
         "unexpected error text: {err_splashed}"
     );
 }
+
+/// Model-declared defaults survive a save/load round-trip (catalogue format v2 stores them by
+/// NAME, so an id renumbering cannot corrupt them), and the CLI override layer survives too.
+#[test]
+fn model_defaults_round_trip_through_the_catalogue() {
+    let path = temp_path("model_defaults");
+    let mut catalog = Catalog::new();
+    {
+        let dim = catalog.get_or_create_dimension("Region");
+        let mut dim = dim.write().expect("dimension lock");
+        dim.add_leaf("East");
+        dim.add_leaf("West");
+        dim.set_model_default_member("East").expect("declare model default");
+        dim.set_default_member("West").expect("set CLI override");
+    }
+    catalog.save_to_disk(path.to_str().expect("path")).expect("save");
+    let loaded = Catalog::load_from_disk(path.to_str().expect("path")).expect("load");
+    let dim = loaded.get_dimension("Region").expect("Region dimension");
+    let dim = dim.write().expect("dimension lock");
+    assert_eq!(dim.model_default_member_name().as_deref(), Some("East"));
+    assert_eq!(dim.get_default_member_name().as_deref(), Some("West"), "override wins");
+
+    // Revoking the override restores the model default after a reload as well.
+    drop(dim);
+    let dim = loaded.get_dimension("Region").expect("Region dimension");
+    let mut dim = dim.write().expect("dimension lock");
+    dim.revert_to_model_default();
+    assert_eq!(dim.get_default_member_name().as_deref(), Some("East"));
+    let _ = std::fs::remove_file(&path);
+}

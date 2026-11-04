@@ -476,7 +476,8 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                 let _ = writeln!(out, "  .rollup <hier> <p> <c> <wt>  - Create parent/child hierarchy relation");
                 let _ = writeln!(out, "  .detach <hier> <p> <c>       - Remove a parent/child hierarchy relation");
                 let _ = writeln!(out, "  .delete_member <dim> <member>- Delete a member and purge its data
-  .default_member <dim> [<m>|none] - Set/clear/show the explicit default member (no implicit default)");
+  .default_member <dim> [<m>|none|model] - CLI default override (model|none revokes it)
+  .model_default <dim> [<m>|none] - Declare/clear the MODEL default member (seed/model authoring)");
                 let _ = writeln!(out, "  .splash [ADD] <cube> <val> <m...> - Allocate a value to leaf descendants");
                 let _ = writeln!(out, "                                 (qualify a member as Hierarchy:Member)");
                 let _ = writeln!(out, "  .order <hier> [<m> front | <m> before <r>] - Set/show member display order");
@@ -1007,6 +1008,13 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
             //
             // There is NO implicit default: without one, a query that omits the dimension
             // aggregates across all its base members. A default is a user choice.
+            // .default_member <dimension>                 -> show model default, override, effective
+            // .default_member <dimension> <member>        -> CLI override: use that member
+            // .default_member <dimension> none            -> CLI override: no default (suppress model)
+            // .default_member <dimension> model|revert    -> revoke the override (model applies again)
+            //
+            // Settings must be revocable: every layer (model declaration and CLI override) can be
+            // undone, and no command is a one-way street.
             ".default_member" => {
                 if parts.len() == 2 || parts.len() == 3 {
                     let wanted = parts[1];
@@ -1020,31 +1028,105 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                             let arc = catalog.dimensions[&key].clone();
                             let mut dim = arc.write().unwrap_or_else(|poisoned| poisoned.into_inner());
                             if parts.len() == 2 {
-                                match dim.get_default_member_name() {
-                                    Some(name) => {
-                                        let _ = writeln!(out, "Default member of '{}': {}", dim.name, name);
-                                    }
-                                    None => {
-                                        let _ = writeln!(
-                                            out,
-                                            "Dimension '{}' has no default member; a query that omits it aggregates all base members.",
-                                            dim.name
-                                        );
-                                    }
-                                }
-                            } else if parts[2].eq_ignore_ascii_case("none") {
-                                dim.clear_default_member();
+                                let model = dim.model_default_member_name();
+                                let override_member = dim.override_member_name();
+                                let override_cleared = dim.override_is_cleared();
+                                let effective = dim.get_default_member_name();
+                                let _ = writeln!(out, "Dimension '{}':", dim.name);
                                 let _ = writeln!(
                                     out,
-                                    "Cleared the default member of '{}'; omitted queries aggregate all base members.",
-                                    dim.name
+                                    "  model default   : {}",
+                                    model.as_deref().unwrap_or("(none)")
+                                );
+                                let override_text = if override_cleared {
+                                    "none (suppresses the model default)".to_string()
+                                } else {
+                                    override_member.clone().unwrap_or_else(|| "(none)".to_string())
+                                };
+                                let _ = writeln!(out, "  CLI override    : {}", override_text);
+                                let _ = writeln!(
+                                    out,
+                                    "  effective default: {}",
+                                    effective.as_deref().unwrap_or("(none - omitted queries aggregate all)")
                                 );
                             } else {
-                                match dim.set_default_member(parts[2]) {
+                                let action = parts[2];
+                                let result = if action.eq_ignore_ascii_case("none") {
+                                    dim.clear_default_member();
+                                    Ok(())
+                                } else if action.eq_ignore_ascii_case("model")
+                                    || action.eq_ignore_ascii_case("revert")
+                                    || action.eq_ignore_ascii_case("reset")
+                                {
+                                    dim.revert_to_model_default();
+                                    Ok(())
+                                } else {
+                                    dim.set_default_member(action)
+                                };
+                                match result {
                                     Ok(()) => {
                                         let _ = writeln!(
                                             out,
-                                            "Default member of '{}' is now '{}'.",
+                                            "Default member of '{}' is now: {}",
+                                            dim.name,
+                                            dim.get_default_member_name()
+                                                .unwrap_or_else(|| "(none; omitted queries aggregate all)".to_string())
+                                        );
+                                    }
+                                    Err(reason) => {
+                                        let _ = writeln!(out, "Error: {}", reason);
+                                        ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = writeln!(out, "Dimension '{}' not found.", wanted);
+                            ok = false;
+                        }
+                    }
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "Usage: .default_member <dimension> [<member>|none|model]"
+                    );
+                    ok = false;
+                }
+            }
+
+            // .model_default <dimension>            -> show the model-declared default
+            // .model_default <dimension> <member>   -> declare it (model authoring / seed)
+            // .model_default <dimension> none       -> remove the declaration
+            //
+            // This is the MODEL layer; a CLI override set with `.default_member` wins over it.
+            ".model_default" => {
+                if parts.len() == 2 || parts.len() == 3 {
+                    let wanted = parts[1];
+                    let key = catalog
+                        .dimensions
+                        .keys()
+                        .find(|name| name.eq_ignore_ascii_case(wanted))
+                        .cloned();
+                    match key {
+                        Some(key) => {
+                            let arc = catalog.dimensions[&key].clone();
+                            let mut dim = arc.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if parts.len() == 2 {
+                                let _ = writeln!(
+                                    out,
+                                    "Model default of '{}': {}",
+                                    dim.name,
+                                    dim.model_default_member_name().as_deref().unwrap_or("(none)")
+                                );
+                            } else if parts[2].eq_ignore_ascii_case("none") {
+                                dim.clear_model_default_member();
+                                let _ = writeln!(out, "Removed the model default of '{}'.", dim.name);
+                            } else {
+                                match dim.set_model_default_member(parts[2]) {
+                                    Ok(()) => {
+                                        let _ = writeln!(
+                                            out,
+                                            "Model default of '{}' is now '{}'.",
                                             dim.name,
                                             parts[2]
                                         );
@@ -1062,7 +1144,7 @@ fn process_command(catalog: &mut Catalog, line: &str, out: &mut String, db_path:
                         }
                     }
                 } else {
-                    let _ = writeln!(out, "Usage: .default_member <dimension> [<member>|none]");
+                    let _ = writeln!(out, "Usage: .model_default <dimension> [<member>|none]");
                     ok = false;
                 }
             }

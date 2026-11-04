@@ -57,14 +57,18 @@ pub struct Dimension {
 
     next_id: u32,
 
-    /// The EXPLICIT default member, encoded with `EXPLICIT_DEFAULT_FLAG`.
+    /// The CLI OVERRIDE of the default member, encoded with `EXPLICIT_DEFAULT_FLAG`.
     ///
-    /// `None` means **there is no default member**: a query that omits this dimension
-    /// aggregates across all its base members. A legacy file (written before this rule)
-    /// stored an unflagged id for the auto-assigned first member; those are deliberately NOT
-    /// honoured - an unflagged id reads as "no default", so old catalogues migrate by
-    /// stopping the implicit restriction.
+    /// Encoding: `None` = no override; `Some(FLAG | id)` = override set to that member;
+    /// `Some(FLAG)` (id bits zero) = override cleared, i.e. suppress any model default.
+    /// A legacy unflagged id (auto-assigned first member of an old file) reads as "no override".
     pub default_member_id: Option<u32>,
+
+    /// The MODEL-declared default, restored from the catalogue-level `model_defaults` map at
+    /// load time. Runtime only: the catalogue persists it as a dimension-name -> member-name
+    /// map (format v2), so this field is not serialised per dimension.
+    #[serde(skip)]
+    pub model_default_member_id: Option<u32>,
 }
 
 /// Marks a default member the USER set. Unflagged ids are legacy auto-defaults and are ignored.
@@ -81,6 +85,7 @@ impl Dimension {
             member_types: HashMap::new(),
             next_id: 1,
             default_member_id: None,
+            model_default_member_id: None,
         };
         // Every dimension is born with a default hierarchy named after itself.
         dim.hierarchies.insert(name.to_lowercase(), Hierarchy::new(name));
@@ -505,10 +510,16 @@ impl Dimension {
     }
 
     fn fix_default(&mut self, deleted_id: u32) {
-        // Deleting the user's default leaves the dimension with NO default again. Never
-        // promote another member: an implicit default is exactly what this rule removes.
-        if self.explicit_default_id() == Some(deleted_id) {
+        // Never promote another member. Deleting the member a layer points at revokes that
+        // layer: the override is dropped (model applies again), the model declaration is
+        // removed (no default).
+        if let Some(Some(id)) = self.encoded_override()
+            && id == deleted_id
+        {
             self.default_member_id = None;
+        }
+        if self.model_default_member_id == Some(deleted_id) {
+            self.model_default_member_id = None;
         }
     }
 
@@ -574,15 +585,43 @@ impl Dimension {
         self.move_member_to_front_in(None, name)
     }
 
-    // --- DEFAULT MEMBER ---
+    // --- DEFAULT MEMBER (two layers: model declaration + CLI override) ---
+    //
+    // The MODEL may declare a default member as part of the model release; if it does not,
+    // there is no default and an omitted dimension aggregates all base members. The CLI may
+    // OVERRIDE the model (set a member, suppress it, or revert to the model declaration).
+    // Every layer is revocable: no setting is a one-way street.
 
-    /// Sets the user's EXPLICIT default member. Queries that omit this dimension will then use
-    /// that member (the same way a declared default works in other engines). Without this, the
-    /// dimension has no default and an omitted dimension aggregates over all base members.
+    /// Declares the MODEL default member (used by a model seed; persisted in the catalogue).
+    pub fn set_model_default_member(&mut self, name: &str) -> Result<(), String> {
+        if let Some(id) = self.get_id_in(None, name) {
+            self.model_default_member_id = Some(id);
+            Ok(())
+        } else if self.get_id(name).is_some() {
+            Err(format!(
+                "Member '{}' exists only outside the default hierarchy of '{}'; a default must be addressable there",
+                name, self.name
+            ))
+        } else {
+            Err(format!(
+                "Member '{}' does not exist in dimension '{}'",
+                name, self.name
+            ))
+        }
+    }
+
+    /// Removes the MODEL declaration; the dimension returns to "no default".
+    pub fn clear_model_default_member(&mut self) {
+        self.model_default_member_id = None;
+    }
+
+    /// The model-declared default, if any.
+    pub fn model_default_member_name(&self) -> Option<String> {
+        self.model_default_member_id.and_then(|id| self.name_if_addressable(id))
+    }
+
+    /// Sets the CLI override to a member (wins over a model declaration).
     pub fn set_default_member(&mut self, name: &str) -> Result<(), String> {
-        // The default is injected as a filter in the DEFAULT hierarchy, so a member that only
-        // lives in another hierarchy could never be honoured. Refuse it instead of storing a
-        // default that silently does nothing.
         if let Some(id) = self.get_id_in(None, name) {
             if id & EXPLICIT_DEFAULT_FLAG != 0 {
                 return Err(format!("Member id {} cannot be used as a default", id));
@@ -602,32 +641,62 @@ impl Dimension {
         }
     }
 
-    /// Removes the explicit default; the dimension returns to "no default".
+    /// CLI override to "no default": suppresses a model declaration without deleting it.
+    /// Revert with `revert_to_model_default`.
     pub fn clear_default_member(&mut self) {
+        self.default_member_id = Some(EXPLICIT_DEFAULT_FLAG);
+    }
+
+    /// Revokes the CLI override, so the model declaration applies again (if any).
+    pub fn revert_to_model_default(&mut self) {
         self.default_member_id = None;
     }
 
-    /// True when the user has explicitly set a default member (legacy auto-defaults are not).
+    /// True when the CLI has an override (either a member or an explicit "none").
+    pub fn has_override(&self) -> bool {
+        self.encoded_override().is_some()
+    }
+
+    /// True when the CLI override suppresses the default rather than choosing a member.
+    pub fn override_is_cleared(&self) -> bool {
+        matches!(self.encoded_override(), Some(None))
+    }
+
+    /// The override member, when the override selects one.
+    pub fn override_member_name(&self) -> Option<String> {
+        match self.encoded_override() {
+            Some(Some(id)) => self.name_if_addressable(id),
+            _ => None,
+        }
+    }
+
+    /// True when an override selects a member (legacy auto-defaults do not count).
     pub fn has_explicit_default(&self) -> bool {
-        self.explicit_default_id().is_some()
+        matches!(self.encoded_override(), Some(Some(_)))
     }
 
-    fn explicit_default_id(&self) -> Option<u32> {
-        self.default_member_id
-            .filter(|id| id & EXPLICIT_DEFAULT_FLAG != 0)
-            .map(|id| id & !EXPLICIT_DEFAULT_FLAG)
+    /// `None` = no override; `Some(None)` = override-to-none; `Some(Some(id))` = override member.
+    fn encoded_override(&self) -> Option<Option<u32>> {
+        match self.default_member_id {
+            None => None,
+            Some(encoded) if encoded & EXPLICIT_DEFAULT_FLAG == 0 => None, // legacy
+            Some(encoded) => Some(match encoded & !EXPLICIT_DEFAULT_FLAG {
+                0 => None,
+                id => Some(id),
+            }),
+        }
     }
 
-    /// The member a query uses when it omits this dimension, or `None`.
-    ///
-    /// There is **no implicit default**: a dimension with no user-set default returns `None` and
-    /// the query aggregates across every base member. A legacy unflagged id is ignored.
-    ///
-    /// An explicit default is only usable when it is ADDRESSABLE in the DEFAULT hierarchy,
-    /// because that is how an injected filter is resolved; otherwise this returns `None`
-    /// rather than inventing a fallback.
+    /// The effective default: CLI override, else model declaration, else no default.
     pub fn get_default_member_name(&self) -> Option<String> {
-        let id = self.explicit_default_id()?;
+        match self.encoded_override() {
+            Some(Some(id)) => self.name_if_addressable(id),
+            Some(None) => None,
+            None => self.model_default_member_name(),
+        }
+    }
+
+    fn name_if_addressable(&self, id: u32) -> Option<String> {
         let name = self.get_name(id);
         if self.get_id_in(None, &name).is_some() {
             Some(name)
