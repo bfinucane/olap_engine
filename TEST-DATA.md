@@ -76,6 +76,17 @@ Measures (measure dimension `Measure`, one member each): `Sales`, `Profit`, `Qua
 Dates are string dimensions (`OrderDate` 2021-01-01 … 2024-12-28); they filter and group
 normally. Derived Year/Quarter/Month are not materialised.
 
+## 3a. Default members (model declaration + CLI override)
+
+The model may declare default members; a model seed does it with `.model_default <dimension>
+<member>` and `.save`. The declaration is part of the model and is persisted in catalogue format
+v2 (dimension name -> member name). If the model declares none, there is **no default** and a
+query that omits the dimension aggregates all base members.
+
+The CLI can override the model (`.default_member <dim> <member>`), suppress it
+(`.default_member <dim> none`), or revoke the override (`.default_member <dim> model`); the
+override is stored separately, so a revoked override restores the model declaration. Both layers
+are revocable. `.default_member <dim>` shows model default, override and effective value.
 ## 4. Verifying
 
 ```powershell
