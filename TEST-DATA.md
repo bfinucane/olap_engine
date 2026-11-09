@@ -112,6 +112,13 @@ cd Patricia\olap_engine
 target\debug\olap_engine.exe --db <scratch>\v2.bin examples\superstore-v2.sql
 ```
 
+Reusable wrapper (builds, seeds, checks the format and the content fingerprint against the model
+pin):
+
+```powershell
+.\scripts\seed-demo.cmd -DatabaseFile <scratch>\v2.bin
+```
+
 Script mode starts from an empty catalogue; the trailing `.save` produces the file (format v3). The raw
 CSV is the single source: `.import_measures <csv> <cube> <Measure1,Measure2,...>` keeps every
 non-measure column as a dimension and stores one cell per measure per row. Two runs agree on
