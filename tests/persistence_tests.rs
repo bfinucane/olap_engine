@@ -474,4 +474,32 @@ fn fact_sets_round_trip_in_the_catalogue() {
     assert_eq!(fs.get_attribute("Customer", &[7]), Some(CellValue::String("Ava".into())));
     let _ = std::fs::remove_file(&path);
 }
-
+/// The internal view registry persists: two names can point at one fact set, one marked canonical.
+#[test]
+fn fact_views_round_trip_and_share_one_fact_set() {
+    let path = temp_path("fact_views");
+    let mut catalog = Catalog::new();
+    let mut fs = FactSet::new("Orders", vec!["Customer".into(), "City".into()], vec!["Sales".into()]);
+    fs.add_index("canonical", vec![0, 1]);
+    fs.add_index("by_city", vec![1, 0]);
+    fs.write_fact(&[7, 3], CellValue::Numeric(42.5));
+    catalog.fact_sets.insert("Orders".into(), fs);
+    for (name, index, view_of) in [
+        ("Orders", "canonical", "Orders"),
+        ("Orders_ByCity", "by_city", "Orders"),
+    ] {
+        catalog.fact_views.insert(name.into(), FactView {
+            name: name.into(), fact_set: "Orders".into(), index: index.into(), view_of: view_of.into(),
+        });
+    }
+    catalog.save_to_disk(path.to_str().expect("path")).expect("save");
+    let loaded = Catalog::load_from_disk(path.to_str().expect("path")).expect("load");
+    assert_eq!(loaded.fact_sets.len(), 1);
+    assert_eq!(loaded.fact_views.len(), 2);
+    assert_eq!(loaded.fact_views["Orders"].view_of, "Orders");
+    assert_eq!(loaded.fact_views["Orders_ByCity"].view_of, "Orders");
+    assert_eq!(loaded.fact_views["Orders_ByCity"].index, "by_city");
+    let fs = &loaded.fact_sets["Orders"];
+    assert_eq!(fs.query_exact("by_city", &[7, 3]), Some(CellValue::Numeric(42.5)));
+    let _ = std::fs::remove_file(&path);
+}
