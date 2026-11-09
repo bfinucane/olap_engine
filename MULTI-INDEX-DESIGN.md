@@ -906,5 +906,5 @@ not copy them into fact rows.
   and `Product` become attribute tables. Acceptance totals must be unchanged. City identity is a
   surrogate key (`CityID`), not the label, so the two Bristols remain distinct.
 
-First implementation slice: attribute table storage + `FactSet` key mapping, then the two-index
+First implementation slice: attribute cube (non-aggregating, own trie) + `FactSet` key mapping, then the two-index
 test over the split demo data. No wire change until the model release declares the schema.
