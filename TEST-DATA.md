@@ -25,13 +25,19 @@ HashMap-backed catalogues in iteration order): the **file SHA-256** identifies t
 release, the **content fingerprint** (SHA-256 over canonical query evidence) identifies the
 model and is stable across regenerations.
 
+**Demo data exists only as CSV + SQL.** The `.bin` files are generated build outputs, not sources,
+and they are never upgraded or migrated. With no users and the design still moving, changing demo
+data means editing the CSV/SQL seed and regenerating. The catalogue format is **v3** and the loader
+rejects older files outright. Regenerating model v2.2 from `examples/superstore-v2.sql` +
+`examples/Plateau/superstore-raw.csv` reproduces the pinned content fingerprint (`4E88A9D4…`);
+only the file bytes/SHA differ.
 ## 2. Where the artefacts live
 
 | Path | What | Rule |
 | --- | --- | --- |
 | `shared\database.bin` | frozen model the shared 8080 server serves | replaced only by a promoted release (D14) |
 | `shared\serve.exe` | frozen engine binary for that release | same |
-| `Patricia\olap_engine\database.bin` | seeded **v1** reference (kept as history) | never served, never REPL-ed |
+| `Patricia\olap_engine\database.bin` | generated demo output (legacy v1; reseed rather than upgrade) | never served, never REPL-ed |
 | `dev-work\database.bin` | dev instance scratch copy | may change freely |
 
 ## 3. Model v2 — raw Superstore line items
