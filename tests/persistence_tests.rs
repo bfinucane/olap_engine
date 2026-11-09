@@ -26,7 +26,7 @@ use olap_engine::catalog::catalog::{Catalog, PersistError};
 use olap_engine::cube::cube::{Cube, SplashMode};
 use olap_engine::cube::node::CellValue;
 use olap_engine::dimension::dimension::Dimension;
-use olap_engine::storage::fact_set::FactSet;
+use olap_engine::storage::fact_set::{FactSet, FactView};
 use std::sync::{Arc, RwLock};
 
 /// Where these tests write, so we never touch the repo's `database.bin`.
@@ -474,3 +474,4 @@ fn fact_sets_round_trip_in_the_catalogue() {
     assert_eq!(fs.get_attribute("Customer", &[7]), Some(CellValue::String("Ava".into())));
     let _ = std::fs::remove_file(&path);
 }
+

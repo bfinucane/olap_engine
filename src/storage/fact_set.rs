@@ -20,6 +20,15 @@ pub struct AttributeCube {
     pub store: SparseStore,
 }
 
+/// A cube-facing name for one fact index. Several views share one FactSet; `view_of` marks the
+/// canonical view. This is metadata until the wire layer exposes it.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct FactView {
+    pub name: String,
+    pub fact_set: String,
+    pub index: String,
+    pub view_of: String,
+}
 /// One index over the fact set: a dimension ORDER (canonical dimension indices in index order)
 /// and its trie. Several indexes share the fact set's heap.
 #[derive(Clone)]
