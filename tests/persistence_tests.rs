@@ -503,3 +503,18 @@ fn fact_views_round_trip_and_share_one_fact_set() {
     assert_eq!(fs.query_exact("by_city", &[7, 3]), Some(CellValue::Numeric(42.5)));
     let _ = std::fs::remove_file(&path);
 }
+#[test]
+fn fact_view_names_resolve_to_the_shared_fact_set() {
+    let mut catalog = Catalog::new();
+    let mut fs = FactSet::new("Orders", vec!["Customer".into(), "City".into()], vec!["Sales".into()]);
+    fs.add_index("by_city", vec![1, 0]);
+    fs.write_fact(&[7, 3], CellValue::Numeric(11.0));
+    catalog.fact_sets.insert("Orders".into(), fs);
+    catalog.fact_views.insert("Orders_ByCity".into(), FactView {
+        name: "Orders_ByCity".into(), fact_set: "Orders".into(), index: "by_city".into(), view_of: "Orders".into(),
+    });
+    assert_eq!(
+        olap_engine::catalog::catalog::query_fact_view(&catalog, "Orders_ByCity", &[7, 3]),
+        Some(CellValue::Numeric(11.0))
+    );
+}

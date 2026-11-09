@@ -545,3 +545,14 @@ fn temp_sibling_path(target: &Path) -> PathBuf {
         None => PathBuf::from(tmp_name),
     }
 }
+/// Internal fact-view query: resolves a view name to its fact set/index and reads one cell.
+/// Server-internal only; adds nothing to the wire contract.
+pub fn query_fact_view(
+    catalog: &Catalog,
+    view_name: &str,
+    canonical_coords: &[u32],
+) -> Option<crate::cube::node::CellValue> {
+    let view = catalog.fact_views.get(view_name)?;
+    let fact_set = catalog.fact_sets.get(&view.fact_set)?;
+    fact_set.query_exact(&view.index, canonical_coords)
+}
