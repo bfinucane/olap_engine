@@ -106,14 +106,14 @@ cd Patricia\olap_engine
 target\debug\olap_engine.exe --db <scratch>\v2.bin examples\superstore-v2.sql
 ```
 
-Script mode starts from an empty catalogue; the trailing `.save` produces the file. The raw
+Script mode starts from an empty catalogue; the trailing `.save` produces the file (format v3). The raw
 CSV is the single source: `.import_measures <csv> <cube> <Measure1,Measure2,...>` keeps every
 non-measure column as a dimension and stores one cell per measure per row. Two runs agree on
 the content fingerprint, not on file bytes.
 
 ## 6. Changing the model (versioning policy)
 
-Any change to dataset, columns, cardinalities, row counts or checks is a **new model
+A generated file is disposable; never carry an old `.bin` forward across a format change - reseed. Any change to dataset, columns, cardinalities, row counts or checks is a **new model
 version** (v3, …):
 
 1. add/seed the new model and a new manifest; keep the old manifest as history;
