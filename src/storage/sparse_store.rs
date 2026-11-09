@@ -43,8 +43,12 @@ impl CellHeap {
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
-    fn values(&self) -> Vec<CellValue> {
+    pub(crate) fn values(&self) -> Vec<CellValue> {
         self.cells.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn from_values(values: Vec<CellValue>) -> Self {
+        CellHeap { cells: RwLock::new(values) }
     }
 }
 
@@ -139,6 +143,12 @@ impl SparseStore {
     /// Builds an index over an existing shared heap (several tries, one fact set).
     pub fn with_heap(dim_count: usize, heap: Arc<CellHeap>) -> Self {
         SparseStore { root: Arc::new(Node::new()), dim_count, heap }
+    }
+
+    pub(crate) fn root_handle(&self) -> Arc<Node> { self.root.clone() }
+
+    pub(crate) fn from_root(dim_count: usize, root: Arc<Node>, heap: Arc<CellHeap>) -> Self {
+        SparseStore { root, dim_count, heap }
     }
 
     /// Writes an already-allocated cell id (the fact set allocates once, then updates every index).
