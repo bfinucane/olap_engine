@@ -886,3 +886,25 @@ are regenerated, so the loader now accepts only the current format.
 - **Next:** index definitions + fact set + the second scheme (flat/tree views over one heap), lazy
   index load/delta log, per-index caches, delete intents, security mapping, benchmark. None of that
   is wired yet; the current cubes still own one trie each.
+## 29. Fact set and attributes (operator, 2026-11-09)
+
+A fact set **owns facts only**: its fact coordinates are dimension **keys** and its measures are
+the cells in the heap. **Attributes are not facts.** Master/descriptive data lives in separate
+attribute tables, keyed by the same member identities, and a fact set references them — it does
+not copy them into fact rows.
+
+- A fact row is `keys + measures` (e.g. `CustomerID`, `CityID`, `ProductID`, `DateID`); a customer
+  name, city label, category or state is stored once in its attribute table.
+- Attribute tables can be shared by several fact sets; the fact set declares which keys reference
+  which attribute table. Attributes are resolved by key lookup, not stored per fact.
+- Indexes/tries cover **fact keys and measures only**. Attribute values never become an index
+  level; a hierarchy over attributes is derived from the key/master relationship.
+- A denormalised attribute in a fact is allowed only when the schema explicitly declares it a
+  **snapshot** column; otherwise attributes are read-through and writable only in their table.
+- Demo split: `Orders` facts = `RowID`, `OrderDateID`/`ShipDateID`, `CustomerID`, `CityID`,
+  `ProductID`, `ShipMode`, `OrderPriority` + the four measures; `Date`, `Customer`, `Geography`
+  and `Product` become attribute tables. Acceptance totals must be unchanged. City identity is a
+  surrogate key (`CityID`), not the label, so the two Bristols remain distinct.
+
+First implementation slice: attribute table storage + `FactSet` key mapping, then the two-index
+test over the split demo data. No wire change until the model release declares the schema.
