@@ -79,8 +79,8 @@ normally. Derived Year/Quarter/Month are not materialised.
 ## 3a. Default members (model declaration + CLI override)
 
 The model may declare default members; a model seed does it with `.model_default <dimension>
-<member>` and `.save`. The declaration is part of the model and is persisted in catalogue format
-v2 (dimension name -> member name). If the model declares none, there is **no default** and a
+<member>` and `.save`. The declaration is part of the model and is persisted in the catalogue
+(currently format v3; dimension name -> member name). If the model declares none, there is **no default** and a
 query that omits the dimension aggregates all base members.
 
 The CLI can override the model (`.default_member <dim> <member>`), suppress it

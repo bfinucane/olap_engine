@@ -874,3 +874,15 @@ keep `<file>.bak`; promotion runs maintenance as release hygiene before hashing/
 re-verifies the fingerprint; operator-only confirmed. §25.4 promotion flow and §25.5 acceptance
 updated accordingly. The maintenance command itself ships with the fact-set storage work; until
 then promotion remains explicit and must not claim hygiene it did not run.
+## 28. Implementation status (2026-11-09)
+
+Phase A has started on purpose, without the migration path: old catalogue files are demo data and
+are regenerated, so the loader now accepts only the current format.
+
+- **`69c9b36` — cell heap + `CellId` leaves.** `Node.value` is a `CellId`; `SparseStore` owns an
+  append-only heap shared by snapshots; exact/scan/print resolve through it. This is the shared
+  cell identity the multiple index tries need. Catalogue `FORMAT_VERSION = 3`; older formats are
+  rejected, no migration branch, shared pair not upgraded in place.
+- **Next:** index definitions + fact set + the second scheme (flat/tree views over one heap), lazy
+  index load/delta log, per-index caches, delete intents, security mapping, benchmark. None of that
+  is wired yet; the current cubes still own one trie each.
