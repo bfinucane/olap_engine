@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use crate::dimension::dimension::Dimension;
 use crate::cube::cube::Cube;
+use crate::storage::fact_set::FactSet;
 
 /// Magic bytes at the head of a saved catalog file. Lets us reject a file that
 /// is not one of ours before attempting a (positional, non-self-describing)
@@ -88,6 +89,7 @@ struct CatalogDiskFormatV2 {
     dimensions: HashMap<String, Dimension>,
     cubes: HashMap<String, Cube>,
     model_defaults: HashMap<String, String>,
+    fact_sets: HashMap<String, FactSet>,
 }
 
 
@@ -103,6 +105,7 @@ struct CatalogDiskFormatV2 {
 pub struct Catalog {
     pub dimensions: HashMap<String, Arc<RwLock<Dimension>>>,
     pub cubes: HashMap<String, Cube>, // The Catalog now owns the Cubes
+    pub fact_sets: HashMap<String, FactSet>,
 }
 
 impl Default for Catalog {
@@ -116,6 +119,7 @@ impl Catalog {
         Catalog {
             dimensions: HashMap::new(),
             cubes: HashMap::new(),
+            fact_sets: HashMap::new(),
         }
     }
 	/// Invalidates every cube's cached aggregates after a STRUCTURAL change.
@@ -347,6 +351,7 @@ impl Catalog {
             dimensions,
             cubes: self.cubes.clone(),
             model_defaults,
+            fact_sets: self.fact_sets.clone(),
         }
     }
 
@@ -466,10 +471,11 @@ impl Catalog {
         let mut reader = BufReader::new(File::open(filepath)?);
         let envelope: PersistedCatalog =
             bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
-        let (disk_dimensions, disk_cubes, model_defaults) = (
+        let (disk_dimensions, disk_cubes, model_defaults, disk_fact_sets) = (
             envelope.payload.dimensions,
             envelope.payload.cubes,
             envelope.payload.model_defaults,
+            envelope.payload.fact_sets,
         );
         let mut catalog = Catalog::new();
 
@@ -497,6 +503,8 @@ impl Catalog {
             cube.attach_dimensions(dim_arcs);
             catalog.cubes.insert(name, cube);
         }
+
+        catalog.fact_sets = disk_fact_sets;
 
         // 3. Rebuild each dimension's derived display order. The dirty flag is
         //    not serialized, so force a rebuild to be safe against a dimension

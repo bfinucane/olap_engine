@@ -26,6 +26,7 @@ use olap_engine::catalog::catalog::{Catalog, PersistError};
 use olap_engine::cube::cube::{Cube, SplashMode};
 use olap_engine::cube::node::CellValue;
 use olap_engine::dimension::dimension::Dimension;
+use olap_engine::storage::fact_set::FactSet;
 use std::sync::{Arc, RwLock};
 
 /// Where these tests write, so we never touch the repo's `database.bin`.
@@ -449,5 +450,27 @@ fn model_defaults_round_trip_through_the_catalogue() {
     let mut dim = dim.write().expect("dimension lock");
     dim.revert_to_model_default();
     assert_eq!(dim.get_default_member_name().as_deref(), Some("East"));
+    let _ = std::fs::remove_file(&path);
+}
+/// A fact set and its named index views survive the catalogue round-trip, with one shared heap.
+#[test]
+fn fact_sets_round_trip_in_the_catalogue() {
+    let path = temp_path("fact_sets");
+    let mut catalog = Catalog::new();
+    let mut fs = FactSet::new("Orders", vec!["Customer".into(), "City".into()], vec!["Sales".into()]);
+    fs.add_index("Orders", vec![0, 1]);
+    fs.add_index("Orders_ByCity", vec![1, 0]);
+    fs.add_attribute("Customer", vec!["CustomerID".into()]);
+    fs.write_fact(&[7, 3], CellValue::Numeric(42.5));
+    fs.set_attribute("Customer", &[7], CellValue::String("Ava".into()));
+    catalog.fact_sets.insert("Orders".into(), fs);
+    catalog.save_to_disk(path.to_str().expect("path")).expect("save");
+
+    let loaded = Catalog::load_from_disk(path.to_str().expect("path")).expect("load");
+    let fs = loaded.fact_sets.get("Orders").expect("fact set");
+    assert_eq!(fs.heap.len(), 1);
+    assert_eq!(fs.query_exact("Orders", &[7, 3]), Some(CellValue::Numeric(42.5)));
+    assert_eq!(fs.query_exact("Orders_ByCity", &[7, 3]), Some(CellValue::Numeric(42.5)));
+    assert_eq!(fs.get_attribute("Customer", &[7]), Some(CellValue::String("Ava".into())));
     let _ = std::fs::remove_file(&path);
 }
