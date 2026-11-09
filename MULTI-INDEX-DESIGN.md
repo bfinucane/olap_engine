@@ -897,8 +897,12 @@ not copy them into fact rows.
   name, city label, category or state is stored once in its attribute table.
 - Attribute tables can be shared by several fact sets; the fact set declares which keys reference
   which attribute table. Attributes are resolved by key lookup, not stored per fact.
-- Indexes/tries cover **fact keys and measures only**. Attribute values never become an index
-  level; a hierarchy over attributes is derived from the key/master relationship.
+- Attribute tables are **non-aggregating cubes**, each with its **own trie** over its keys. They
+  can be shared by several fact sets; the fact set declares which keys reference which attribute
+  cube. Attributes are resolved through that attribute cube's trie, not stored per fact.
+- **Fact-set indexes** cover fact keys and measures only. An attribute value never becomes a
+  level in a *fact* trie; an attribute hierarchy is resolved through the attribute cube's own
+  trie, and the fact set is then filtered by the corresponding key.
 - A denormalised attribute in a fact is allowed only when the schema explicitly declares it a
   **snapshot** column; otherwise attributes are read-through and writable only in their table.
 - Demo split: `Orders` facts = `RowID`, `OrderDateID`/`ShipDateID`, `CustomerID`, `CityID`,
