@@ -13,6 +13,41 @@ use crate::cube::node::{Node, CellId, CellValue};
 ///
 /// The public API is unchanged: `write` still takes `&mut self`. What changed is the
 /// cost model — an overwrite now allocates a path instead of mutating in place.
+/// Shared, append-only cell heap. One heap can be referenced by several index tries: they store
+/// the same `CellId` for the same fact cell. Snapshots share it; writes only append.
+pub struct CellHeap {
+    cells: RwLock<Vec<CellValue>>,
+}
+
+impl Default for CellHeap {
+    fn default() -> Self { Self::new() }
+}
+
+impl CellHeap {
+    pub fn new() -> Self { CellHeap { cells: RwLock::new(Vec::new()) } }
+
+    pub fn append(&self, value: CellValue) -> CellId {
+        let mut cells = self.cells.write().unwrap_or_else(|p| p.into_inner());
+        cells.push(value);
+        (cells.len() - 1) as CellId
+    }
+
+    pub fn get(&self, id: CellId) -> Option<CellValue> {
+        let cells = self.cells.read().unwrap_or_else(|p| p.into_inner());
+        cells.get(id as usize).cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.cells.read().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    fn values(&self) -> Vec<CellValue> {
+        self.cells.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct SparseStore {
     root: Arc<Node>,
@@ -21,7 +56,7 @@ pub struct SparseStore {
     dim_count: usize, 
     /// Append-only cell heap: leaves hold `CellId` slots. Snapshots share it; writes append and
     /// never mutate or reuse a slot, so old versions keep their values. Persisted with the trie.
-    heap: Arc<RwLock<Vec<CellValue>>>,
+    heap: Arc<CellHeap>,
 }
 
 /// On-disk shape of a SparseStore (format v3): trie + heap.
@@ -34,8 +69,7 @@ struct SparseStoreOnDisk {
 
 impl serde::Serialize for SparseStore {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        SparseStoreOnDisk { root: self.root.clone(), dim_count: self.dim_count, heap: heap.clone() }
+        SparseStoreOnDisk { root: self.root.clone(), dim_count: self.dim_count, heap: self.heap.values() }
             .serialize(serializer)
     }
 }
@@ -46,7 +80,7 @@ impl<'de> serde::Deserialize<'de> for SparseStore {
         Ok(SparseStore {
             root: disk.root,
             dim_count: disk.dim_count,
-            heap: Arc::new(RwLock::new(disk.heap)),
+            heap: Arc::new(CellHeap { cells: RwLock::new(disk.heap) }),
         })
     }
 }
@@ -56,7 +90,7 @@ impl SparseStore {
         SparseStore {
             root: Arc::new(Node::new()),
             dim_count,
-            heap: Arc::new(RwLock::new(Vec::new())),
+            heap: Arc::new(CellHeap::new()),
         }
     }
 
@@ -76,13 +110,12 @@ impl SparseStore {
             let _ = writeln!(out, "    (Trie is empty)");
             return;
         }
-        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.print_node(&self.root, &heap, &mut Vec::new(), out);
+        self.print_node(&self.root, &self.heap, &mut Vec::new(), out);
     }
 
-    fn print_node(&self, node: &Node, heap: &[CellValue], path: &mut Vec<u32>, out: &mut String) {
+    fn print_node(&self, node: &Node, heap: &CellHeap, path: &mut Vec<u32>, out: &mut String) {
         if let Some(id) = node.value
-            && let Some(val) = heap.get(id as usize)
+            && let Some(val) = heap.get(id)
         {
             let _ = writeln!(out, "    Coords: {:?} -> Value: {}", path, val);
         }
@@ -99,11 +132,17 @@ impl SparseStore {
     // new and whose other subtrees are the SAME `Arc`s as before. Cost is O(depth),
     // not O(cells).
     pub fn write(&mut self, coords: &[u32], value: CellValue) {
-        let id = {
-            let mut heap = self.heap.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-            heap.push(value);
-            (heap.len() - 1) as CellId
-        };
+        let id = self.heap.append(value);
+        self.root = Self::write_path(&self.root, coords, 0, id);
+    }
+
+    /// Builds an index over an existing shared heap (several tries, one fact set).
+    pub fn with_heap(dim_count: usize, heap: Arc<CellHeap>) -> Self {
+        SparseStore { root: Arc::new(Node::new()), dim_count, heap }
+    }
+
+    /// Writes an already-allocated cell id (the fact set allocates once, then updates every index).
+    pub fn write_id(&mut self, coords: &[u32], id: CellId) {
         self.root = Self::write_path(&self.root, coords, 0, id);
     }
 
@@ -142,8 +181,7 @@ impl SparseStore {
         }
         
         let id = current_node.value?;
-        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        heap.get(id as usize).cloned()
+        self.heap.get(id)
     }
 
 
@@ -195,15 +233,14 @@ impl SparseStore {
     // allowed_leaves: For each dimension, a Set of valid IDs, or None to allow all.
     pub fn scan_subcube(&self, allowed_leaves: &[Option<HashSet<u32>>]) -> Vec<(Vec<u32>, CellValue)> {
         let mut results = Vec::new();
-        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.scan_recursive(&self.root, &heap, allowed_leaves, 0, &mut Vec::new(), &mut results);
+        self.scan_recursive(&self.root, &self.heap, allowed_leaves, 0, &mut Vec::new(), &mut results);
         results
     }
     
 	fn scan_recursive(
         &self, 
         node: &Node, 
-        heap: &[CellValue],
+        heap: &CellHeap,
         allowed_leaves: &[Option<HashSet<u32>>], 
         depth: usize, 
         current_path: &mut Vec<u32>, 
@@ -212,7 +249,7 @@ impl SparseStore {
         // Base case: We reached the bottom of the tree
         if depth == allowed_leaves.len() {
             if let Some(id) = node.value
-                && let Some(val) = heap.get(id as usize)
+                && let Some(val) = heap.get(id)
             {
                 results.push((current_path.clone(), val.clone()));
             }
