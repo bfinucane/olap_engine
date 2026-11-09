@@ -4,11 +4,13 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
-
 pub enum CellValue {
     Numeric(f64),
     String(String),
 }
+
+/// Index into the fact-set cell heap. Two index tries over one fact set store the SAME id.
+pub type CellId = u64;
 // Implement Display so it prints nicely in our ASCII tables
 impl fmt::Display for CellValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -32,7 +34,9 @@ impl fmt::Display for CellValue {
 pub struct Node {
     // A HashMap keeps sparse children cheap; the values are shared, not copied.
     pub children: HashMap<u32, Arc<Node>>, 
-    pub value: Option<CellValue>,
+    /// Heap slot for this coordinate; the value lives once in the store heap, so several
+    /// index tries over one fact set can reference the SAME cell.
+    pub value: Option<CellId>,
 }
 
 impl Default for Node {

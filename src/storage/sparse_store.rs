@@ -1,8 +1,8 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::Arc;
-use crate::cube::node::{Node, CellValue};
+use std::sync::{Arc, RwLock};
+use crate::cube::node::{Node, CellId, CellValue};
 
 /// Sparse Patricia trie: one cell per leaf coordinate.
 ///
@@ -13,12 +13,42 @@ use crate::cube::node::{Node, CellValue};
 ///
 /// The public API is unchanged: `write` still takes `&mut self`. What changed is the
 /// cost model — an overwrite now allocates a path instead of mutating in place.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct SparseStore {
     root: Arc<Node>,
     // We might track depth or other metadata here later
     #[allow(dead_code)] 
     dim_count: usize, 
+    /// Append-only cell heap: leaves hold `CellId` slots. Snapshots share it; writes append and
+    /// never mutate or reuse a slot, so old versions keep their values. Persisted with the trie.
+    heap: Arc<RwLock<Vec<CellValue>>>,
+}
+
+/// On-disk shape of a SparseStore (format v3): trie + heap.
+#[derive(Serialize, Deserialize)]
+struct SparseStoreOnDisk {
+    root: Arc<Node>,
+    dim_count: usize,
+    heap: Vec<CellValue>,
+}
+
+impl serde::Serialize for SparseStore {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        SparseStoreOnDisk { root: self.root.clone(), dim_count: self.dim_count, heap: heap.clone() }
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SparseStore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let disk = SparseStoreOnDisk::deserialize(deserializer)?;
+        Ok(SparseStore {
+            root: disk.root,
+            dim_count: disk.dim_count,
+            heap: Arc::new(RwLock::new(disk.heap)),
+        })
+    }
 }
 
 impl SparseStore {
@@ -26,6 +56,7 @@ impl SparseStore {
         SparseStore {
             root: Arc::new(Node::new()),
             dim_count,
+            heap: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -45,16 +76,19 @@ impl SparseStore {
             let _ = writeln!(out, "    (Trie is empty)");
             return;
         }
-        self.print_node(&self.root, &mut Vec::new(), out);
+        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.print_node(&self.root, &heap, &mut Vec::new(), out);
     }
 
-    fn print_node(&self, node: &Node, path: &mut Vec<u32>, out: &mut String) {
-        if let Some(val) = &node.value {
+    fn print_node(&self, node: &Node, heap: &[CellValue], path: &mut Vec<u32>, out: &mut String) {
+        if let Some(id) = node.value
+            && let Some(val) = heap.get(id as usize)
+        {
             let _ = writeln!(out, "    Coords: {:?} -> Value: {}", path, val);
         }
         for (id, child) in &node.children {
             path.push(*id);
-            self.print_node(child, path, out);
+            self.print_node(child, heap, path, out);
             path.pop();
         }
     }
@@ -65,10 +99,15 @@ impl SparseStore {
     // new and whose other subtrees are the SAME `Arc`s as before. Cost is O(depth),
     // not O(cells).
     pub fn write(&mut self, coords: &[u32], value: CellValue) {
-        self.root = Self::write_path(&self.root, coords, 0, value);
+        let id = {
+            let mut heap = self.heap.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            heap.push(value);
+            (heap.len() - 1) as CellId
+        };
+        self.root = Self::write_path(&self.root, coords, 0, id);
     }
 
-    fn write_path(node: &Arc<Node>, coords: &[u32], depth: usize, value: CellValue) -> Arc<Node> {
+    fn write_path(node: &Arc<Node>, coords: &[u32], depth: usize, value: CellId) -> Arc<Node> {
         // Shallow copy: `children` clones its `Arc`s and `value` clones its payload.
         let mut copied = (**node).clone();
 
@@ -102,8 +141,9 @@ impl SparseStore {
             }
         }
         
-        // Return a clone of the value if it exists, otherwise None
-        current_node.value.clone()
+        let id = current_node.value?;
+        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        heap.get(id as usize).cloned()
     }
 
 
@@ -155,13 +195,15 @@ impl SparseStore {
     // allowed_leaves: For each dimension, a Set of valid IDs, or None to allow all.
     pub fn scan_subcube(&self, allowed_leaves: &[Option<HashSet<u32>>]) -> Vec<(Vec<u32>, CellValue)> {
         let mut results = Vec::new();
-        self.scan_recursive(&self.root, allowed_leaves, 0, &mut Vec::new(), &mut results);
+        let heap = self.heap.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.scan_recursive(&self.root, &heap, allowed_leaves, 0, &mut Vec::new(), &mut results);
         results
     }
     
 	fn scan_recursive(
         &self, 
         node: &Node, 
+        heap: &[CellValue],
         allowed_leaves: &[Option<HashSet<u32>>], 
         depth: usize, 
         current_path: &mut Vec<u32>, 
@@ -169,7 +211,9 @@ impl SparseStore {
     ) {
         // Base case: We reached the bottom of the tree
         if depth == allowed_leaves.len() {
-            if let Some(val) = &node.value {
+            if let Some(id) = node.value
+                && let Some(val) = heap.get(id as usize)
+            {
                 results.push((current_path.clone(), val.clone()));
             }
             return;
@@ -181,7 +225,7 @@ impl SparseStore {
                 for id in valid_ids {
                     if let Some(child) = node.children.get(id) {
                         current_path.push(*id);
-                        self.scan_recursive(child, allowed_leaves, depth + 1, current_path, results);
+                        self.scan_recursive(child, heap, allowed_leaves, depth + 1, current_path, results);
                         current_path.pop();
                     }
                 }
@@ -190,7 +234,7 @@ impl SparseStore {
             None => {
                 for (id, child) in &node.children {
                     current_path.push(*id);
-                    self.scan_recursive(child, allowed_leaves, depth + 1, current_path, results);
+                    self.scan_recursive(child, heap, allowed_leaves, depth + 1, current_path, results);
                     current_path.pop();
                 }
             }

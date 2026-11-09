@@ -15,7 +15,7 @@ const CATALOG_MAGIC: [u8; 4] = *b"OLAP";
 /// Current on-disk format version. Bump this whenever the serialized layout
 /// changes (new fields, changed types) and add a migration branch in
 /// `load_from_disk`.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Errors that can occur while persisting or loading a catalog.
 #[derive(Debug)]
@@ -90,20 +90,7 @@ struct CatalogDiskFormatV2 {
     model_defaults: HashMap<String, String>,
 }
 
-/// The v1 payload (before model defaults). Kept only to migrate old files.
-#[derive(Serialize, Deserialize)]
-struct CatalogDiskFormatV1 {
-    dimensions: HashMap<String, Dimension>,
-    cubes: HashMap<String, Cube>,
-}
 
-/// v1 envelope, used only by the loader's migration branch.
-#[derive(Serialize, Deserialize)]
-struct PersistedCatalogV1 {
-    magic: [u8; 4],
-    version: u32,
-    payload: CatalogDiskFormatV1,
-}
 
 /// The whole database: dimensions (shared by `Arc`) and cubes.
 ///
@@ -468,33 +455,22 @@ impl Catalog {
                 supported: FORMAT_VERSION,
             });
         }
-        // Migration: v1 (no model defaults) reads through the legacy struct; v2 carries the
-        // dimension-name -> member-name map. A newer file is refused above.
-        // Decode the payload. We re-read the whole file from the start because
-        // bincode consumes the header bytes again into the envelope struct.
+        // NO MIGRATION: only the current format is readable. Older catalogue files are demo
+        // data that is regenerated from the seed, never upgraded in place.
+        if version != FORMAT_VERSION {
+            return Err(PersistError::UnsupportedVersion {
+                found: version,
+                supported: FORMAT_VERSION,
+            });
+        }
         let mut reader = BufReader::new(File::open(filepath)?);
-        let (disk_dimensions, disk_cubes, model_defaults) = match version {
-            1 => {
-                let envelope: PersistedCatalogV1 =
-                    bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
-                (envelope.payload.dimensions, envelope.payload.cubes, HashMap::new())
-            }
-            2 => {
-                let envelope: PersistedCatalog =
-                    bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
-                (
-                    envelope.payload.dimensions,
-                    envelope.payload.cubes,
-                    envelope.payload.model_defaults,
-                )
-            }
-            other => {
-                return Err(PersistError::UnsupportedVersion {
-                    found: other,
-                    supported: FORMAT_VERSION,
-                });
-            }
-        };
+        let envelope: PersistedCatalog =
+            bincode::deserialize_from(&mut reader).map_err(PersistError::Decode)?;
+        let (disk_dimensions, disk_cubes, model_defaults) = (
+            envelope.payload.dimensions,
+            envelope.payload.cubes,
+            envelope.payload.model_defaults,
+        );
         let mut catalog = Catalog::new();
 
         // 1. Restore dimensions and put them back into locks
